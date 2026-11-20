@@ -1,0 +1,9 @@
+{
+  "name": "newvcs-dev",
+  "private": true,
+  "description": "Development tooling for newvcs (the secret scan run before a push)",
+  "devDependencies": {
+    "@secretlint/secretlint-rule-preset-recommend": "^9",
+    "secretlint": "^9"
+  }
+}

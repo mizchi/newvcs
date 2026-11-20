@@ -1,0 +1,26 @@
+[package]
+name = "newvcs"
+version = "0.0.1"
+edition = "2024"
+description = "Experiment: a version-control store that keeps Git's object ids but not Git's storage"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "nv"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+sha1 = "0.10"
+zstd = { version = "0.13", default-features = false }
+libc = "0.2"
+memmap2 = "0.9"
+# Plain HTTP only: the server is local so far.
+ureq = { version = "2", default-features = false }
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1

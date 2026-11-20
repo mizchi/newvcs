@@ -1,0 +1,75 @@
+amends "package://pkg.pkl-lang.org/github.com/mizchi/pkfire/pkfire@0.12.3#/Taskfile.pkl"
+
+local sources: Listing<String> = new {
+  "src/**/*.rs"
+  "tests/**/*.rs"
+  "Cargo.toml"
+  "Cargo.lock"
+}
+
+local build: Task = new {
+  name = "build"
+  description = "Release build of the nv binary"
+  cmd = "cargo build --release"
+  inputs = sources
+  outputs { "target/release/nv" }
+}
+
+local test: Task = new {
+  name = "test"
+  description = "Unit tests and the end-to-end tests against a generated Git repository"
+  cmd = "cargo test --release"
+  inputs = sources
+}
+
+local lint: Task = new {
+  name = "lint"
+  description = "rustfmt check and clippy with warnings as errors"
+  cmd = "cargo fmt --check && cargo clippy --release --all-targets -- -D warnings"
+  inputs = sources
+}
+
+local ci: Task = new {
+  name = "ci"
+  description = "Everything a change has to pass"
+  deps { lint; test }
+}
+
+local secretlint: Task = new {
+  name = "lint:secretlint"
+  description = "Run secretlint against files in the diff about to be pushed"
+  cmd =
+    #"""
+    set -euo pipefail
+    upstream=$(git rev-parse --symbolic-full-name '@{push}' 2>/dev/null \
+            || git rev-parse --symbolic-full-name '@{u}' 2>/dev/null \
+            || true)
+    emit_files() {
+      if [ -n "$upstream" ]; then
+        git diff --name-only --diff-filter=ACMR -z "${upstream}..HEAD"
+      else
+        git ls-files -z
+      fi
+    }
+    if [ -z "$(emit_files | tr -d '\0')" ]; then
+      exit 0
+    fi
+    emit_files | xargs -0 pnpm exec secretlint --
+    """#
+  cache = false
+  inputs {
+    ".secretlintrc.json"
+    "package.json"
+    "pnpm-lock.yaml"
+  }
+}
+
+local prePush: Task = new {
+  name = "pre-push"
+  description = "Pre-push gate: secretlint over the outgoing diff"
+  cmd = "echo pre-push ok"
+  cache = false
+  deps { secretlint }
+}
+
+tasks { build; test; lint; ci; secretlint; prePush }
