@@ -1,0 +1,16 @@
+#!/bin/sh
+# `git`, as far as nv speaks it. Put this directory first on PATH and a script
+# written for Git runs against an nv store instead.
+#
+# Unlike a shim that passes what it does not know through to the real Git,
+# this one cannot: the two keep their data in different places. A command nv
+# does not implement fails, and says so.
+#
+#   NV_BIN     the nv binary (required)
+#   SHIM_LOG   if set, every invocation is appended to this file
+set -eu
+: "${NV_BIN:?NV_BIN must point at the nv binary}"
+if [ -n "${SHIM_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$SHIM_LOG"
+fi
+exec "$NV_BIN" git "$@"

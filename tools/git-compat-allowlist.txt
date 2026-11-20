@@ -1,0 +1,23 @@
+# Cases under tests/git-compat/cases that must print the same under nv's
+# `git` as under Git, and exit the same. One per line.
+01-init-commit.sh
+02-status.sh
+03-add-paths.sh
+04-history.sh
+05-branches.sh
+06-modes-and-names.sh
+07-refusals.sh
+08-status-long.sh
+09-diff-and-show.sh
+10-rm-mv-restore-reset.sh
+11-tags-and-config.sh
+12-merge.sh
+13-amend.sh
+14-fsck.sh
+15-index.sh
+16-what-commands-say.sh
+17-merge-within-a-file.sh
+18-annotated-tags.sh
+19-ignore.sh
+20-line-endings.sh
+21-merge-conflict.sh

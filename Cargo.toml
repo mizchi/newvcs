@@ -16,6 +16,14 @@ sha1 = "0.10"
 zstd = { version = "0.13", default-features = false }
 libc = "0.2"
 memmap2 = "0.9"
+# Git's own rules for .gitignore, from gitoxide.
+gix-ignore = "0.24"
+gix-glob = "0.29"
+gix-attributes = "0.37"
+# Git's three-way text merge, conflict markers included.
+gix-merge = { version = "0.23", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "0.3" }
+bstr = "1"
 # Plain HTTP only: the server is local so far.
 ureq = { version = "2", default-features = false }
 serde_json = "1"

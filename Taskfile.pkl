@@ -3,6 +3,8 @@ amends "package://pkg.pkl-lang.org/github.com/mizchi/pkfire/pkfire@0.12.3#/Taskf
 local sources: Listing<String> = new {
   "src/**/*.rs"
   "tests/**/*.rs"
+  "tests/git-compat/**/*.sh"
+  "tools/**"
   "Cargo.toml"
   "Cargo.lock"
 }
@@ -27,6 +29,16 @@ local lint: Task = new {
   description = "rustfmt check and clippy with warnings as errors"
   cmd = "cargo fmt --check && cargo clippy --release --all-targets -- -D warnings"
   inputs = sources
+}
+
+/// The same scripts under Git and under `nv git`, compared; and the commands
+/// nv does not speak, each checked to fail. Also part of `test`.
+local gitCompat: Task = new {
+  name = "git-compat"
+  description = "Run the Git compatibility cases and print the table"
+  cmd = "tools/git-compat.sh target/release/nv"
+  cache = false
+  deps { build }
 }
 
 local ci: Task = new {
@@ -72,4 +84,4 @@ local prePush: Task = new {
   deps { secretlint }
 }
 
-tasks { build; test; lint; ci; secretlint; prePush }
+tasks { build; test; lint; gitCompat; ci; secretlint; prePush }

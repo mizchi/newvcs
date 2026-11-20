@@ -31,6 +31,172 @@ nv export <dir> <git-repo> <ref>           write the workspace's commit into a G
 nv stats <store>
 ```
 
+## Speaking Git
+
+`nv git <command>` answers the everyday Git commands on an nv store, and
+`tools/git-shim/bin/git` is that under the name `git`: put it first on
+`PATH` and a script written for Git runs against nv.
+
+What is spoken is one table in `src/gitcli.rs`, each command with the
+options it takes (`nv git --spoken` prints it). An invocation is checked
+against the table before any of it runs:
+
+| Command | Options |
+| --- | --- |
+| `init` | `-q` `-b <branch>` |
+| `clone`, `fetch`, `pull`, `push` | `-q`; `pull --ff-only`, `--no-rebase`. A Git repository on this machine only |
+| `add` | `-A`, paths |
+| `rm`, `mv` | `rm -r -q -f` |
+| `restore` | `--staged`, paths |
+| `reset` | `--soft` `--mixed` `--hard` `-q`, a revision or paths |
+| `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
+| `status` | the long form, `--porcelain`, `--short` |
+| `log` | `--oneline` `--format=` `-n`, a revision; the default format |
+| `show` | `--format=` `--name-status` `--name-only` `--stat`, a revision or an annotated tag |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, the working tree against the index, `--cached` |
+| `rev-parse` | a revision, `<rev>^{tree}`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
+| `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags |
+| `ls-tree` | `-r` `--name-only`, one path |
+| `branch` | list, create, `--show-current`, `-d`, `-D` |
+| `tag` | list, create, `-a` / `-m` for an annotated one, `-d` |
+| `checkout`, `switch` | a branch, `-b` / `-c` with a start point, `checkout -- <paths>` |
+| `merge` | `-q` `--no-ff` `--ff-only` `-m`, one branch; `--abort` |
+| `config` | `user.name` and `user.email` |
+| `fsck` | `--full` `--strict` `--no-dangling` |
+
+Revisions are `HEAD`, a branch, a tag, `origin/<branch>` or a full id, with
+`^`, `~N` and `^{commit}`.
+
+The test is the design of [bit](https://github.com/bit-vcs/bit)'s harness,
+turned around. bit puts a shim named `git` in front of Git's own test suite
+and routes chosen commands to its implementation, the rest to the real Git.
+nv keeps its data elsewhere, so nothing can be passed through; instead
+`tools/git-compat.sh` runs scripts under both and compares what they print
+and how they exit, with the same author, committer and clock. Since nv
+reproduces Git's ids, the commit ids in that output have to agree too.
+
+```
+$ tools/git-compat.sh target/release/nv
+ok       01-init-commit.sh (15 lines)
+ok       02-status.sh (19 lines)
+ok       03-add-paths.sh (18 lines)
+ok       04-history.sh (46 lines)
+ok       05-branches.sh (22 lines)
+ok       06-modes-and-names.sh (30 lines)
+ok       07-refusals.sh (12 lines)
+ok       08-status-long.sh (81 lines)
+ok       09-diff-and-show.sh (221 lines)
+ok       10-rm-mv-restore-reset.sh (41 lines)
+ok       11-tags-and-config.sh (23 lines)
+ok       12-merge.sh (33 lines)
+ok       13-amend.sh (18 lines)
+ok       14-fsck.sh (2 lines)
+ok       15-index.sh (144 lines)
+ok       16-what-commands-say.sh (76 lines)
+ok       17-merge-within-a-file.sh (50 lines)
+ok       18-annotated-tags.sh (54 lines)
+ok       19-ignore.sh (33 lines)
+ok       20-line-endings.sh (32 lines)
+ok       21-merge-conflict.sh (85 lines)
+ok       reads/01-history-made-by-git.sh (150 lines)
+ok       reads/02-work-on-both-sides.sh (57 lines)
+ok       reads/03-tags-ignores-and-merges-made-by-git.sh (38 lines)
+refused  79 commands nv does not speak
+all compatible
+```
+
+Three things are checked:
+
+- **What nv writes, Git would have written** (`tests/git-compat/cases`). The
+  same script under Git and under the shim, each in a repository of its own.
+- **What Git writes, nv reads** (`tests/git-compat/reads`). Git builds a
+  history upstream, with things nv does not make itself: a merge within one
+  file, a rename with edits, an octopus merge, a binary file, an annotated
+  tag. A clone made and pulled by Git and one made and pulled by nv then
+  answer the same questions. In the second case the clone also commits,
+  pulls into a merge and pushes, and the real Git reads back what arrived
+  and runs its own `fsck` over it.
+- **What is not spoken is refused, never approximated**
+  (`tools/git-compat-unsupported.txt`, seventy-nine command lines): commands that
+  are not in the table, options that are not in a command's row, and
+  arguments a command does not take. Each must exit non-zero saying "not
+  supported", must be something Git itself accepts, and must leave the
+  repository as it was.
+
+`fsck` is nv's own check behind Git's name: every object is read and hashed
+against its name, and from every ref each commit's parents, trees and files
+must be there. Like Git's it prints nothing when nothing is wrong; a test
+flips single bytes of the store and expects it to say so.
+
+The index is real: `git add` takes the content as it is then, a commit
+records that and nothing else, and `status` and `diff` tell the last commit,
+the index and the working tree apart. It is kept as the paths where it
+differs from `HEAD` (`.nv/git-staged`), so an untouched index is an empty
+file whatever the size of the tree.
+
+Opening a store never changes it. Bytes after the last whole record of the
+segment (a record cut short by a crash, or damage that hides what follows)
+stay where they are until a command has to append; `fsck` reports them.
+
+Where Git's rules are only Git's, the code is gitoxide's rather than a
+second writing of it: `.gitignore` is matched by `gix-ignore`, and
+`.gitattributes` is parsed by `gix-attributes` and matched by `gix-glob`.
+Each was measured before and after on oxc (14,716 files, 2,499
+directories, 11 `.gitignore` files, 49 rules at the root):
+
+| | before | after |
+| --- | ---: | ---: |
+| `status`, clean tree | 62.4 ms | 63.8 ms |
+| `status`, 10,000 untracked files and 10,000 ignored ones | 306 ms | 189 ms |
+| first checkout | 1243 ms | 1215 ms |
+| repeated checkout | 272 ms | 263 ms |
+| files that differ from Git's checkout | 14 | 0 |
+
+The first attempt cost 4 ms on the clean tree, none of it in matching: it
+kept every directory entry to look for a `.gitignore` among them. Keeping
+the names alone, and asking the rules about a directory that holds known
+files only when a file that is not known turns up, left 1.4 ms. With
+untracked files it is faster than before because ignored files are no
+longer read.
+
+The merge within a file is gitoxide's too (`gix-merge`). It replaced one
+written here, after both were run on the same inputs and gave the same
+bytes every time:
+
+| three-way merge of one file | written here | `gix-merge` |
+| --- | ---: | ---: |
+| 2,319 lines, two changes a side | 0.25 ms | 0.34 ms |
+| 2,319 lines, a change every 40 lines a side | 0.75 ms | 0.30 ms |
+| 57,975 lines, two changes a side | 3.6 ms | 2.8 ms |
+| 57,975 lines, a change every 40 lines a side | 151 ms | 4.7 ms |
+
+It also writes Git's conflict markers, which the one here could not. So a
+merge whose changes meet stops as Git's does: the file holds both sides'
+lines, `status` shows it as `UU`, `git add` marks it settled, `git commit`
+concludes the merge with both parents, and `git merge --abort` puts
+everything back. The price is in the build: 19.1 s to 21.9 s from clean,
+66 KB more in the stripped binary, and a dependency tree of 364 lines
+where it was 168.
+
+Where it is not Git even inside those commands:
+
+- A merge stops for someone only where lines of text met. Where one side
+  deleted a file the other changed, both added one of the same name, or the
+  file is binary, it refuses and touches nothing.
+- `diff` does not show an unmerged file as Git's combined diff does.
+- `.gitattributes` is read for line endings only (`text`, `text=auto`,
+  `eol`, `-text`, `binary`), as Git does with `core.autocrlf` unset on a
+  system whose line ending is LF. Filters, `ident` and
+  `working-tree-encoding` are not applied. A file under `text=auto` that
+  was committed with CRLF and is then edited is stored with LF, where Git
+  would keep its CRLF.
+- A file that was added and then became ignored is not looked at again.
+- `fsck` does not report dangling objects.
+- Commit dates are taken from `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` only
+  as `<seconds> <+hhmm>`.
+- Patches come from a plain shortest-edit diff. Where Git's heuristics pick
+  among equally short ones, the lines shown can differ.
+
 ## The model
 
 - **A commit is a list of changes** (`src/commit.rs`): its parents, the paths
@@ -55,6 +221,11 @@ nv stats <store>
 - **A workspace is a set of path prefixes** (`src/workspace.rs`), not the
   whole tree. Each blob is materialised once in the store and cloned
   copy-on-write (APFS `clonefile`) into every workspace that needs it.
+- **A workspace of everything is cloned whole.** Cloning files one at a
+  time takes turns inside the kernel, about 75 microseconds each, on any
+  number of threads; cloning a directory is one call. So the store keeps
+  the two most recent whole trees it was asked for, and a full checkout is
+  a clone of one, or of the nearer one with the difference applied.
 - **Recording is not publishing.** A snapshot is a commit on top of the last
   one, taken after every step of work and seen by nobody else. A commit
   folds the snapshots since the last published commit into one. What changed
@@ -96,7 +267,8 @@ while the machine was busy with other work, so compare within a row:
 
 | Operation | Git | nv |
 | --- | ---: | ---: |
-| A new working copy of everything | 415 ms (`worktree add`) | 378 ms (`checkout`), 41 ms (`fork`) |
+| A new working copy of everything | 371 ms (`worktree add`) | 289 ms the first time, 37 ms after (`checkout`), 41 ms (`fork`) |
+| A new working copy 200 commits back | 335 ms | 205 ms the first time, 65 ms after |
 | A new working copy of one directory (51 files) | 72 ms (worktree + cone sparse-checkout) | 41 ms |
 | `status`, nothing changed | 25 ms | 15 ms |
 | `status` after one edit | 26 ms | 15 ms |
@@ -186,19 +358,45 @@ Larger repositories, with Git and Jujutsu 0.36 beside it (best of 8):
 | --- | ---: | ---: | ---: |
 | Import, Git ids reproduced | 20.5 s, all | 484 s, all (94.6 GB raw) | 1.7 s |
 | Store / Git packs | 219 MB / 271 MB | 2.8 GB / 6.4 GB | |
-| New working copy: Git / nv / nv fork | 989 / 1,273 / 200 ms | 3,038 / 1,147 / 156 ms | 4,808 / 7,845 / 1,032 ms |
+| New working copy: Git / nv / nv fork | 989 / 1,273 / 200 ms | 3,038 / 1,147 / 156 ms | 4,890 / 1,729 / 1,032 ms |
 | One directory: Git / nv | 144 / 100 ms | 111 / 73 ms | 117 / 12.5 ms |
 | `status`: Git / jj / nv | 64 / 52 / 66 ms | 39 / 53 / 44 ms | 179 / – / 229 ms |
 | Record an edit: Git / jj / nv | 41 / 158 / 70 ms | 37 / 149 / 49 ms | 113 / – / 236 ms |
 | Record an edit the writer reported: nv | 6.9 ms | 7.1 ms | 1.9 ms |
 
+Four more, cloned to see what would break (`first / again` is a whole
+checkout the first time the store is asked for that tree, and after):
+
+| | Commits | Files | Git ids reproduced | Import | Store / Git packs | Checkout: first / again / Git |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vuejs/core | 7,303 | 704 | all | 2.8 s | 34 / 53 MB | 73 / 12 / 76 ms |
+| astral-sh/ruff | 18,268 | 11,338 | all | 18.6 s | 189 / 247 MB | 983 / 210 / 838 ms |
+| git/git | 83,079 | 4,876 | all | 52.9 s | 316 / 323 MB | 439 / 101 / 360 ms |
+| golang/go | 68,874 | 16,366 | all | 50.7 s | 482 / 482 MB | 1,509 / 244 / 1,162 ms |
+
+git/git did break it: 98 of its commits came back with another id. They are
+from Git's first weeks, April 2005, when trees recorded files as mode
+`100664`. `git log --raw` and `git ls-tree` both print that as `100644`, and
+the import believed them. It now reads the tree objects themselves whenever
+a tree's id does not come out right. Octopus merges (37), several roots (7),
+a submodule, symlinks and signed commits (16,767 in ruff) all went through.
+
+Where the files of a checkout differ from Git's, it is `.gitattributes`: 13
+files in ruff and 3 in git are marked `eol=crlf`, and Git writes them with
+CRLF where nv writes the bytes it stores. Every one of them equals its blob.
+
 What this says:
 
-- **Git ids hold at every size tried**: 94,288 commits across six
-  repositories, none different.
-- **Checking out everything is not faster than Git**, and at 100,000 files
-  it is slower: each file is written once into the store's shared copy and
-  cloned from there. The first checkout of that tree took 20.7 s.
+- **Git ids hold at every size tried**: 271,812 commits across ten
+  repositories, none different (see below for the one bug that took).
+- **Checking out everything is one clone of a tree the store keeps.** At
+  100,000 files that is 1.7 s where `git worktree add` takes 4.9 s, and on
+  playwright 37 ms against 371. A commit near one already checked out is
+  that tree with the difference applied (3.1 s at 100,000 files for the
+  commit before; 205 ms for 200 commits back on playwright). Only the
+  store's very first tree is written file by file, and that is the one case
+  slower than Git: 6.1 s against 4.9. The oxc and lean4 columns predate
+  this and are the old file-by-file figures.
 - **Looking over the whole tree is not faster than Git either.** `status`
   and an unreported snapshot stat every file; at 100,000 files Git is ahead,
   179 ms to 229.
@@ -258,10 +456,14 @@ Measured on real histories before any of this was written (the tools are
   together is not written.
 - A fork keeps build output, but whether a build tool still trusts it under
   a new absolute path has not been tried.
-- No rename tracking, no ignore files (`.git`, `target` and `node_modules`
-  are skipped by name), no locking between processes.
-- Git objects that are not in canonical form (a tree with unsorted entries,
-  say) would not round-trip; none turned up in 32,211 commits.
+- `.gitattributes` is read for line endings only: no filters, no LFS.
+- `.gitignore` is honoured, and `.nv/exclude` is a workspace's own list in
+  the same form. Nothing is skipped by name any more, so a workspace
+  without rules sees its `target` and `node_modules`.
+- No locking between processes.
+- A tree whose entries are not in Git's order, or whose directory modes are
+  written with a leading zero, would not round-trip. File modes Git no
+  longer writes do. None of the former turned up in 271,812 commits.
 
 ## Building and testing
 

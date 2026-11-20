@@ -1,0 +1,88 @@
+# Git command lines nv's `git` does not speak. Each must fail under the shim
+# and say it is not supported, rather than do something else. One per row,
+# run in a repository with two commits on `main` and a branch `side`.
+
+# Commands that are not spoken at all.
+rebase side
+cherry-pick side
+revert HEAD
+stash
+blame a.txt
+clean -fd
+remote -v
+submodule status
+worktree list
+bisect start
+gc
+reflog
+describe
+apply patch.diff
+format-patch HEAD~1
+archive HEAD
+grep a
+shortlog
+notes list
+update-index --refresh
+write-tree
+commit-tree HEAD^{tree}
+for-each-ref
+show-ref
+symbolic-ref HEAD
+ls-files
+hash-object a.txt
+bundle create x HEAD
+
+# Commands that are spoken, with an option that is not.
+status --branch
+status -uno
+diff -w
+diff --numstat
+show --numstat
+diff --word-diff
+log --graph
+log --stat
+log -p
+log --all
+log --author=someone
+commit --fixup HEAD
+commit -S -m signed
+commit --no-verify -m skip
+add -p
+add -u
+add -f a.txt
+rm --cached a.txt
+reset --keep
+reset --merge
+restore --source=HEAD~1 a.txt
+checkout --orphan new
+checkout -B side
+switch --detach HEAD
+branch -m renamed
+branch -a
+branch --merged
+tag -f v1
+merge --squash side
+merge --continue
+merge -s ours side
+pull --rebase
+push --force
+push -u origin main
+fetch --all
+clone --depth 1 . ../shallow
+clone --bare . ../bare
+config --global user.name someone
+config --unset user.name
+ls-tree -l HEAD
+cat-file -s HEAD
+cat-file --batch
+rev-parse --git-dir
+rev-parse --verify HEAD
+init --bare elsewhere
+fsck --lost-found
+
+# Options that are spoken, with arguments that are not.
+checkout HEAD~1
+commit -m one -m two
+config core.editor vim
+diff HEAD
+log main side

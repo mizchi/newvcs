@@ -5,16 +5,22 @@
 //! - `manifest`: a directory tree as one small object per directory.
 //! - `commit`: a commit as a list of path changes; its tree is derived.
 //! - `git`: import from Git, and the Git ids every object maps back to.
+//! - `gitcli`: the part of Git's command line that nv speaks.
 //! - `index`: what a workspace knows of its files, changed by appending.
+//! - `textdiff`: line differences, written as `git diff` writes them.
 //! - `workspace`: checkouts of a set of path prefixes, shared copy-on-write.
 //! - `remote`: pushing to and catching up with a server that owns the refs.
 
 pub mod commit;
+pub mod eol;
 pub mod git;
+pub mod gitcli;
+pub mod ignore;
 pub mod index;
 pub mod manifest;
 pub mod remote;
 pub mod store;
+pub mod textdiff;
 pub mod workspace;
 
 /// An object id: BLAKE3 over the object's kind and bytes.

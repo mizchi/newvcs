@@ -45,6 +45,8 @@ pub enum Kind {
   Blob = 1,
   Tree = 2,
   Commit = 3,
+  /// An annotated tag: the id of what it names, then Git's tag object from its second line on.
+  Tag = 4,
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +142,8 @@ pub struct Store {
   roots_log: File,
   /// The root tree of a commit; `None` for a commit with no files.
   pub roots: HashMap<Id, Option<Id>>,
+  /// Bytes of the segment after its last whole record.
+  unread: u64,
   pub stats: Stats,
 }
 
@@ -225,9 +229,10 @@ impl Store {
       stats.add(h[0], flags, raw, head + stored as usize);
       at += head + stored as usize;
     }
-    if at < bytes.len() {
-      segment.set_len(covered + at as u64).map_err(|e| format!("cannot repair the segment: {e}"))?;
-    }
+    // Bytes after the last whole record are left where they are. They may be
+    // a record cut short by a crash, or the sign of damage further up; only a
+    // command that has to write cuts them off, and `check` reports them.
+    let unread = (bytes.len() - at) as u64;
     let flushed = covered + at as u64;
     drop(bytes);
 
@@ -257,6 +262,7 @@ impl Store {
       git: None,
       roots_log,
       roots,
+      unread,
       stats,
     })
   }
@@ -324,9 +330,7 @@ impl Store {
       for record in bytes.as_chunks::<53>().0 {
         let (id, oid): (Id, GitOid) = (record[1..33].try_into().unwrap(), record[33..53].try_into().unwrap());
         ids.of.insert(id, oid);
-        if record[0] != Kind::Tree as u8 {
-          ids.back.insert(oid, id);
-        }
+        ids.back.insert(oid, id);
       }
       ids
     })
@@ -337,18 +341,42 @@ impl Store {
     self.git_ids().of.get(id).copied()
   }
 
-  /// The blob or commit Git knows by this id.
+  /// What kind of object this is, read from its record.
+  pub fn kind_of(&mut self, id: &Id) -> Result<Option<Kind>> {
+    let Some(slot) = self.slot(id) else { return Ok(None) };
+    let head = (HEADER + if slot.flags & F_DELTA != 0 { BASE } else { 0 }) as u64;
+    let at = slot.offset - head;
+    let mut byte = [0u8; 1];
+    if at >= self.flushed {
+      byte[0] = self.pending[(at - self.flushed) as usize];
+    } else {
+      self.segment.read_exact_at(&mut byte, at).map_err(|e| format!("cannot read the segment: {e}"))?;
+    }
+    Ok(match byte[0] {
+      1 => Some(Kind::Blob),
+      2 => Some(Kind::Tree),
+      3 => Some(Kind::Commit),
+      4 => Some(Kind::Tag),
+      _ => None,
+    })
+  }
+
+  /// The object Git knows by this id.
   pub fn of_git(&mut self, oid: &GitOid) -> Option<Id> {
     self.git_ids().back.get(oid).copied()
   }
 
-  /// Every blob and commit that has a Git id.
+  /// Every object that has a Git id.
   pub fn with_git_ids(&mut self) -> Vec<(Id, GitOid)> {
     self.git_ids().back.iter().map(|(oid, id)| (*id, *oid)).collect()
   }
 
   pub fn flush(&mut self) -> Result<()> {
     if !self.pending.is_empty() {
+      // New records go after the last whole one, so what follows it has to go first.
+      if std::mem::take(&mut self.unread) > 0 {
+        self.segment.set_len(self.flushed).map_err(|e| format!("cannot cut the segment's torn end: {e}"))?;
+      }
       self.segment.write_all(&self.pending).map_err(|e| format!("cannot write the segment: {e}"))?;
       self.flushed += self.pending.len() as u64;
       self.pending.clear();
@@ -463,9 +491,8 @@ impl Store {
     if ids.of.insert(id, oid).is_some() {
       return Ok(());
     }
-    if kind != Kind::Tree {
-      ids.back.insert(oid, id);
-    }
+    let _ = kind;
+    ids.back.insert(oid, id);
     let mut record = Vec::with_capacity(53);
     record.push(kind as u8);
     record.extend_from_slice(&id);
@@ -496,6 +523,67 @@ impl Store {
     std::fs::write(&temp, crate::hex(&new)).map_err(|e| e.to_string())?;
     std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
     Ok(true)
+  }
+
+  /// Point a ref at a commit whatever it pointed at: for a copy of someone else's ref.
+  pub fn set_ref(&self, name: &str, id: Id) -> Result<()> {
+    let path = self.dir.join("refs").join(name);
+    std::fs::create_dir_all(path.parent().expect("under refs")).map_err(|e| e.to_string())?;
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&temp, crate::hex(&id)).and_then(|_| std::fs::rename(&temp, &path)).map_err(|e| e.to_string())
+  }
+
+  /// Remove a ref. `false` if there was none.
+  pub fn delete_ref(&self, name: &str) -> bool {
+    std::fs::remove_file(self.dir.join("refs").join(name)).is_ok()
+  }
+
+  /// The refs under a prefix (`heads`, `tags`, `remotes/origin`), by name.
+  pub fn refs_under(&self, prefix: &str) -> Vec<(String, Id)> {
+    let mut found: Vec<(String, Id)> = std::fs::read_dir(self.dir.join("refs").join(prefix))
+      .into_iter()
+      .flatten()
+      .flatten()
+      .filter_map(|e| e.file_name().into_string().ok())
+      .filter(|name| !name.contains(".tmp"))
+      .filter_map(|name| Some((name.clone(), self.read_ref(&format!("{prefix}/{name}"))?)))
+      .collect();
+    found.sort();
+    found
+  }
+
+  /// Every object's id.
+  pub fn ids(&self) -> Vec<Id> {
+    let mut ids: Vec<Id> = self.index.keys().copied().collect();
+    if let Some(sorted) = &self.sorted {
+      ids.extend((0..sorted.count).map(|i| Id::try_from(&sorted.record(i)[..32]).unwrap()));
+    }
+    ids
+  }
+
+  /// Read every object and hash it: `(objects read, what is wrong)`. An
+  /// object is wrong if it cannot be read or is not what its name says.
+  pub fn check(&mut self) -> Result<(usize, Vec<String>)> {
+    let ids = self.ids();
+    let mut wrong = Vec::new();
+    if self.unread > 0 {
+      wrong.push(format!(
+        "{} bytes after the last whole record of the segment: a record cut short, or damage that hides the records after it",
+        self.unread
+      ));
+    }
+    for id in &ids {
+      let kind = self.kind_of(id)?;
+      match (kind, self.get(id)) {
+        (Some(kind), Ok(Some(bytes))) if object_id(kind, &bytes) == *id => {}
+        (_, Err(e)) => wrong.push(format!("{}: {e}", crate::hex(id))),
+        _ => wrong.push(format!("{}: is not the object its name says", crate::hex(id))),
+      }
+      // Reading everything must not mean holding everything.
+      self.cache.clear();
+      self.cache_bytes = 0;
+    }
+    Ok((ids.len(), wrong))
   }
 
   pub fn read_ref(&self, name: &str) -> Option<Id> {

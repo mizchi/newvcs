@@ -36,6 +36,8 @@ nv: an experiment in keeping Git's object ids without Git's storage
   nv export <dir> <git-repo> <ref>
         Write the workspace's commit into a Git repository
   nv stats <store>
+  nv git <command> [<args>]
+        The everyday Git commands, on an nv store (see tools/git-shim)
 ";
 
 const AUTHOR: &str = "nv <nv@localhost>";
@@ -195,6 +197,10 @@ fn main() -> ExitCode {
   // SAFETY: called once, before any thread or output exists.
   unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
   let args: Vec<String> = std::env::args().skip(1).collect();
+  // `nv git …` answers as Git would, exit code and all.
+  if args.first().is_some_and(|a| a == "git") {
+    return ExitCode::from(newvcs::gitcli::run(&args[1..]) as u8);
+  }
   match run(&args) {
     Ok(()) => ExitCode::SUCCESS,
     Err(e) => {

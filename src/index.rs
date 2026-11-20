@@ -158,6 +158,22 @@ impl Index {
     }
   }
 
+  /// Whether the index holds anything below this directory.
+  pub fn has_under(&self, dir: &[u8]) -> bool {
+    let below = |path: &[u8]| path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == b'/';
+    if self.overlay.iter().any(|(path, value)| value.is_some() && below(path)) {
+      return true;
+    }
+    // The first entry at or after `dir/` is under it, or nothing is.
+    let prefix = [dir, b"/"].concat();
+    let (mut lo, mut hi) = (0, self.count);
+    while lo < hi {
+      let mid = (lo + hi) / 2;
+      if self.base_at(mid).0 < prefix.as_slice() { lo = mid + 1 } else { hi = mid }
+    }
+    (lo..self.count).map(|i| self.base_at(i).0).take_while(|path| below(path)).any(|path| !self.overlay.contains_key(path))
+  }
+
   pub fn insert(&mut self, path: Vec<u8>, indexed: Indexed) {
     self.pending.push(1);
     self.pending.extend_from_slice(&(path.len() as u32).to_le_bytes());

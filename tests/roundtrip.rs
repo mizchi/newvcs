@@ -138,13 +138,21 @@ fn workspaces_share_files_and_a_fork_keeps_untracked_output() {
   std::fs::write(dir.join("one/README.md"), "changed here\n").unwrap();
   assert_eq!(std::fs::read_to_string(dir.join("two/README.md")).unwrap(), "# readme\n");
 
-  // A fork carries what no commit holds: build output and the like.
+  // A fork carries what no commit holds: build output and the like, which a rule keeps out of sight.
+  std::fs::write(dir.join("two/.nv/exclude"), "target/\n").unwrap();
   std::fs::create_dir_all(dir.join("two/target")).unwrap();
   std::fs::write(dir.join("two/target/cache.bin"), "warm").unwrap();
   workspace::fork(&dir.join("two"), &dir.join("three")).unwrap();
   assert_eq!(std::fs::read_to_string(dir.join("three/target/cache.bin")).unwrap(), "warm");
   let forked = Workspace::open(&dir.join("three")).unwrap();
   assert_eq!(forked.base, Some(head));
+  let (differences, _) = workspace::status(&forked, Look::Everywhere).unwrap();
+  assert!(differences.is_empty(), "the fork has the rule too, and sees no build output");
+  // Without the rule the output is a file like any other.
+  std::fs::remove_file(dir.join("three/.nv/exclude")).unwrap();
+  let (seen, _) = workspace::status(&forked, Look::Everywhere).unwrap();
+  assert_eq!(seen.iter().map(|d| d.0.as_slice()).collect::<Vec<_>>(), [b"target/cache.bin".as_slice()]);
+  std::fs::write(dir.join("three/.nv/exclude"), "target/\n").unwrap();
   let (differences, looked) = workspace::status(&forked, Look::Everywhere).unwrap();
   assert!(differences.is_empty());
   // The fork kept the files' times, so its index still vouches for them.
@@ -258,4 +266,96 @@ fn a_writer_that_reports_its_writes_is_not_walked_after() {
   let (found, _) = workspace::status(&ws, Look::Everywhere).unwrap();
   assert_eq!(found.len(), 1);
   assert_eq!(found[0].0, b"README.md");
+}
+
+#[test]
+fn a_whole_checkout_is_cloned_from_a_tree_the_store_keeps_or_derives() {
+  let dir = repository("trees");
+  let (repo, mut store) = (dir.join("repo"), Store::open(&dir.join("store")).unwrap());
+  git::import(&mut store, &repo, "HEAD", None).unwrap();
+  let files = |ws: &Path| -> Vec<String> {
+    let listing = sh(ws, "find . -path ./.nv -prune -o \\( -type f -o -type l \\) -print | sed 's|^./||' | LC_ALL=C sort");
+    listing.lines().map(str::to_string).collect()
+  };
+  let tracked = |rev: &str| -> Vec<String> {
+    sh(&repo, &format!("git ls-tree -r --name-only {rev} | LC_ALL=C sort")).lines().map(str::to_string).collect()
+  };
+  let commit = |store: &mut Store, rev: &str| store.resolve(sh(&repo, &format!("git rev-parse {rev}")).trim()).unwrap();
+
+  // The first whole checkout writes the tree; the second of the same commit writes nothing.
+  let head = commit(&mut store, "HEAD");
+  let first = workspace::checkout(&mut store, head, &dir.join("w1"), Vec::new()).unwrap();
+  let again = workspace::checkout(&mut store, head, &dir.join("w2"), Vec::new()).unwrap();
+  assert!(first.materialised > 0);
+  assert_eq!((again.files, again.materialised), (first.files, 0));
+  assert_eq!(files(&dir.join("w2")), tracked("HEAD"));
+
+  // An older commit is that tree with the difference applied: a directory back
+  // to a file, a file back, files gone. Three paths differ, so three are written.
+  let old = commit(&mut store, "HEAD~3");
+  let older = workspace::checkout(&mut store, old, &dir.join("w3"), Vec::new()).unwrap();
+  assert_eq!(files(&dir.join("w3")), tracked("HEAD~3"));
+  assert_eq!(std::fs::read_to_string(dir.join("w3/a.b")).unwrap(), "x\n");
+  assert_eq!(std::fs::read_to_string(dir.join("w3/pkg/core/a.ts")).unwrap(), "export const a = 1;\n");
+  assert_eq!(older.materialised, 3, "docs/guide.md, a.b and pkg/core/a.ts");
+  // The workspace knows itself: nothing reads as changed, and what it commits is only what is edited.
+  let mut ws = Workspace::open(&dir.join("w3")).unwrap();
+  assert!(workspace::status(&ws, Look::Everywhere).unwrap().0.is_empty());
+  std::fs::write(dir.join("w3/docs/guide.md"), "edited\n").unwrap();
+  let made = workspace::commit(&mut store, &mut ws, "t <t@example.com>", "on the old commit").unwrap().unwrap();
+  git::export(&mut store, &made, &repo, "refs/heads/old-line").unwrap();
+  assert_eq!(sh(&repo, "git diff --name-status HEAD~3 old-line"), "M\tdocs/guide.md\n");
+  // Writing in a workspace does not reach the store's tree, nor a sibling cloned from it.
+  std::fs::write(dir.join("w1/README.md"), "changed in w1\n").unwrap();
+  assert_eq!(std::fs::read_to_string(dir.join("w2/README.md")).unwrap(), "# readme\n");
+  workspace::checkout(&mut store, head, &dir.join("w4"), Vec::new()).unwrap();
+  assert_eq!(std::fs::read_to_string(dir.join("w4/README.md")).unwrap(), "# readme\n");
+
+  // The store keeps the newest few trees, not one per commit ever checked out.
+  for (i, rev) in ["HEAD~1", "HEAD~2", "HEAD~4"].iter().enumerate() {
+    let id = commit(&mut store, rev);
+    workspace::checkout(&mut store, id, &dir.join(format!("w-more-{i}")), Vec::new()).unwrap();
+    assert_eq!(files(&dir.join(format!("w-more-{i}"))), tracked(rev));
+  }
+  let kept =
+    std::fs::read_dir(dir.join("store/trees")).unwrap().flatten().filter(|e| !e.file_name().to_string_lossy().contains('.')).count();
+  assert_eq!(kept, 2);
+}
+
+#[test]
+fn a_tree_with_a_mode_git_no_longer_writes_keeps_its_id() {
+  // Git's own first commits have files of mode 100664. `git log --raw` shows them as 100644.
+  let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("old-modes");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(dir.join("repo")).unwrap();
+  let repo = dir.join("repo");
+  sh(&repo, "git init -q -b main .");
+  let blob = |text: &str| sh(&repo, &format!("printf '{text}\\n' | git hash-object -w --stdin")).trim().to_string();
+  // A tree object written by hand, entries in Git's order, modes as given.
+  let tree = |entries: &[(&str, &str, &str)]| -> String {
+    let mut bytes = Vec::new();
+    for (mode, name, oid) in entries {
+      bytes.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+      bytes.extend_from_slice(&newvcs::unhex(oid).unwrap());
+    }
+    std::fs::write(repo.join("tree.bin"), bytes).unwrap();
+    sh(&repo, "git hash-object -w -t tree --literally tree.bin").trim().to_string()
+  };
+  let (hello, world, changed) = (blob("hello"), blob("world"), blob("changed"));
+  let inner = tree(&[("100664", "deep.c", &world)]);
+  let first_tree = tree(&[("100664", "Makefile", &hello), ("100644", "README", &world), ("40000", "src", &inner)]);
+  let second_tree = tree(&[("100664", "Makefile", &changed), ("100644", "README", &world), ("40000", "src", &inner)]);
+  let first = sh(&repo, &format!("git commit-tree {first_tree} -m first")).trim().to_string();
+  let second = sh(&repo, &format!("git commit-tree {second_tree} -p {first} -m second")).trim().to_string();
+  sh(&repo, &format!("git update-ref refs/heads/main {second}"));
+
+  // What Git reports hides the mode; what Git stored has it.
+  assert!(sh(&repo, "git log --raw --format= main").contains(":000000 100644"));
+  assert!(sh(&repo, "git cat-file tree 'main^{tree}' | head -c 6").starts_with("100664"));
+  let mut store = Store::open(&dir.join("store")).unwrap();
+  let done = git::import(&mut store, &repo, "main", None).unwrap();
+  assert_eq!((done.commits, done.mismatches), (2, Vec::<String>::new()));
+  drop(store);
+  let mut store = Store::open(&dir.join("store")).unwrap();
+  assert_eq!(git::verify(&mut store).unwrap(), (2, Vec::new()));
 }
