@@ -392,7 +392,7 @@ runs with `hyperfine`:
 | `nv mark` | | | 4.4 ms |
 | `nv since` | | | 4.1 ms |
 | `nv restore` (two files differ) | | | 5.3 ms |
-| `nv commit`, the commit made by Git | 108 ms | 81 ms | 74 ms |
+| `nv commit`, the commit made by Git (older than the eleventh round's fixes: see "Not done") | 108 ms | 81 ms | 74 ms |
 | `git commit -a`, for scale | | 30 ms | |
 
 Recording is what happens hundreds of times, and it is four to six times
@@ -1589,6 +1589,45 @@ on oxc where it was 227), and a restore hashes the ready copy of each
 file it writes and looks at what stands in the way (5.6 ms for two files
 where it was 5.0).
 
+What the eleventh round found and is now fixed, each with a test that
+failed first:
+
+- **A `nv snapshot` killed after it moved the workspace's state and before
+  it logged it left a state nothing named**, and the next `nv restore`
+  removed a file's only copy. A state is now logged before anything names
+  it, everywhere a state is made, and a record is one write: a kill no
+  longer tears a line into the next, and a torn line names nothing.
+- **`nv git merge --abort` threw away an unstaged edit to a file the merge
+  did not touch.** It is Git's `reset --merge` now: the files the merge
+  wrote go back, the others keep what was done to them.
+- **Finishing a conflicting sync with `--amend` amended the other writer's
+  commit**, and a later sync undid a third writer's change. Refused, as
+  Git refuses an amend in a merge that stopped.
+- **A killed `nv git commit --amend` left the branch on the commit it
+  replaced**, and every commit after was refused ("another workspace
+  moved it"). The next command finishes the move, as it already did for a
+  plain commit.
+- `nv commit` opened what a link to a pipe led to, and waited for ever; it
+  reads only regular files, and a link as a link.
+- Beside Git, `git mv` and `nv commit --tracked` published half the move;
+  the paths Git has staged are now looked at by `--tracked`, as
+  `git commit -a` commits them. A lock Git left behind (`index.lock`,
+  `HEAD.lock`, the branch's) is found before anything is written, where
+  `nv sync` used to write the files and fail at the end, and `nv commit`
+  wrote Git's index over the lock. A Git commit stopped by
+  `NV_GIT_TIMEOUT` no longer leaves its locks behind.
+- `nv record . a ../zz` refused `../zz` and had noted `a`; it notes all or
+  none. A push refused over a sync's markers in a commit now says what
+  takes them out of the chain (a commit on top does not). A restore that
+  could not read a file it should have recorded no longer says it is
+  done. A change to `.nv/exclude` (or Git's `info/exclude`) is seen by
+  `--recorded` without being reported.
+- `nv git`: `reset <path>` in a stopped merge, a merge refused over a
+  local edit (nothing on stdout, exit 2), a fast-forward over a staged
+  file it does not touch, `restore --staged` before the first commit,
+  `rm` of a tracked link, "Initial commit", `show` of a merge, and
+  `reset --hard` before the first commit now do what Git does (case 33).
+
 What the rounds agree on, measured three times by different hands on a
 machine busy with the other reviewers: recording is about three times
 quicker than Git's quickest commit; going back is five to six times
@@ -1647,22 +1686,12 @@ stops.
 
 ## Not done
 
-- **Found by the eleventh round and not fixed yet**, each a way to lose
-  work or publish the wrong thing in ordinary use:
-  - a `nv snapshot` killed after it moved the workspace's state and
-    before it logged it leaves a state nothing names, and the next
-    `nv restore` removes a file's only copy;
-  - `nv git merge --abort` throws away an unstaged edit to a file the
-    merge did not touch;
-  - finishing a conflicting sync with `--amend` amends the other writer's
-    commit, and a later sync can then undo a third writer's change;
-  - `nv commit` opens what a link to a pipe leads to, and waits;
-  - a directory renamed only in case (`d` to `D`) on a file system that
-    folds case is recorded beside the old spelling;
-  - `git rm way` then `nv git add WAY` stages nothing; beside Git,
-    `git mv` and `nv commit --tracked` publish half the move;
-  - a kill can tear a line of `.nv/oplog`, and the id on it is then not a
-    name `restore` takes.
+- **Found by the eleventh round and not fixed yet**, each a way to
+  publish the wrong thing in ordinary use, on a file system that folds
+  case (none was at hand where the rest were fixed):
+  - a directory renamed only in case (`d` to `D`) is recorded beside the
+    old spelling;
+  - `git rm way` then `nv git add WAY` stages nothing.
 
 - The server checks a push against the spellings of the ref's paths it
   has kept since those checks were added: a ref older than them was not
@@ -1670,14 +1699,20 @@ stops.
   down, not all the way. A server that sends one byte a second is cut
   off only by the command's own limit (30 minutes).
 
-- Publishing a commit beside Git is three to four times slower than
-  `git commit`: on oxc 126 ms with `--recorded`, 135 with `--tracked`,
-  164 walking, where `git commit -am` takes 42. It was two to three times
-  until the fifth round. What was added since is what makes a killed or
-  refused publishing leave Git's index alone: a look at what the user has
-  staged, an index of nv's own, a process of its own for the commit. Six
-  Git commands are run where `git commit` is one. `git status` with fsmonitor and the untracked cache is
-  quicker than `nv status`, which has no equivalent of either.
+- Publishing a commit beside Git is two to four times slower than
+  `git commit`. On oxc as it is now (17,002 files, 22,530 commits; a
+  4-core Linux VM, ext4, Git 2.43; medians of 25 runs), `nv commit
+  --recorded` takes 90 to 94 ms, `--tracked` 150, where `git commit -qam`
+  takes 39. Until the eleventh round's fixes `--recorded` took 143 to 147
+  ms there: looking for a sync's markers before publishing walked the whole
+  tree, whatever the look, and now it looks where the commit does. Taking
+  Git's commit in asks Git once where it asked twice. `--tracked` still
+  looks at every tracked file twice, once for the markers and once to
+  record. What makes a killed or refused publishing leave Git's index alone
+  costs the rest: a look at what the user has staged, an index of nv's
+  own, a process of its own for the commit; six Git commands are run where
+  `git commit` is one. `git status` with fsmonitor and the untracked cache
+  is quicker than `nv status`, which has no equivalent of either.
 - Two writers who each add a file whose names differ only in case both
   land; on a file system that does not tell the names apart, a workspace
   then has one file on disk for the two.
@@ -1833,8 +1868,9 @@ stops.
   the same form. Nothing is skipped by name, so a workspace without rules
   sees its `target` and `node_modules`.
 - Nothing searches the snapshots for the one that broke a test.
-- The watcher has only been run on macOS, and copy-on-write clones are
-  APFS's: on another file system a checkout or fork would have to copy.
+- The watcher has been run on macOS, and on Linux by the tests only.
+  Copy-on-write clones are APFS's: on another file system a checkout or
+  fork copies, and the copy's files are read once afterwards.
 - A tree whose entries are not in Git's order, or whose directory modes are
   written with a leading zero, would not round-trip. File modes Git no
   longer writes do. None of the former turned up in 271,812 commits.
@@ -1845,10 +1881,25 @@ stops.
 cargo test
 cargo build --release   # target/release/nv
 pkf run ci              # fmt, clippy, tests
+cargo test --profile fast   # while working on nv
 ```
 
+The release profile is built with fat LTO and one codegen unit, and a change
+to one file takes a minute to rebuild. The `fast` profile is optimized but
+not linked whole, and rebuilds in seconds; the tests pass on it as on
+release. Numbers in this file are measured with release builds only.
+
 The end-to-end tests build a Git repository with `git`, so `git` has to be on
-the path.
+the path. Some tests make files unreadable with `chmod 000`, which does not
+stop root: run them as another user.
+
+On Linux (ext4, Git 2.43, the tests run as an unprivileged user and against
+a local server) everything passes but what depends on copy-on-write clones,
+which ext4 does not have (two tests in `roundtrip.rs`, one in `agent.rs`:
+a copy has every file read again once), case 27 of the Git cases (Git 2.43
+takes `log -n abc`, newer Git refuses it), and, now and then, the check that
+a hook's process is gone after it was stopped, which can still be seen there
+for a moment until it is reaped.
 
 The server:
 

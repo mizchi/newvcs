@@ -124,7 +124,7 @@ fn out(bytes: &[u8]) {
 }
 
 /// A command killed between moving the workspace to a new commit and moving its branch there
-/// leaves the branch one step behind. Nothing else leaves a branch behind the workspace that is
+/// leaves the branch one step behind, or, for an amend, on the commit that was replaced. Nothing else leaves a branch behind the workspace that is
 /// on it, so the move is finished here: otherwise every later commit would be made off the
 /// branch, and lost to it at the next switch.
 fn caught_up(store: &mut Store, ws: &Workspace) -> Res<()> {
@@ -146,6 +146,19 @@ fn caught_up(store: &mut Store, ws: &Workspace) -> Res<()> {
       return Ok(());
     }
     at = parent;
+  }
+  // Or sideways, for an amend: the workspace's commit is one it logged after the branch's, in its
+  // place, on the same parents.
+  if let Some(tip) = tip {
+    let logged = ws.operations();
+    let last = |id: &Id| logged.iter().rposition(|(_, what, at)| what == "commit" && *at == hex(id));
+    if let (Some(replaced), Some(replacing)) = (last(&tip), last(&head))
+      && replaced < replacing
+      && Commit::load(store, &tip)?.parents == Commit::load(store, &head)?.parents
+    {
+      store.compare_and_set_ref(&format!("heads/{name}"), Some(tip), head)?;
+      store.flush()?;
+    }
   }
   Ok(())
 }
@@ -1178,8 +1191,13 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
   let mut doomed: Vec<Vec<u8>> = Vec::new();
   for arg in positional("rm", args) {
     let path = repo.inside(arg)?;
-    // Beyond a link is somewhere else's file: Git removes it there when forced, and nv does not go there.
-    if workspace::link_on_the_way(&repo.ws.root, &[path.as_slice(), b"/."].concat()).is_some() {
+    // Beyond a link is somewhere else's file: Git removes it there when forced, and nv does not go
+    // there. A link that is itself a tracked file is removed as one.
+    let tracked_link = known.contains(&path)
+      && std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(&path))).is_ok_and(|meta| meta.file_type().is_symlink());
+    if (!tracked_link && workspace::link_on_the_way(&repo.ws.root, &[path.as_slice(), b"/."].concat()).is_some())
+      || workspace::link_on_the_way(&repo.ws.root, &path).is_some()
+    {
       return unsupported(format_args!("rm {arg}` (a path at or beyond a symbolic link that stands for a directory)"));
     }
     let files: Vec<&Vec<u8>> = known.iter().filter(|k| under(std::slice::from_ref(&path), k)).collect();
@@ -1302,10 +1320,18 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
 }
 
 /// Take these paths out of the index: back to what HEAD has for them.
+/// The index back to HEAD for these paths. In a merge that stopped, a path unstaged is no longer
+/// unmerged either: its index entry is HEAD's, and what the merge left is an edit in the file.
 fn unstage(repo: &Repo, paths: &[Vec<u8>]) -> Res<()> {
   let mut staged = repo.staged();
   staged.retain(|path, _| !under(paths, path));
-  repo.set_staged(&staged)
+  repo.set_staged(&staged)?;
+  if repo.merging().is_some() {
+    let mut unmerged = repo.unmerged();
+    unmerged.retain(|path| !under(paths, path));
+    repo.set_unmerged(&unmerged)?;
+  }
+  Ok(())
 }
 
 fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
@@ -1315,6 +1341,10 @@ fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
     return fatal(128, "fatal: you must specify path(s) to restore");
   }
   if has(args, "--staged") {
+    // From HEAD, which a branch with no commits does not have.
+    if repo.ws.head.is_none() {
+      return fatal(128, "fatal: could not resolve HEAD");
+    }
     let known: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).chain(repo.staged().into_keys()).collect();
     for (path, arg) in paths.iter().zip(&given) {
       if !path.is_empty() && !known.iter().any(|k| under(std::slice::from_ref(path), k)) {
@@ -1322,11 +1352,6 @@ fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
       }
     }
     unstage(&repo, &paths)?;
-    if repo.merging().is_some() {
-      let mut unmerged = repo.unmerged();
-      unmerged.retain(|path| !under(&paths, path));
-      repo.set_unmerged(&unmerged)?;
-    }
     return Ok(0);
   }
   put_back(&mut repo, &given, &paths)
@@ -1416,7 +1441,8 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
       // what was never added stays where it is.
       for (path, state) in repo.states()? {
         if state.head.is_none() && state.staged().is_some() {
-          let _ = std::fs::remove_file(repo.ws.root.join(std::ffi::OsStr::from_bytes(&path)));
+          // With the directories it leaves empty, as Git removes them.
+          workspace::unplace(&repo.ws.root, &path);
         }
       }
       repo.set_staged(&Staged::new())?;
@@ -1525,6 +1551,19 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if merging.is_some() && amend {
     return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
   }
+  // A sync that could not merge leaves the workspace on the ref's commit, someone else's, with
+  // this workspace's work on top as changes to commit: the same as a merge that stopped. Amended,
+  // that commit would carry this workspace's resolution under another writer's name and parents.
+  if amend
+    && let Some(head) = repo.ws.head
+    && repo.ws.pushed == Some(head)
+    && !repo.ws.operations().iter().any(|(_, what, id)| what == "commit" && *id == hex(&head))
+  {
+    return fatal(
+      128,
+      "fatal: HEAD is the ref's commit, made by another workspace, as the last sync left it -- cannot amend.\nCommit without --amend: the commit goes on top of theirs.",
+    );
+  }
   let before = repo.ws.head;
   let previous = match (amend, before) {
     (true, Some(head)) => Some(Commit::load(&mut repo.store, &head)?),
@@ -1556,7 +1595,8 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     repo.set_staged(&staged_before)?;
     // There is nothing to commit, and why is what status says.
     let (lines, untracked) = status_lines(&mut repo)?;
-    out(long_status(&mut repo, &lines, &untracked)?.as_bytes());
+    // What `status` calls "No commits yet", a commit that finds nothing calls the commit it is not.
+    out(long_status(&mut repo, &lines, &untracked)?.replacen("\nNo commits yet\n", "\nInitial commit\n", 1).as_bytes());
     return Ok(1);
   }
   // An amended commit keeps who wrote it and when; who commits it is whoever is here now.
@@ -2416,11 +2456,9 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if format.is_some_and(|format| !format.is_empty()) {
     println!();
   }
-  // A merge that needed no decisions has nothing of its own to show: with a format, an empty line stands for it.
+  // A merge that needed no decisions has nothing of its own to show: an empty line stands for it.
   if commit.parents.len() > 1 {
-    if format.is_some() {
-      println!();
-    }
+    println!();
     return Ok(0);
   }
   // Before the diff: an empty line, unless the format was empty or was given as one that separates.
@@ -2860,7 +2898,7 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     if repo.merging().is_none() {
       return fatal(128, "fatal: There is no merge to abort (MERGE_HEAD missing).");
     }
-    return reset(repo, &["-q", "--hard"]);
+    return abort_merge(repo);
   }
   if repo.merging().is_some() {
     return fatal(
@@ -2878,9 +2916,20 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     }
     return Ok(0);
   }
+  let ahead = ancestors(&mut repo.store, theirs)?;
+  let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  // A fast-forward is a checkout: what is staged stays staged, unless the move has to write it.
+  if ahead.contains(&ours) && !has(args, "--no-ff") && !repo.staged().is_empty() {
+    let (from, to) = (root(&mut repo.store, Some(ours))?, root(&mut repo.store, Some(theirs))?);
+    let moved = diff(&mut repo.store, from, to)?;
+    let staged = repo.staged();
+    if moved.iter().any(|(path, _)| staged.keys().any(|s| under(std::slice::from_ref(s), path) || under(std::slice::from_ref(path), s))) {
+      return unsupported("merge` that only moves the branch forward, over a file staged that it changes");
+    }
+  }
   // Git merges into the last commit, not into what has been added since: with anything staged it will not start.
   let staged: Vec<String> = repo.staged().keys().map(|path| String::from_utf8_lossy(path).into_owned()).collect();
-  if !staged.is_empty() {
+  if !staged.is_empty() && !(ahead.contains(&ours) && !has(args, "--no-ff")) {
     return fatal(
       2,
       format!(
@@ -2888,10 +2937,6 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
         staged.join(" ")
       ),
     );
-  }
-  let ahead = ancestors(&mut repo.store, theirs)?;
-  if ahead.contains(&ours) && !has(args, "--no-ff") && !repo.staged().is_empty() {
-    return unsupported("merge` that only moves the branch forward, with changes staged");
   }
   if ahead.contains(&ours) && !has(args, "--no-ff") {
     // Nothing of ours that they lack: the branch just moves to where they are.
@@ -2926,7 +2971,6 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if base.is_none() {
     return fatal(128, "fatal: refusing to merge unrelated histories");
   }
-  let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
   let (from, our_root, their_root) =
     (root(&mut repo.store, base)?, root(&mut repo.store, Some(ours))?, root(&mut repo.store, Some(theirs))?);
   let our_changes = diff(&mut repo.store, from, our_root)?;
@@ -2985,13 +3029,16 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     // Only lines that met within a text file can be left for someone to settle.
     return unsupported(format_args!("merge {name}` (a conflict that is not between lines of text: {})", conflicts.join(", ")));
   }
-  // Git says so for each file it had to merge, whether or not it was asked to be quiet.
-  for path in &merged_within {
-    out(&[b"Auto-merging ".as_slice(), &quoted(path, false), b"\n"].concat());
-    if marked.iter().any(|(p, _)| p == path) {
-      out(&[b"CONFLICT (content): Merge conflict in ".as_slice(), &quoted(path, false), b"\n"].concat());
+  // Git says so for each file it had to merge, whether or not it was asked to be quiet; once it
+  // knows the merge can be made, and not when it refuses to start.
+  let say_merged = || {
+    for path in &merged_within {
+      out(&[b"Auto-merging ".as_slice(), &quoted(path, false), b"\n"].concat());
+      if marked.iter().any(|(p, _)| p == path) {
+        out(&[b"CONFLICT (content): Merge conflict in ".as_slice(), &quoted(path, false), b"\n"].concat());
+      }
     }
-  }
+  };
   // What came out as ours already is no change to us.
   their_changes.retain(|change| !our_changes.contains(change));
   let into = repo.branch().filter(|b| b != "main" && b != "master").map(|b| format!(" into {b}")).unwrap_or_default();
@@ -3011,13 +3058,16 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     // The merge stops here: what could be merged is in the files and in the index, and the
     // rest is in the files for someone to settle, add and commit.
     their_changes.retain(|(path, _)| !marked.iter().any(|(p, _)| p == path));
-    let states = repo.states()?;
+    let states = repo.states_of_tracked()?;
     let touched = their_changes.iter().map(|(p, _)| p).chain(marked.iter().map(|(p, _)| p));
     let in_the_way: Vec<String> = touched.filter(|p| states.contains_key(*p)).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
     if !in_the_way.is_empty() {
       return fatal(
-        1,
-        format!("error: Your local changes to the following files would be overwritten by merge:\n\t{}\nAborting", in_the_way.join("\n\t")),
+        2,
+        format!(
+          "error: Your local changes to the following files would be overwritten by merge:\n\t{}\nPlease commit your changes or stash them before you merge.\nAborting\nMerge with strategy ort failed.",
+          in_the_way.join("\n\t")
+        ),
       );
     }
     let blocking = workspace::blocked(&mut repo.store, &repo.ws, &their_changes)?;
@@ -3027,6 +3077,7 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
         format!("error: The following untracked working tree files would be overwritten by merge:\n\t{}\nAborting", blocking.join("\n\t")),
       );
     }
+    say_merged();
     let mut staged = repo.staged();
     // What goes, first: a file may be written where a directory of files that go stood.
     for (path, entry) in &their_changes {
@@ -3049,9 +3100,24 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     println!("Automatic merge failed; fix conflicts and then commit the result.");
     return Ok(1);
   }
+  // A tracked file the merge has to write that was changed here and not committed: Git will not
+  // start. An untracked one in the way is the next check's.
+  let states = repo.states_of_tracked()?;
+  let in_the_way: Vec<String> =
+    their_changes.iter().map(|(p, _)| p).filter(|p| states.contains_key(*p)).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+  if !in_the_way.is_empty() {
+    return fatal(
+      2,
+      format!(
+        "error: Your local changes to the following files would be overwritten by merge:\n\t{}\nPlease commit your changes or stash them before you merge.\nAborting\nMerge with strategy ort failed.",
+        in_the_way.join("\n\t")
+      ),
+    );
+  }
   if let Err(refusal) = workspace::apply_changes(&mut repo.store, &repo.ws, &their_changes) {
     return fatal(1, format!("error: {refusal}\nAborting"));
   }
+  say_merged();
   let rest =
     format!("author {}\ncommitter {}\n\n{}\n", identity(&repo, "AUTHOR")?, identity(&repo, "COMMITTER")?, message.trim_end()).into_bytes();
   let id = Commit { parents: vec![ours, theirs], rest, changes: their_changes }.store(&mut repo.store)?;
@@ -3063,6 +3129,37 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if !quiet(args) {
     println!("Merge made by the 'ort' strategy.");
     brought(&mut repo, ours, id)?;
+  }
+  Ok(0)
+}
+
+/// `git merge --abort`, which is Git's `reset --merge`: the files the merge wrote, and what was
+/// added since, go back to HEAD. A file the merge did not touch keeps what was done to it and not
+/// added: the merge would not have started over an edit to a file it had to write.
+fn abort_merge(mut repo: Repo) -> Res<i32> {
+  let staged = repo.staged();
+  let mut paths: Vec<Vec<u8>> = staged.keys().cloned().chain(repo.unmerged()).collect();
+  paths.sort();
+  paths.dedup();
+  let states = repo.states()?;
+  let going: Vec<Vec<u8>> =
+    paths.iter().filter(|path| states.get(*path).is_some_and(|state| state.head.is_none() && state.staged().is_some())).cloned().collect();
+  let blocking = workspace::hard_reset_blocked(&mut repo.store, &repo.ws, repo.ws.head, &going)?;
+  if let Some(first) = blocking.first() {
+    return fatal(
+      128,
+      format!(
+        "error: Untracked working tree file '{first}' would be overwritten by merge.\nfatal: Could not reset index file to revision 'HEAD'."
+      ),
+    );
+  }
+  for path in &going {
+    workspace::unplace(&repo.ws.root, path);
+  }
+  repo.set_staged(&Staged::new())?;
+  repo.end_merge();
+  if !paths.is_empty() {
+    workspace::restore(&mut repo.store, &repo.ws, &paths)?;
   }
   Ok(0)
 }

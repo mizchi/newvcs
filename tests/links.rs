@@ -102,14 +102,18 @@ fn a_link_follows_its_repository_when_asked_and_only_touches_what_changed() {
   );
   ok(&dir, "$NV import lib store >/dev/null && $NV name store /mizchi/lib $(git -C lib rev-parse HEAD)");
   assert!(ok(&dir, "$NV links work").contains("behind"), "{}", ok(&dir, "$NV links work"));
-  let untouched = ok(&dir, "stat -f %m work/vendor/lib/deep/b.rs");
+  let untouched = ok(&dir, "perl -e 'print((stat shift)[9])' work/vendor/lib/deep/b.rs");
   let updated = ok(&dir, "$NV links work --update");
   assert!(updated.contains("3 paths"), "{updated}");
   assert_eq!(
     ok(&dir, "cd work && tail -1 vendor/lib/a.rs && cat vendor/lib/new.rs && ls vendor/lib | tr '\\n' ' '"),
     "pub fn a2() {}\nnew\na.rs deep new.rs"
   );
-  assert_eq!(ok(&dir, "stat -f %m work/vendor/lib/deep/b.rs"), untouched, "a file the update did not change was not written");
+  assert_eq!(
+    ok(&dir, "perl -e 'print((stat shift)[9])' work/vendor/lib/deep/b.rs"),
+    untouched,
+    "a file the update did not change was not written"
+  );
   assert!(ok(&dir, "$NV links work").contains("as linked, up to date"));
   // Changed here, a link says so, and updating will not write over it.
   ok(&dir, "$NV commit work 'follow' >/dev/null && echo local >> work/vendor/lib/a.rs");

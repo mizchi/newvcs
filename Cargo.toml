@@ -39,3 +39,12 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 lto = "fat"
 codegen-units = 1
 debug = 1
+
+# For working on nv: optimized, but built in parallel and incrementally, so a
+# change rebuilds in seconds. Numbers in the README are measured with `release`.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = 0

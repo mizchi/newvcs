@@ -346,10 +346,11 @@ fn run(args: &[String]) -> Result<()> {
       // Told from the directory that was given, which may be below the workspace's top.
       let whole = |dir: &Path| std::fs::canonicalize(dir).map_err(|e| e.to_string());
       let below = whole(Path::new(arg(1)?))?.strip_prefix(whole(&ws.root)?).map(Path::to_path_buf).unwrap_or_default();
-      for path in &args[2.min(args.len())..] {
-        let path = if Path::new(path).is_absolute() { PathBuf::from(path) } else { below.join(path) };
-        ws.record(path.as_os_str().as_encoded_bytes())?;
-      }
+      let paths: Vec<PathBuf> = args[2.min(args.len())..]
+        .iter()
+        .map(|path| if Path::new(path).is_absolute() { PathBuf::from(path) } else { below.join(path) })
+        .collect();
+      ws.record_all(&paths.iter().map(|path| path.as_os_str().as_encoded_bytes()).collect::<Vec<_>>())?;
     }
     "snapshot" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -403,7 +404,7 @@ fn run(args: &[String]) -> Result<()> {
       }
       // A file holding both versions between a sync's markers, put back by a restore after the
       // sync's own note was cleared, is not published either.
-      let marked = workspace::with_sync_markers(&mut store, &ws)?;
+      let marked = workspace::with_sync_markers(&mut store, &ws, look(3))?;
       if !marked.is_empty() {
         return Err(format!(
           "these hold both versions between the markers a sync leaves (<<<<<<< yours ... >>>>>>> theirs): {}\nEdit them to what they should be, then commit.",
@@ -538,6 +539,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     "push" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
+      newvcs::colocated::locked(&ws.root)?;
       let done = remote::push(&mut store, &mut ws, AUTHOR)?;
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
@@ -557,6 +559,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     "sync" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
+      newvcs::colocated::locked(&ws.root)?;
       let done = remote::sync(&mut store, &mut ws, AUTHOR)?;
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");

@@ -467,7 +467,7 @@ fn a_name_that_differs_only_in_case_or_in_how_its_letters_are_built_is_the_same_
   );
   // Going back writes the file; it does not write it and then remove it under its other name.
   ok(&dir, "$NV restore . h >/dev/null");
-  assert_eq!(ok(&dir, "cat a.txt; ls | wc -l"), "a1\n       3");
+  assert_eq!(ok(&dir, "cat a.txt; ls | wc -l | tr -d ' '"), "a1\n3");
   // A name the file system hands back with its accents apart is the name Git has with them joined.
   let apart = "cafe\u{301}.txt";
   let joined = "caf\u{e9}.txt";
@@ -1087,4 +1087,97 @@ fn what_a_tenth_reviewer_found_in_recording_stays_fixed() {
   ok(&dir, "$NV mark . with-x >/dev/null; echo 1 > x && $NV mark . with-x >/dev/null && rm x && $NV snapshot . >/dev/null && mkfifo x");
   assert_eq!(code_of(&dir, "$NV restore . with-x 2>/dev/null").0, 2);
   assert_eq!(ok(&dir, "test -p x && echo pipe; rm x"), "pipe");
+}
+
+#[test]
+fn a_snapshot_killed_at_any_moment_leaves_every_state_it_reached_named() {
+  // Killed after the head moved: the state the head is at is in the log, so it is somewhere a
+  // restore can go back to, and a line of the log is never torn into the next one.
+  let dir = workspace("eleventh-killed");
+  ok(&dir, "$NV mark . green >/dev/null");
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo \"only copy $i\" > new$i.txt; $NV snapshot . >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.006))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; head=$(sed -n 's/^head //p' .nv/workspace); $NV log . | grep -q \"$head\" || { echo \"head $head is not in the log after kill $i\"; exit 1; }; done",
+  );
+  let log = ok(&dir, "cat .nv/oplog");
+  for line in log.lines() {
+    let fields: Vec<&str> = line.split(' ').collect();
+    let whole = fields.len() == 3 && fields[2].len() == 64;
+    // A torn record is left as a line of its own, which names nothing.
+    assert!(whole || (fields.len() <= 3 && fields.get(2).is_none_or(|id| id.len() < 64)), "a torn line runs into another: {line}");
+  }
+  for line in ok(&dir, "$NV log .").lines() {
+    assert_eq!(line.split_whitespace().nth(2).map(str::len), Some(64), "{line}");
+  }
+  // Every file written is in some state the log names: going back loses none of them.
+  ok(&dir, "$NV snapshot . >/dev/null; $NV restore . green >/dev/null");
+  ok(&dir, "$NV restore . '~0' >/dev/null 2>&1 || $NV restore . \"$(sed -n 's/^head //p' .nv/workspace)\" >/dev/null");
+  ok(&dir, "for i in $(seq 1 300); do grep -q \"only copy $i\" new$i.txt || { echo missing new$i.txt; exit 1; }; done");
+}
+
+#[test]
+fn what_an_eleventh_reviewer_found_in_publishing_stays_fixed() {
+  // What a commit looks through for a sync's markers is read as the tree has it: a link as a link,
+  // and what is not a file not at all. Nothing waits on a pipe, here or beyond a link.
+  let dir = workspace("eleventh-publish");
+  ok(&dir, "rm -rf ../agent-eleventh-outside && mkdir ../agent-eleventh-outside && mkfifo ../agent-eleventh-outside/fifo");
+  let started = std::time::Instant::now();
+  ok(
+    &dir,
+    "printf 1 > a && $NV commit . c1 >/dev/null && ln -s ../agent-eleventh-outside/fifo l && NV_TIMEOUT=20 $NV commit . c2 >/dev/null",
+  );
+  ok(&dir, "printf 2 > g && $NV snapshot . >/dev/null && rm g && mkfifo g && NV_TIMEOUT=20 $NV commit . c3 >/dev/null 2>&1; rm g");
+  assert!(started.elapsed().as_secs() < 10, "it waited {:?}", started.elapsed());
+  // A link to a file outside that holds markers is a link, not that file.
+  ok(
+    &dir,
+    "printf '<<<<<<< yours\\na\\n=======\\nb\\n>>>>>>> theirs\\n' > ../agent-eleventh-outside/marked && ln -s ../agent-eleventh-outside/marked m",
+  );
+  ok(&dir, "$NV commit . 'a link to markers' >/dev/null");
+  // What is looked through for markers is what the commit publishes, found by the same look: with
+  // `--recorded` the paths reported, and not the whole tree.
+  ok(&dir, "printf '<<<<<<< yours\na\n=======\nb\n>>>>>>> theirs\n' > unreported && echo 2 > a && $NV record . a");
+  ok(&dir, "$NV commit . 'what was reported' --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "a");
+  let (code, said) = code_of(&dir, "$NV commit . 'all of it' 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("unreported"), "{said}");
+}
+
+#[test]
+fn an_amend_killed_at_any_moment_leaves_one_commit_in_place_of_the_other() {
+  // Killed while amending, three hundred times: the branch has the commit amended or the one that
+  // replaced it, never both one on the other, and the workspace names a commit the store has.
+  let dir = workspace("killed-amend");
+  ok(&dir, "echo e0 >> a.txt && $NV git commit -q -am c0");
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo \"e$i\" >> a.txt; $NV git commit -q -a --amend -m \"c$i\" >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.012))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; subjects=$($NV git log --format=%s | tr '\\n' ' '); case \"$subjects\" in 'c'*' base ') ;; *) echo \"after kill $i: $subjects\"; exit 1;; esac; case \"$subjects\" in *' c'*' base ') echo \"after kill $i, one on the other: $subjects\"; exit 1;; esac; done",
+  );
+  ok(&dir, "$NV git commit -q -a --amend -m last && $NV git fsck");
+  assert_eq!(ok(&dir, "$NV git log --format=%s && tail -1 a.txt && $NV git status --short"), "last\nbase\ne300");
+}
+
+#[test]
+fn what_an_eleventh_reviewer_found_in_recording_stays_fixed() {
+  let dir = workspace("eleventh-recording");
+  // A report with one path that is not the workspace's is refused whole: none of it is noted.
+  ok(&dir, "$NV snapshot . >/dev/null; echo 2 > a.txt");
+  let (code, said) = code_of(&dir, "$NV record . a.txt ../zz 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert_eq!(ok(&dir, "test -s .nv/journal && tr '\\0' ' ' < .nv/journal; true"), "");
+  // A file that may not be read, changed since the state gone back to: not recorded, so not
+  // restored, and the restore says so instead of saying it is done. Reported, the same.
+  ok(&dir, "$NV snapshot . >/dev/null; $NV mark . m >/dev/null && echo changed > b.txt && chmod 000 b.txt");
+  for look in ["", "--recorded"] {
+    let (code, said) = code_of(&dir, &format!("$NV record . b.txt && $NV restore . m {look} 2>&1"));
+    assert_eq!(code, 2, "{look}: {said}");
+    assert!(said.contains("b.txt") && !said.starts_with("restored to"), "{look}: {said}");
+  }
+  assert_eq!(ok(&dir, "chmod 644 b.txt && cat b.txt"), "changed");
+  // The rules of what is left out that are not in the tree: a change to them is seen without a
+  // report, and reporting one is not refused.
+  ok(&dir, "$NV snapshot . >/dev/null; echo '*.log' > .nv/exclude && echo l > x.log && $NV snapshot . >/dev/null");
+  ok(&dir, "rm .nv/exclude && $NV record . .nv/exclude && $NV snapshot . --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . base | grep log; true"), "A x.log");
 }

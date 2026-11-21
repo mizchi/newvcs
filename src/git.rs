@@ -204,6 +204,9 @@ fn split_commit(raw: &[u8]) -> Result<(GitOid, Vec<GitOid>, &[u8])> {
 /// A change as `git log --raw` prints it: the modes, ids and status, and the path.
 type RawChange = (String, Vec<u8>);
 
+/// A commit as `git log --raw` gives it: its id, its parents' ids, and what it changed.
+type Logged = (String, Vec<String>, Vec<RawChange>);
+
 #[derive(Default, Debug)]
 pub struct Imported {
   pub commits: usize,
@@ -229,56 +232,61 @@ pub fn import_beyond(store: &mut Store, repo: &Path, rev: &str, limit: Option<us
 /// `import_beyond`, of everything behind several commits at once: one question to Git for all
 /// of them, where a repository's hundreds of tags would otherwise each ask for the whole history.
 pub fn import_tips(store: &mut Store, repo: &Path, revs: &[&str], limit: Option<usize>, have: &[String]) -> Result<Imported> {
-  let mut log = git(repo);
-  log.args([
-    "log",
-    "--reverse",
-    "--topo-order",
-    "--raw",
-    "--no-renames",
-    "--abbrev=40",
-    "--diff-merges=first-parent",
-    "--root",
-    "-z",
-    "--format=C %H",
-  ]);
-  // One commit, made on the very commit already had: by far the usual case, a commit just made.
-  // Asked for by itself. Asked for as "everything behind it that is not behind the other", Git
-  // sorts history to answer, and without a commit-graph that is a walk of all of it.
-  let next = match (revs, have) {
-    ([rev], [had]) => {
-      let line = git(repo).args(["rev-list", "--parents", "-n", "1", rev]).output().map_err(|e| format!("cannot run git: {e}"))?;
-      let line = String::from_utf8_lossy(&line.stdout).into_owned();
-      let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
-      parents == [had.as_str()]
+  // `C <hash> <parents>`, then per change a `:modes ids status` record and a path record.
+  let logged = |tail: &[String]| -> Result<Vec<Logged>> {
+    let mut log = git(repo);
+    log.args([
+      "log",
+      "--reverse",
+      "--topo-order",
+      "--raw",
+      "--no-renames",
+      "--abbrev=40",
+      "--diff-merges=first-parent",
+      "--root",
+      "-z",
+      "--format=C %H %P",
+    ]);
+    log.args(revs).args(tail);
+    let out = log.output().map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+      return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
-    _ => false,
+    let mut history: Vec<Logged> = Vec::new();
+    let mut records = out.stdout.split(|&b| b == 0);
+    while let Some(record) = records.next() {
+      let record = match record.iter().position(|&b| b != b'\n') {
+        Some(start) => &record[start..],
+        None => continue,
+      };
+      if let Some(line) = record.strip_prefix(b"C ") {
+        let line = String::from_utf8_lossy(line);
+        let mut ids = line.split_whitespace().map(str::to_string);
+        let hash = ids.next().ok_or("a commit without its id")?;
+        history.push((hash, ids.collect(), Vec::new()));
+      } else if let Some(meta) = record.strip_prefix(b":") {
+        let path = records.next().ok_or("a change without a path")?.to_vec();
+        history.last_mut().ok_or("a change before any commit")?.2.push((String::from_utf8_lossy(meta).into_owned(), path));
+      }
+    }
+    Ok(history)
   };
-  log.args(revs);
-  if next {
-    log.arg("--no-walk");
-  } else {
-    log.args(have.iter().map(|oid| format!("^{oid}")));
+  // One commit, made on the very commit already had: by far the usual case, a commit just made.
+  // Asked for by itself, its parents with it. Asked for as "everything behind it that is not
+  // behind the other", Git sorts history to answer, and without a commit-graph that is a walk of
+  // all of it; that is asked only when the commit stands on something else.
+  let alone = match (revs, have) {
+    ([_], [had]) => Some(logged(&["--no-walk".to_string()])?).filter(|one| one.len() == 1 && one[0].1 == [had.clone()]),
+    _ => None,
+  };
+  let history: Vec<(String, Vec<RawChange>)> = match alone {
+    Some(one) => one,
+    None => logged(&have.iter().map(|oid| format!("^{oid}")).collect::<Vec<_>>())?,
   }
-  let out = log.output().map_err(|e| format!("cannot run git: {e}"))?;
-  if !out.status.success() {
-    return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-  }
-  // `C <hash>`, then per change a `:modes ids status` record and a path record.
-  let mut history: Vec<(String, Vec<RawChange>)> = Vec::new();
-  let mut records = out.stdout.split(|&b| b == 0);
-  while let Some(record) = records.next() {
-    let record = match record.iter().position(|&b| b != b'\n') {
-      Some(start) => &record[start..],
-      None => continue,
-    };
-    if let Some(hash) = record.strip_prefix(b"C ") {
-      history.push((String::from_utf8_lossy(hash).into_owned(), Vec::new()));
-    } else if let Some(meta) = record.strip_prefix(b":") {
-      let path = records.next().ok_or("a change without a path")?.to_vec();
-      history.last_mut().ok_or("a change before any commit")?.1.push((String::from_utf8_lossy(meta).into_owned(), path));
-    }
-  }
+  .into_iter()
+  .map(|(hash, _, changes)| (hash, changes))
+  .collect();
+  let mut history = history;
   if let Some(limit) = limit {
     history.truncate(limit);
   }

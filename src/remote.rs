@@ -345,8 +345,11 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
       let Some(bytes) = store.get(&entry.id)? else { continue };
       let lines = || bytes.split(|&b| b == b'\n');
       if lines().any(|line| line == b"<<<<<<< yours") && lines().any(|line| line == b">>>>>>> theirs") {
+        // A commit after it does not take the markers out of the one that has them: the commits
+        // not pushed are made one again, with the file settled.
+        let back = chain.len();
         return Err(format!(
-          "`{}` holds both versions between the markers a sync leaves, in a commit not pushed yet. Nothing was sent: edit it to what it should be, commit, and push again.",
+          "`{}` holds both versions between the markers a sync leaves, in a commit not pushed yet. Nothing was sent.\nA commit on top does not take them out. Commit again, with the file settled: `nv git reset --soft HEAD~{back}` (what the {back} not pushed made becomes changes to commit), edit the file to what it should be, `nv git add` it, `nv git commit`, and push again.",
           String::from_utf8_lossy(path)
         ));
       }
@@ -1038,7 +1041,8 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
       let rest = Commit::load(store, &was)?.rest;
       let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
       root_of(store, &id)?;
-      // A commit of this workspace's own, like the one it stands for.
+      // A commit of this workspace's own, like the one it stands for: logged once it is stored.
+      store.flush()?;
       ws.log("commit", &id)?;
       id
     }
