@@ -150,6 +150,19 @@ fn in_the_way(root: &Path, changes: &[(Vec<u8>, Option<Entry>)]) -> Vec<String> 
   found
 }
 
+/// Whether the file system `dir` is on takes names that differ in case for one name. Asked of
+/// the file system itself, with a file made and looked for under another case.
+pub fn folds_names(dir: &Path) -> bool {
+  let probe = dir.join(format!(".nv-case-probe-{}", std::process::id()));
+  if std::fs::write(&probe, b"").is_err() {
+    return cfg!(target_os = "macos");
+  }
+  let other = dir.join(format!(".NV-CASE-PROBE-{}", std::process::id()));
+  let folds = std::fs::symlink_metadata(&other).is_ok();
+  let _ = std::fs::remove_file(&probe);
+  folds
+}
+
 /// A copy of `from` at `to` that shares its blocks until one of them is
 /// written. Whatever is at `to` is replaced.
 fn clone_file(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -721,6 +734,27 @@ fn untracked_in_the_way(store: &mut Store, root: &Path, from: Option<Id>, change
   Ok(found.into_iter().collect())
 }
 
+/// The files that differ from the last commit and hold the markers a sync writes where both
+/// sides changed the same lines, with this workspace's names for the two sides.
+pub fn with_sync_markers(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let (from, to) = (tree(store, ws.base)?, tree(store, ws.head)?);
+  let mut changed: Vec<Vec<u8>> =
+    crate::manifest::diff(store, from, to)?.into_iter().filter(|(_, e)| e.is_some()).map(|(p, _)| p).collect();
+  changed.extend(status(ws, Look::Everywhere)?.0.into_iter().filter(|(_, new, _)| new.is_some()).map(|(p, _, _)| p));
+  changed.sort();
+  changed.dedup();
+  let mut found = Vec::new();
+  for path in changed {
+    let Ok(bytes) = std::fs::read(ws.root.join(to_path(&path))) else { continue };
+    let lines = || bytes.split(|&b| b == b'\n');
+    if lines().any(|line| line == b"<<<<<<< yours") && lines().any(|line| line == b">>>>>>> theirs") {
+      found.push(String::from_utf8_lossy(&path).into_owned());
+    }
+  }
+  Ok(found)
+}
+
 /// The store's ready copies, each compared with what it is a copy of: single files under
 /// `files/`, and whole trees under `trees/`. They are plain files that a checkout clones without
 /// reading; this reads them all. One that differs is removed, to be made again when next needed,
@@ -916,6 +950,28 @@ pub fn checkout(store: &mut Store, commit: Id, target: &Path, prefixes: Vec<Vec<
     Ok(mut entries) => entries.next().is_none(),
     Err(_) => !target.exists(),
   };
+  if std::fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    return Err(format!("{} is a symbolic link: a checkout makes a workspace in a directory, not through a link to one", target.display()));
+  }
+  // On a file system that takes `Link` and `link` for one name, a tree that has both cannot be
+  // written as it is: one would be written through the other.
+  if let Some(root) = root_of(store, &commit)? {
+    std::fs::create_dir_all(target).map_err(|e| fail("create", target, e))?;
+    // A tree is looked over once: that it has no such names is noted beside the store's copy of it.
+    let noted = store.dir.join("trees").join(format!("{}.names-checked", hex(&root)));
+    if !noted.exists() && folds_names(target) {
+      if let Some((a, b)) = crate::manifest::folded_twins(store, root, b"")? {
+        return Err(format!(
+          "the commit has both `{}` and `{}`, which this file system takes for one name: it cannot be checked out here",
+          String::from_utf8_lossy(&a),
+          String::from_utf8_lossy(&b)
+        ));
+      }
+      if std::fs::create_dir_all(store.dir.join("trees")).is_ok() {
+        let _ = std::fs::write(&noted, b"");
+      }
+    }
+  }
   if !vacant {
     return Err(format!(
       "{} is there already and is not empty: a checkout makes a workspace, it does not write over files. To go to another commit in a workspace, use `nv restore` or `nv git switch` there; or check out into a new directory.",
@@ -1174,9 +1230,11 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     return Ok(());
   }
   found.looked.reads += 1;
-  let (mode, mut bytes) = match std::fs::File::open(&full) {
+  // A link is read as a link, and what it leads to is never opened: a pipe there would wait for ever.
+  let opened = if meta.is_file() { std::fs::File::open(&full).map(drop) } else { Ok(()) };
+  let (mode, mut bytes) = match opened {
     // One file that may not be read is not a reason to record nothing of the others.
-    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !meta.file_type().is_symlink() => {
+    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
       eprintln!("nv: {} may not be read ({e}): it is left out of this look, and of what is recorded", full.display());
       return Ok(());
     }
@@ -1380,6 +1438,13 @@ pub fn status(ws: &Workspace, look: Look) -> Result<(Vec<Difference>, Looked)> {
           }
         }
       }
+      // Two spellings reported of one file are one path, as the index knows it: looked at once.
+      todo.sort_by(|a, b| a.0.cmp(&b.0));
+      todo.dedup_by(|a, b| a.0 == b.0);
+      if names_fold(ws) {
+        let mut seen = std::collections::HashSet::new();
+        todo.retain(|(path, _)| seen.insert(Names::fold(path)));
+      }
       finish(ws, index, todo)
     }
   }
@@ -1436,6 +1501,11 @@ pub fn status_at(ws: &Workspace, tracked: bool, under: &[Vec<u8>]) -> Result<(Ve
 /// name the index does not have may there be a file it does have, spelt
 /// another way; Git on such a file system takes it for that file, and so
 /// does this.
+/// Whether this workspace's file system takes names that differ in case for one name.
+fn names_fold(ws: &Workspace) -> bool {
+  ws.root.join(META.to_ascii_uppercase()).join("workspace").is_file()
+}
+
 struct Names<'a> {
   index: &'a Index,
   folds: bool,
@@ -1805,6 +1875,16 @@ pub fn record_events(ws: &Workspace, events: &std::collections::BTreeSet<Vec<u8>
         if index.get(path).is_some() {
           reported.push(path.clone());
         }
+        // A directory made where one was (moved away, and another made): what the index has below
+        // it and the disk does not is gone, though no event says so.
+        if index.has_under(path) {
+          let below = [path.as_slice(), b"/"].concat();
+          for (known, _) in index.entries().into_iter().filter(|(known, _)| known.starts_with(&below)) {
+            if std::fs::symlink_metadata(ws.root.join(to_path(&known))).is_err() {
+              reported.push(known);
+            }
+          }
+        }
         // Build output arrives as directories by the hundred; they are not walked.
         if !rules.ignored(&[path.as_slice(), b"/."].concat()) || index.has_under(path) {
           files_under(&full, &mut path.clone(), &mut reported);
@@ -1868,14 +1948,22 @@ pub fn restore_to(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
     // behind it than the workspace now does, because the workspace was reset to an older commit,
     // is still somewhere to go: its files bring back, as changes not yet committed, what the reset
     // took away, as checking its files out with Git would.)
+    let own: std::collections::HashSet<&str> = logged.iter().map(|(_, _, id)| id.as_str()).collect();
     let mut at = Some(target);
     let mut within = false;
+    let mut all_own = true;
     for _ in 0..65536 {
-      let Some(id) = at else { break };
+      let Some(id) = at else {
+        // Down to a state with nothing before it, all of them recorded here: made before the
+        // first commit, on nothing anyone else made.
+        within = all_own;
+        break;
+      };
       if stands_on.contains(&id) {
         within = true;
         break;
       }
+      all_own &= own.contains(hex(&id).as_str());
       at = Commit::load(store, &id)?.parents.first().copied();
     }
     if !within {
@@ -1937,19 +2025,52 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
       }
       continue;
     }
-    // A directory that may not be listed or written in: found now, not half-way through.
-    if let Some(parent) = full.parent().filter(|parent| parent.is_dir()) {
-      let closed = *unlistable.entry(parent.to_path_buf()).or_insert_with(|| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::read_dir(parent).is_err() || std::fs::metadata(parent).is_ok_and(|meta| meta.permissions().mode() & 0o200 == 0)
-      });
-      if closed {
-        blocking.push(parent.strip_prefix(&ws.root).unwrap_or(parent).display().to_string());
-        continue;
+    // A directory that may not be listed or written in, on the way to the file: found now, not
+    // half-way through. The nearest one there is the one the file, or the directories it needs,
+    // are made in; any above it has to be one that can be gone through.
+    let blocked_before = blocking.len();
+    let mut on_the_way = full.parent();
+    while let Some(dir) = on_the_way.filter(|dir| dir.starts_with(&ws.root) && *dir != ws.root.as_path()) {
+      if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        // A file or a link standing there is the other checks' to judge: only a directory is gone into.
+        if !meta.is_dir() {
+          break;
+        }
+        let closed = *unlistable.entry(dir.to_path_buf()).or_insert_with(|| {
+          use std::os::unix::fs::PermissionsExt;
+          std::fs::read_dir(dir).is_err() || std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o200 == 0)
+        });
+        if closed {
+          blocking.push(dir.strip_prefix(&ws.root).unwrap_or(dir).display().to_string());
+        }
+        break;
       }
+      on_the_way = dir.parent();
+    }
+    if blocking.len() > blocked_before {
+      continue;
     }
     let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+    // A directory where something else has to be: emptied first, so each directory in it has to
+    // be one things can be removed from.
+    if meta.is_dir() && entry.is_some_and(|e| !e.is_dir()) {
+      use std::os::unix::fs::PermissionsExt;
+      let mut todo = vec![full.clone()];
+      while let Some(dir) = todo.pop() {
+        let writable = std::fs::metadata(&dir).is_ok_and(|meta| meta.permissions().mode() & 0o300 == 0o300);
+        match std::fs::read_dir(&dir) {
+          Ok(listing) if writable => todo.extend(listing.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path())),
+          _ => {
+            blocking.push(dir.strip_prefix(&ws.root).unwrap_or(&dir).display().to_string());
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    // A pipe, a socket, a device: nothing nv tracks, so nothing it may remove.
     if !meta.is_file() && !meta.file_type().is_symlink() {
+      blocking.push(String::from_utf8_lossy(path).into_owned());
       continue;
     }
     // A file the state left has nothing at this path of: nv did not record it (the rules leave it
@@ -2289,8 +2410,9 @@ pub fn fold(store: &mut Store, ws: &mut Workspace) -> Result<()> {
   let _ = (from, to);
   // Where the snapshots were, so that nv's own commands find them again: a look in Git's terms
   // is not to change what a later `nv commit` publishes.
-  if let (Some(head), Some(base)) = (ws.head, ws.base) {
-    crate::write_whole(&ws.root.join(META).join("folded"), format!("{} {}\n", hex(&head), hex(&base)))?;
+  if let Some(head) = ws.head {
+    let base = ws.base.map_or("-".to_string(), |base| hex(&base));
+    crate::write_whole(&ws.root.join(META).join("folded"), format!("{} {base}\n", hex(&head)))?;
   }
   let base = ws.base;
   move_head(store, ws, base)
@@ -2301,15 +2423,30 @@ pub fn fold(store: &mut Store, ws: &mut Workspace) -> Result<()> {
 pub fn unfold(store: &mut Store, ws: &mut Workspace) -> Result<()> {
   let noted = ws.root.join(META).join("folded");
   let Ok(text) = std::fs::read_to_string(&noted) else { return Ok(()) };
-  let mut ids = text.split_whitespace().filter_map(|id| unhex(id).and_then(|bytes| Id::try_from(bytes).ok()));
-  if let (Some(head), Some(base)) = (ids.next(), ids.next())
-    && ws.base == Some(base)
-    && ws.head == Some(base)
+  let mut words = text.split_whitespace();
+  let id = |word: Option<&str>| word.and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok());
+  let (head, base) = (id(words.next()), words.clone().next().map(|word| if word == "-" { None } else { id(Some(word)) }));
+  // `base` is `Some(None)` where the snapshots were before any commit.
+  if let (Some(head), Some(base)) = (head, base)
+    && ws.base == base
+    && ws.head == base
     && store.contains(&head)
   {
-    move_head(store, ws, Some(head))?;
-    // The snapshots are on the commit, as they were: moving the head took the base along.
-    ws.base = Some(base);
+    // The index first, then where the workspace stands, in one write: the head on the snapshots,
+    // the base where it was. Written as two, a kill between them left the snapshots as the
+    // workspace's commit, and the next push published what nobody had committed.
+    let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+    let (from, to) = (tree(store, ws.head)?, tree(store, Some(head))?);
+    let mut index = ws.load_index();
+    for (path, entry) in crate::manifest::diff(store, from, to)? {
+      match entry {
+        // Known to be this entry in the snapshot; whether the file still is, is for the next look to say.
+        Some(entry) => index.insert(path, Indexed { entry, size: 0, mtime: 0, ctime: 0 }),
+        None => index.remove(&path),
+      }
+    }
+    index.save()?;
+    ws.head = Some(head);
     ws.save()?;
   }
   let _ = std::fs::remove_file(noted);
@@ -2645,7 +2782,9 @@ pub fn fork(from: &Path, to: &Path) -> Result<()> {
     let _lock = lock(from)?;
     let (found, _) = status(&Workspace::open(from)?, Look::Everywhere)?;
     if let Err(e) = clone_tree(from, to) {
-      // Half a copy with nv's directory in it would pass for a workspace.
+      // Half a copy with nv's directory in it would pass for a workspace: taken away, its modes
+      // first, which were copied with it and may not let it be.
+      let _ = std::process::Command::new("chmod").arg("-R").arg("u+rwx").arg(to).status();
       let _ = std::fs::remove_dir_all(to);
       return Err(format!("cannot copy {} to {}: {e}", from.display(), to.display()));
     }

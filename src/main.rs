@@ -289,7 +289,12 @@ fn run(args: &[String]) -> Result<()> {
       );
     }
     "status" => {
-      let ws = Workspace::open(Path::new(arg(1)?))?;
+      let mut ws = Workspace::open(Path::new(arg(1)?))?;
+      // Snapshots a look in Git's terms set aside are what status lists against, as ever.
+      if ws.root.join(".nv").join("folded").exists() {
+        let mut store = Store::open(&ws.store)?;
+        workspace::unfold(&mut store, &mut ws)?;
+      }
       let (found, looked) = workspace::status(&ws, Look::Everywhere)?;
       for (path, new, old) in found {
         let mark = match (new.is_some(), old.is_some()) {
@@ -352,6 +357,15 @@ fn run(args: &[String]) -> Result<()> {
       if arg(2)?.trim().is_empty() {
         return Err("a commit needs a message that says something".into());
       }
+      // A file holding both versions between a sync's markers, put back by a restore after the
+      // sync's own note was cleared, is not published either.
+      let marked = workspace::with_sync_markers(&mut store, &ws)?;
+      if !marked.is_empty() {
+        return Err(format!(
+          "these hold both versions between the markers a sync leaves (<<<<<<< yours ... >>>>>>> theirs): {}\nEdit them to what they should be, then commit.",
+          marked.join(", ")
+        ));
+      }
       // Beside a Git repository it is Git that makes the commit, by its own rules.
       if newvcs::colocated::shared(&ws.root) {
         match newvcs::colocated::commit(&mut store, &mut ws, AUTHOR, arg(2)?, look(3))? {
@@ -396,6 +410,11 @@ fn run(args: &[String]) -> Result<()> {
         }
         _ => workspace::restore_to(&mut store, &mut ws, target, AUTHOR, look(3))?,
       };
+      // Beside Git, Git goes with nv at once: a commit made with Git before the next command of
+      // nv's would otherwise be made on where the workspace was, and undo what it went back over.
+      if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
+        eprintln!("nv: {done}");
+      }
       let kept = done.kept.map(|id| format!("; what was on disk is kept as {}", hex(&id))).unwrap_or_default();
       println!(
         "restored to {}: {} files written, {} removed, in {:.1} ms{kept}",

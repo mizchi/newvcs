@@ -1026,3 +1026,147 @@ fn what_an_eighth_reviewer_found_in_syncing_stays_fixed() {
   let again = ann.push().unwrap();
   assert_eq!((again.updated, again.rebased), (0, 0), "{again:?}");
 }
+
+#[test]
+fn git_beside_nv_is_never_left_where_its_next_commit_undoes_someone() {
+  let Some((root, url)) = shared_file("git-along") else { return };
+  let mut ann = Peer::new(&root, "ann", &[], &url);
+  ann.write("start", "s\n");
+  ann.commit("start");
+  ann.push().unwrap();
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      "git clone -q repo c && cd c && git config user.name c && git config user.email c@example.com && {nv} adopt . >/dev/null && {nv} remote . {url} main && {nv} sync . >/dev/null"
+    ),
+  );
+  let c = |script: &str| sh(&root, &format!("NV={nv}; cd c; {script}"));
+  // Ann changes a line; the Git user changes the same one, syncs, and undoes the sync.
+  replace_line(&ann, "shared.txt", 5, "line 5 ann");
+  ann.commit("a5");
+  ann.push().unwrap();
+  c(
+    "sed -i '' 's/^line 5$/line 5 c/' shared.txt && git commit -qam c5 && { $NV sync . >/dev/null 2>&1 || true; } && $NV restore . before-sync >/dev/null",
+  );
+  // Git is back where nv is, at once: a plain commit now is a commit on c5, not a revert of a5.
+  assert_eq!(c("git log -1 --format=%s; git status --porcelain"), "c5\n");
+  c(
+    "echo typo >> other.txt && git add other.txt && git commit -qm 'fix typo' && ($NV push . >/dev/null 2>&1 || true) && ($NV sync . >/dev/null 2>&1 || true)",
+  );
+  ann.sync().ok();
+  assert!(
+    ann.read("shared.txt").unwrap().contains("line 5 ann") || ann.read("shared.txt").unwrap().contains("<<<<<<<"),
+    "Ann's line is not silently gone"
+  );
+
+  // A sync killed while it brings Git along: the next command finishes it, index and all. (In a
+  // Git repository of its own, with no work of its own: what is checked is only that Git follows.)
+  sh(
+    &root,
+    &format!(
+      "git clone -q repo d && cd d && git config user.name d && git config user.email d@example.com && {nv} adopt . >/dev/null && {nv} remote . {url} main && {nv} sync . >/dev/null"
+    ),
+  );
+  let c = |script: &str| sh(&root, &format!("NV={nv}; cd d; {script}"));
+  for round in 0..40 {
+    ann.sync().unwrap();
+    ann.write("f1", &format!("f1 {round}\n"));
+    ann.write("f2", &format!("f2 {round}\n"));
+    ann.commit(&format!("a {round}"));
+    ann.push().unwrap();
+    let pause = 20 + (round * 7) % 90;
+    c(&format!(
+      "$NV sync . >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $pid 2>/dev/null || true; wait $pid 2>/dev/null || true"
+    ));
+    c("$NV sync . >/dev/null 2>&1 || $NV restore . before-sync >/dev/null 2>&1 || true");
+    let state = c("$NV check . | tail -1; git status --porcelain | grep -v '^??' || true");
+    assert_eq!(state, "in step\n", "round {round}: Git is not where nv is");
+  }
+}
+
+#[test]
+fn a_push_that_landed_unheard_is_known_for_this_workspaces_own() {
+  let Some((root, url)) = shared_file("unheard") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  ann.write("afile", "A\n");
+  ann.commit("a0");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  bob.write("fb", "v0\n");
+  bob.commit("b0");
+  bob.push().unwrap();
+  ann.sync().unwrap();
+  ann.write("afile", "A2\n");
+  ann.commit("a1");
+  ann.push().unwrap();
+  // Bob's push lands on the newer tip, and Bob never hears so (killed): his workspace is as before it.
+  bob.write("fb", "v1\n");
+  bob.commit("b1");
+  let before = std::fs::read(bob.dir.join(".nv/workspace")).unwrap();
+  bob.push().unwrap();
+  std::fs::write(bob.dir.join(".nv/workspace"), &before).unwrap();
+  bob.ws = Workspace::open(&bob.dir).unwrap();
+  // Another commit of his own on top, and a sync: no conflict with himself.
+  bob.write("fb", "v2\n");
+  bob.commit("b2");
+  let synced = bob.sync().unwrap();
+  assert!(synced.conflicts.is_empty(), "{synced:?}");
+  assert_eq!(bob.read("fb").as_deref(), Some("v2\n"));
+  bob.push().unwrap();
+  ann.sync().unwrap();
+  assert_eq!((ann.read("fb").as_deref(), ann.read("afile").as_deref()), (Some("v2\n"), Some("A2\n")));
+  let said = history(&mut ann);
+  assert_eq!(said.iter().filter(|s| *s == "b1").count(), 1, "{said:?}");
+  assert_eq!(said[0], "b2", "{said:?}");
+}
+
+#[test]
+fn what_a_tenth_reviewer_found_in_pushing_stays_fixed() {
+  let Some((root, url)) = shared_file("tenth") else { return };
+  let nv = env!("CARGO_BIN_EXE_nv");
+  let mut bob = Peer::new(&root, "bob", &[], &url);
+  bob.write("start", "s\n");
+  bob.commit("start");
+  bob.push().unwrap();
+  sh(&root, &format!("{nv} git clone -q repo a && {nv} remote a {url} main && {nv} sync a >/dev/null"));
+  let a = |script: &str| sh(&root, &format!("NV={nv}; cd a; {script}"));
+  // After a look in Git's terms, a command killed in its first moments never makes what is not
+  // committed the workspace's commit.
+  a("sed -i '' 's/^line 1$/committed/' shared.txt && $NV commit . c1 >/dev/null && $NV push . >/dev/null");
+  for round in 0..60 {
+    a(&format!(
+      "sed -i '' 's/^line 3.*$/line 3 not committed {round}/' shared.txt && $NV mark . m >/dev/null && $NV git status --short >/dev/null"
+    ));
+    let pause = round % 7;
+    a(&format!(
+      "$NV push . >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $p 2>/dev/null || true; wait $p 2>/dev/null || true"
+    ));
+    assert_eq!(a("$NV git log -1 --format=%s"), "c1\n", "round {round}: the last commit is not the one made");
+    assert!(a("$NV since . base").contains("shared.txt"), "round {round}: the edit is no longer pending");
+  }
+  a("$NV push . >/dev/null 2>&1 || true");
+  bob.sync().unwrap();
+  assert!(!bob.read("shared.txt").unwrap().contains("not committed"), "nothing uncommitted reached the ref");
+
+  // A commit a sync put on another's tip, pushed and landed unheard, then a commit of the same lines: no conflict with oneself.
+  a("($NV restore . base >/dev/null 2>&1 || true) && ($NV sync . >/dev/null 2>&1 || true)");
+  bob.sync().unwrap();
+  bob.write("g.txt", "b\n");
+  bob.commit("b1");
+  bob.push().unwrap();
+  a(
+    "sed -i '' 's/^line 7$/A1/' shared.txt && $NV commit . a1 >/dev/null && $NV sync . >/dev/null && cp .nv/workspace ../a-before && $NV push . >/dev/null && cp ../a-before .nv/workspace",
+  );
+  a("sed -i '' 's/^A1$/A1b/' shared.txt && $NV commit . a3 >/dev/null");
+  let said = a("$NV push . 2>&1 || $NV sync . 2>&1; true");
+  assert!(!said.contains("same lines"), "{said}");
+  a("$NV push . >/dev/null 2>&1 || true");
+  bob.sync().unwrap();
+  assert!(bob.read("shared.txt").unwrap().contains("A1b\n"));
+
+  // A file with a sync's markers, committed with `nv git`, is not pushed.
+  a("printf 'x\\n<<<<<<< yours\\nmine\\n=======\\ntheirs\\n>>>>>>> theirs\\n' > m.txt && $NV git add m.txt && $NV git commit -qm markers");
+  let refused = a("$NV push . 2>&1 || true");
+  assert!(refused.contains("markers"), "{refused}");
+}

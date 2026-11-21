@@ -112,7 +112,10 @@ tracked asks about what is tracked.
   set whole is written where its names say. A server is not trusted to
   have checked, nor a client. An object read from the store is hashed
   before it is used. The server keeps what kind of object each id it was
-  handed is, and takes only one line of commits for a ref.
+  handed is, and takes only one line of commits for a ref. Paths are 1,024
+  bytes at most; two names a case-folding, normalizing file system takes
+  for one are not in one tree; a ref only goes forward, as a client sees
+  it.
 - **nv removes only what it can give back.** A file it tracks is recorded
   before it is written over. A file it does not track, or may not read,
   is never removed or written over to make way: the command refuses and
@@ -266,7 +269,7 @@ because the borrowed code is known to be good.
 - A new option goes into `SPOKEN` in `src/gitcli.rs` together with a case
   that fails first. Capture what Git prints before writing the code.
 - A difference someone finds becomes a line of a case before it is fixed.
-  Cases 22 to 31 are reviewers' findings.
+  Cases 22 to 32 are reviewers' findings.
 
 ## How it is checked by someone else
 

@@ -44,7 +44,7 @@
 // of them. What a repository may read is what its table says it was given:
 // knowing an id is not having the content.
 
-import { hex, refOk, unhex } from "./commit.ts";
+import { hex, MAX_PATH, refOk, unhex } from "./commit.ts";
 import { blobHasher, blobId, hash, objectId } from "./hash.ts";
 import { Repo, type Placed, type Step } from "./repo.ts";
 import { decodeTree, KIND_TREE, MODE_DIR, MODE_GITLINK } from "./tree.ts";
@@ -151,6 +151,24 @@ export default {
           // answer, for the writer to send.
           const trees = frames(await body()).map((bytes) => ({ id: objectId(KIND_TREE, bytes), bytes, entries: decodeTree(bytes) }));
           const given = new Set(trees.map((t) => hex(t.id)));
+          // No path below these longer than a file system takes: worked out without recursion,
+          // from each tree handed over down through the others handed over with it.
+          {
+            const byId = new Map(trees.map((t) => [hex(t.id), t]));
+            const below = new Set(trees.flatMap((t) => t.entries.filter((e) => e.mode === MODE_DIR).map((e) => hex(e.id))));
+            const todo: [string, number][] = trees.filter((t) => !below.has(hex(t.id))).map((t) => [hex(t.id), 0]);
+            const deepest = new Map<string, number>();
+            while (todo.length > 0) {
+              const [id, length] = todo.pop()!;
+              if ((deepest.get(id) ?? -1) >= length) continue;
+              deepest.set(id, length);
+              for (const e of byId.get(id)?.entries ?? []) {
+                const path = length + e.name.length + 1;
+                if (path > MAX_PATH) return json({ error: "a directory below these has a path longer than a file system takes" }, 400);
+                if (e.mode === MODE_DIR && byId.has(hex(e.id))) todo.push([hex(e.id), path]);
+              }
+            }
+          }
           const below = (dirs: boolean) => {
             const ids = new Map<string, Uint8Array>();
             for (const t of trees) for (const e of t.entries) if (e.mode !== MODE_GITLINK && (e.mode === MODE_DIR) === dirs) ids.set(hex(e.id), e.id);
@@ -167,7 +185,10 @@ export default {
           let adopted = 0;
           const from = url.searchParams.get("from")?.match(/^\/([^/]+\/[^/]+)$/)?.[1];
           if (from && missing.length > 0) {
-            const theirs = await repos.get(repos.idFromName(from)).where(missing);
+            const source = repos.get(repos.idFromName(from));
+            // A file's content, not a directory: what the source repository was handed as one stays one.
+            const dirs = await source.trees(missing);
+            const theirs = (await source.where(missing)).filter((c) => !dirs.has(hex(c.id)));
             await repo.place(theirs);
             adopted = theirs.length;
             const taken = new Set(theirs.map((c) => hex(c.id)));

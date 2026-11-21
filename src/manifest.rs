@@ -37,7 +37,68 @@ impl Entry {
 /// any case of letters), has no NUL in it, and has no part longer than a
 /// file system will take. These are Git's rules for a tree, and one more.
 pub fn path_ok(path: &[u8]) -> bool {
-  !path.is_empty() && path.len() <= 4096 && path.split(|&b| b == b'/').all(name_ok)
+  !path.is_empty() && path.len() <= MAX_PATH && path.split(|&b| b == b'/').all(name_ok)
+}
+
+/// The longest path a tree may have, below its top: what macOS takes in one path. Longer, a
+/// file could be committed on one system and never written on another, and every sync of the
+/// ref would stop at it.
+pub const MAX_PATH: usize = 1024;
+
+/// Two entries of one directory that a file system which does not tell case or composed
+/// characters apart takes for one name.
+pub fn dir_twins(store: &mut Store, root: Option<Id>, dir: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+  use unicode_normalization::UnicodeNormalization;
+  let id = match (root, dir.is_empty()) {
+    (Some(root), true) => root,
+    (Some(root), false) => match lookup(store, root, dir)? {
+      Some(entry) if entry.is_dir() => entry.id,
+      _ => return Ok(None),
+    },
+    (None, _) => return Ok(None),
+  };
+  let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
+  for name in load(store, &id)?.into_keys() {
+    let folded = match std::str::from_utf8(&name) {
+      Ok(text) => text.nfc().collect::<String>().to_lowercase().into_bytes(),
+      Err(_) => name.to_ascii_lowercase(),
+    };
+    let path = if dir.is_empty() { name.clone() } else { [dir, b"/", name.as_slice()].concat() };
+    if let Some(other) = seen.insert(folded, path.clone()) {
+      return Ok(Some((other, path)));
+    }
+  }
+  Ok(None)
+}
+
+/// Names a file system that does not tell case or composed characters apart takes for one: the
+/// first such pair in each directory below `root`, as two paths. Walked without recursion, and
+/// refused as too deep past `MAX_PATH`.
+pub fn folded_twins(store: &mut Store, root: Id, at: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+  use unicode_normalization::UnicodeNormalization;
+  let fold = |name: &[u8]| -> Vec<u8> {
+    match std::str::from_utf8(name) {
+      Ok(text) => text.nfc().collect::<String>().to_lowercase().into_bytes(),
+      Err(_) => name.to_ascii_lowercase(),
+    }
+  };
+  let mut todo = vec![(at.to_vec(), root)];
+  while let Some((dir, id)) = todo.pop() {
+    let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
+    for (name, entry) in load(store, &id)? {
+      let path = if dir.is_empty() { name.clone() } else { [dir.as_slice(), b"/", name.as_slice()].concat() };
+      if path.len() > MAX_PATH {
+        return Err(format!("a tree has a path longer than {MAX_PATH} bytes, below `{}`", String::from_utf8_lossy(&dir)));
+      }
+      if let Some(other) = seen.insert(fold(&name), path.clone()) {
+        return Ok(Some((other, path)));
+      }
+      if entry.is_dir() {
+        todo.push((path, entry.id));
+      }
+    }
+  }
+  Ok(None)
 }
 
 /// Whether one name, an entry of a directory, may be in a tree: not empty, not `.` or `..`,

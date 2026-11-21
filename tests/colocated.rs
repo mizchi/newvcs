@@ -485,3 +485,23 @@ fn a_hook_that_never_returns_is_stopped_and_gits_index_is_as_it_was() {
   // Without the hook, the work is published as ever.
   ok(&dir, "rm .git/hooks/pre-commit && $NV commit . 'no hook' >/dev/null && git status --porcelain");
 }
+
+#[test]
+fn what_a_tenth_reviewer_found_beside_git_stays_fixed() {
+  let dir = adopted("tenth");
+  // The user's own removal from Git, of a file nv saw go and come back, is the user's still.
+  ok(
+    &dir,
+    "echo x > b.txt && git add b.txt && git commit -qm b && rm a.txt && $NV snapshot . >/dev/null && printf 'one\\ntwo\\nthree\\n' > a.txt",
+  );
+  ok(&dir, "git rm -q --cached a.txt && echo 2 > b.txt && $NV record . b.txt && $NV commit . m --recorded >/dev/null; sleep 1.2");
+  assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _"), "D__a.txt\n??_a.txt");
+  ok(&dir, "git add a.txt && git status --porcelain");
+  // A hook that stages a file of its own, while the user has something staged: Git's index knows of it after.
+  ok(&dir, "printf '#!/bin/sh\\necho hooked >> hookfile\\ngit add hookfile\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit");
+  ok(&dir, "echo u > u.txt && git add u.txt && echo 3 > b.txt && $NV record . b.txt && $NV commit . m2 --recorded >/dev/null; sleep 1.2");
+  assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _"), "A__u.txt");
+  ok(&dir, "rm .git/hooks/pre-commit && git commit -qm user");
+  assert_eq!(ok(&dir, "git show --format= --name-status HEAD"), "A\tu.txt");
+  assert_eq!(ok(&dir, "git ls-files hookfile"), "hookfile");
+}

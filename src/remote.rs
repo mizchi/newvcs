@@ -36,7 +36,14 @@ fn http() -> &'static ureq::Agent {
   AGENT.get_or_init(|| {
     let mut agent = ureq::AgentBuilder::new();
     if let Some(quiet) = crate::limits::http_quiet() {
-      agent = agent.timeout_connect(quiet.min(std::time::Duration::from_secs(10))).timeout_read(quiet).timeout_write(quiet);
+      // Each request on a connection of its own: a connection kept for the next request is
+      // read without the limit on how long it may stay silent.
+      agent = agent
+        .timeout_connect(quiet.min(std::time::Duration::from_secs(10)))
+        .timeout_read(quiet)
+        .timeout_write(quiet)
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0);
     }
     agent.build()
   })
@@ -138,6 +145,15 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
     let bytes = step["bytes"].as_str().and_then(unhex).filter(|b| object_id(Kind::Commit, b) == id);
     let bytes = bytes.ok_or_else(|| format!("the server did not hand over commit {}", hex(&id)))?;
     let commit = Commit::decode(&bytes)?;
+    // A ref is one line of commits, as the server keeps it: a merge would leave a parent here
+    // nobody has, and a history nobody can write out.
+    if commit.parents.len() > 1 {
+      return Err(format!(
+        "the server handed over commit {} with {} parents: a ref holds one line of commits",
+        hex(&id),
+        commit.parents.len()
+      ));
+    }
     if let Some(parent) = commit.parents.first().filter(|p| !store.contains(p)) {
       return Err(format!("the ref's history starts from a commit this store does not have ({})", hex(parent)));
     }
@@ -160,6 +176,10 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
     }
     if let Some(lost) = dirs.iter().find(|id| !store.contains(id)) {
       return Err(format!("the server did not hand over the directory {}", hex(lost)));
+    }
+    // A directory too deep for any file system to write is refused before anything is written.
+    for dir in &dirs {
+      crate::manifest::folded_twins(store, *dir, b"")?;
     }
   }
   Ok(taken)
@@ -291,6 +311,21 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     done.synced = sync(store, ws, author)?;
     return Ok(done);
   }
+  // A file holding both versions between a sync's markers is not published, however it was
+  // committed (with `nv git commit` after a restore, the sync's own note is gone).
+  for commit in &chain {
+    for (path, entry) in &commit.changes {
+      let Some(entry) = entry.filter(|e| !e.is_dir() && e.mode != MODE_GITLINK) else { continue };
+      let Some(bytes) = store.get(&entry.id)? else { continue };
+      let lines = || bytes.split(|&b| b == b'\n');
+      if lines().any(|line| line == b"<<<<<<< yours") && lines().any(|line| line == b">>>>>>> theirs") {
+        return Err(format!(
+          "`{}` holds both versions between the markers a sync leaves, in a commit not pushed yet. Nothing was sent: edit it to what it should be, commit, and push again.",
+          String::from_utf8_lossy(path)
+        ));
+      }
+    }
+  }
   // A ref is one line of commits. A merge has a second parent the ref would not have, and whoever
   // synced it could not read its history.
   if let Some(merge) = chain.iter().find(|commit| commit.parents.len() > 1) {
@@ -370,9 +405,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     let landed_at = tip.seq;
     let arrived = arrive(store, ws, &url, tip, author);
     if arrived.is_err() {
-      // The ref has these commits: from here on it is this workspace's last of them that the two
-      // agree on, and what the ref takes after this position that a push is checked against.
-      (ws.pushed, ws.seq) = (ws.base, landed_at);
+      // The ref has these commits, under ids the server gave them. Where the workspace stands on
+      // the ref is asked again next time, and its commits are known there by what they are.
+      let _ = landed_at;
+      (ws.pushed, ws.seq) = (None, 0);
       ws.save()?;
     }
     done.synced = arrived.map_err(|why| {
@@ -439,6 +475,26 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
     return Ok(Synced::default());
   }
   let commits = take_commits(store, &url, &answer)?;
+  // A ref only goes forward: its tip now has what this workspace last saw of it behind it.
+  if let Some(seen) = ws.pushed {
+    let mut at = Some(tip.id);
+    let mut found = false;
+    for _ in 0..1_000_000 {
+      let Some(id) = at else { break };
+      if id == seen {
+        found = true;
+        break;
+      }
+      at = Commit::load(store, &id)?.parents.first().copied();
+    }
+    if !found {
+      return Err(format!(
+        "the server says the ref is at {}, which does not have {} behind it, where this workspace last saw the ref: a ref only goes forward. Nothing was touched.",
+        &hex(&tip.id)[..12],
+        &hex(&seen)[..12]
+      ));
+    }
+  }
   let mut done = arrive(store, ws, &url, tip, author)?;
   done.commits = commits;
   Ok(done)
@@ -575,24 +631,73 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     Some(id) => root_of(store, &id),
     None => Ok(None),
   };
+  // Commits of this workspace's own that the ref has though the workspace never heard so (a push
+  // killed after it landed): the ref's commits since the common point, in order, that are these
+  // commits again (the same message, the same changes) on whatever the server put them on. The
+  // last of them is where the two agree now, and only what came after is this workspace's to merge.
+  let (mine_since, own_landed, own_on_ref) = {
+    let walk = |store: &mut Store, from: Option<Id>| -> Result<Vec<Id>> {
+      let mut out = Vec::new();
+      let mut at = from;
+      while let Some(id) = at.filter(|id| Some(*id) != common) {
+        out.push(id);
+        at = Commit::load(store, &id)?.parents.first().copied();
+        if out.len() > 100_000 {
+          break;
+        }
+      }
+      out.reverse();
+      Ok(out)
+    };
+    let (mine, refs) = (walk(store, ws.base)?, walk(store, Some(tip))?);
+    let key = |store: &mut Store, id: &Id| -> Result<(Vec<u8>, Vec<Change>)> {
+      let commit = Commit::load(store, id)?;
+      Ok((commit.rest, commit.changes))
+    };
+    let mut matched: Option<(Id, Id)> = None;
+    let mut their_copies: Vec<Change> = Vec::new();
+    let mut from_ref = 0;
+    let mut count = 0;
+    'mine: for own in &mine {
+      let wanted = key(store, own)?;
+      while from_ref < refs.len() {
+        let candidate = refs[from_ref];
+        from_ref += 1;
+        if candidate == *own || key(store, &candidate)? == wanted {
+          their_copies.extend(wanted.1.iter().cloned());
+          matched = Some((*own, candidate));
+          count += 1;
+          continue 'mine;
+        }
+      }
+      break;
+    }
+    (mine.len(), matched.map(|(own, on_ref)| (own, on_ref, count)), their_copies)
+  };
+  // What this workspace has to put on the tip starts after the last of those; and what they
+  // changed, the ref has from this workspace, not from anyone else.
+  let mut published_from = None;
+  if let Some((own, _, _)) = own_landed {
+    published_from = Some(root(store, Some(own))?);
+  }
   let from = root(store, common)?;
   let (tip_root, base_root, head_root) = (root(store, Some(tip))?, root(store, ws.base)?, root(store, ws.head)?);
   // A directory either side set whole, and that still is that directory, stays one change.
   let mut whole = workspace::whole_since(store, Some(tip), common)?;
   whole.extend(workspace::whole_since(store, ws.head, common)?);
   let mut theirs = diff_keeping(store, from, tip_root, &whole)?;
-  let mut published = diff_keeping(store, from, base_root, &whole)?;
+  if published_from.is_some() {
+    // A change of this workspace's landed commits, as the ref still has it, is no change of theirs.
+    theirs.retain(|change| !own_on_ref.contains(change));
+  }
+  let mut published = diff_keeping(store, published_from.unwrap_or(from), base_root, &whole)?;
+  let _ = mine_since;
   // What the files have become since the last commit made here: kept apart from that commit all
   // the way through. Merged with theirs as if it were committed, it would come out committed.
   let unpublished = diff_keeping(store, base_root, head_root, &whole)?;
-  let chain = |store: &mut Store| -> Result<usize> {
-    let (mut count, mut at) = (0, ws.base);
-    while let Some(id) = at.filter(|id| Some(*id) != common) {
-      count += 1;
-      at = Commit::load(store, &id)?.parents.first().copied();
-    }
-    Ok(count)
-  };
+  // The commits made here and not yet on the ref.
+  let still_mine = mine_since - own_landed.map_or(0, |(_, _, count)| count);
+  let chain = |_: &mut Store| -> Result<usize> { Ok(still_mine) };
   if published.is_empty() && ws.base != common && Some(tip) != ws.base {
     done.cancelled = chain(store)?;
   }
@@ -630,6 +735,26 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // The contents this store lacks: what is to be written inside the view, and theirs of every
   // file that has to be merged. One request.
   let theirs_files = workspace::removals_first(expand(store, from, &theirs)?);
+  // Where this file system takes two names for one, a directory of the ref's that has both cannot
+  // be written: one would land on the other, or be written through it.
+  if ws.root.join(".NV").join("workspace").is_file() {
+    let mut dirs: Vec<&[u8]> = theirs_files
+      .iter()
+      .filter(|(_, entry)| entry.is_some())
+      .map(|(path, _)| path.iter().rposition(|&b| b == b'/').map_or(&path[..0], |at| &path[..at]))
+      .collect();
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+      if let Some((a, b)) = crate::manifest::dir_twins(store, tip_root, dir)? {
+        return Err(format!(
+          "the ref has both `{}` and `{}`, which this file system takes for one name. Nothing was touched; one of them has to be renamed on the ref, from a workspace on a file system that tells them apart.",
+          String::from_utf8_lossy(&a),
+          String::from_utf8_lossy(&b)
+        ));
+      }
+    }
+  }
   let index = ws.load_index();
   let mut wanted: Vec<(Id, Option<Id>)> = Vec::new();
   for (path, entry) in &theirs_files {

@@ -979,3 +979,104 @@ fn nothing_waits_for_ever() {
   assert!(said.contains("was stopped"), "{said}");
   ok(&dir, "$NV snapshot . >/dev/null");
 }
+
+#[test]
+fn what_a_ninth_reviewer_found_in_recording_stays_fixed() {
+  let dir = workspace("ninth");
+  // A tracked directory that cannot be gone into: refused before anything is written.
+  ok(
+    &dir,
+    "mkdir -p e/d && echo v1 > e/d/a && $NV mark . x >/dev/null && echo v2 > e/d/a && echo v2 > a.txt && $NV mark . y >/dev/null && chmod 000 e && echo v3 > a.txt",
+  );
+  let (code, said) = code_of(&dir, "$NV restore . x 2>&1");
+  ok(&dir, "chmod 755 e");
+  assert_eq!(code, 2, "{said}");
+  assert_eq!(ok(&dir, "cat a.txt e/d/a"), "v3\nv2", "nothing was written: {said}");
+  ok(&dir, "$NV restore . x >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt e/d/a"), "a1\nv1");
+  // A file put back with a sync's markers in it is not committed.
+  ok(&dir, "printf 'x\\n<<<<<<< yours\\nmine\\n=======\\ntheirs\\n>>>>>>> theirs\\n' > b.txt");
+  let (code, said) = code_of(&dir, "$NV commit . 'with markers' 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("b.txt"), "{said}");
+  ok(&dir, "echo b2 > b.txt && $NV commit . settled >/dev/null");
+  // A checkout does not go through a link to a directory.
+  ok(&dir, "mkdir -p ../agent-ninth-empty && ln -sfn ../agent-ninth-empty ../agent-ninth-link");
+  let store = String::from_utf8(std::fs::read(dir.join(".nv/workspace")).unwrap()).unwrap();
+  let store = store.lines().find_map(|line| line.strip_prefix("store ")).map(|at| dir.join(at)).expect("a store");
+  let (code, _) = code_of(&dir, &format!("$NV checkout {} $($NV git rev-parse HEAD) ../agent-ninth-link 2>/dev/null", store.display()));
+  assert_eq!(code, 2);
+  assert_eq!(ok(&dir, "ls -A ../agent-ninth-empty | wc -l | tr -d ' '"), "0");
+  let _ = std::fs::remove_dir_all(dir.join("../agent-ninth-empty"));
+  let _ = std::fs::remove_file(dir.join("../agent-ninth-link"));
+  // After a look in Git's terms, `nv status` lists against the last snapshot, as before it.
+  ok(&dir, "echo new > n.txt && $NV snapshot . >/dev/null && $NV git status >/dev/null && rm n.txt");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "D n.txt");
+  // A watcher sees a directory moved away and another made in its place.
+  ok(&dir, "mkdir w && echo 1 > w/a && echo 2 > w/b && $NV snapshot . >/dev/null && $NV watch . --start >/dev/null");
+  ok(&dir, "mv w w-old && mkdir w && sleep 0.4 && $NV mark . moved --recorded >/dev/null; $NV watch . --stop >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . moved"), "");
+}
+
+#[test]
+fn a_tree_with_names_this_file_system_takes_for_one_is_not_written() {
+  let dir = fresh("twins");
+  // A commit a case-sensitive file system can hold: a link `Link` to outside, and `link/pwned`.
+  ok(
+    &dir,
+    "mkdir outside repo && cd repo && git init -q -b main . && l=$(printf '../outside' | git hash-object -w --stdin) && f=$(echo pwned | git hash-object -w --stdin) && git update-index --add --cacheinfo 120000,$l,Link && git update-index --add --cacheinfo 100644,$f,link/pwned && git commit -q -m twins",
+  );
+  ok(&dir, "$NV import repo store >/dev/null");
+  let head = ok(&dir, "git -C repo rev-parse HEAD");
+  for prefix in ["", " Link link"] {
+    let (code, said) = code_of(&dir, &format!("rm -rf co && $NV checkout store {head} co{prefix} 2>&1"));
+    let folds = ok(&dir, "touch probe-case && test -e PROBE-CASE && echo yes || echo no; rm -f probe-case");
+    if folds == "yes" {
+      assert_eq!(code, 2, "{said}");
+      assert!(said.contains("Link") && said.contains("link"), "{said}");
+    }
+    assert_eq!(ok(&dir, "ls outside | wc -l | tr -d ' '"), "0", "nothing was written outside, through `{prefix}`");
+  }
+}
+
+#[test]
+fn what_a_tenth_reviewer_found_in_recording_stays_fixed() {
+  // Before the first commit: a look in Git's terms changes nothing, and the first snapshot is somewhere to go back to.
+  let dir = fresh("tenth-first");
+  ok(
+    &dir,
+    "$NV git init -q . && echo 1 > a && $NV snapshot . >/dev/null && $NV git status >/dev/null && $NV mark . m --recorded >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "");
+  ok(&dir, "$NV commit . c1 --tracked >/dev/null");
+  assert_eq!(ok(&dir, "$NV git ls-tree --name-only HEAD"), "a");
+  ok(&dir, "echo 2 > a && $NV commit . c2 >/dev/null && $NV restore . m >/dev/null && cat a");
+  let dir = workspace("tenth");
+  // One file reported under two spellings is one path.
+  let folds = ok(&dir, "test -e A.TXT && echo yes || echo no") == "yes";
+  if folds {
+    ok(&dir, "echo 1 > a.txt && $NV record . a.txt A.TXT && $NV snapshot . --recorded >/dev/null");
+    assert_eq!(ok(&dir, "$NV since . base"), "M a.txt");
+    ok(&dir, "$NV commit . 'one path' >/dev/null && $NV restore . base >/dev/null && $NV status . 2>/dev/null");
+  }
+  // A link to a pipe is a link: nothing waits on what it leads to.
+  let started = std::time::Instant::now();
+  ok(
+    &dir,
+    "mkfifo ../agent-tenth-pipe; ln -sf ../agent-tenth-pipe lp && NV_TIMEOUT=20 $NV snapshot . >/dev/null && NV_TIMEOUT=20 $NV status . >/dev/null 2>&1",
+  );
+  assert!(started.elapsed().as_secs() < 10, "it waited {:?}", started.elapsed());
+  ok(&dir, "rm lp ../agent-tenth-pipe && $NV snapshot . >/dev/null");
+  // A directory nothing can be removed from, where a file has to be: refused before anything is written.
+  ok(&dir, "echo s > d2 && $NV commit . 'd2 is a file' >/dev/null && $NV mark . g >/dev/null");
+  ok(&dir, "rm d2 && mkdir -p d2/sub && echo f > d2/sub/f && echo zz > a.txt && $NV snapshot . >/dev/null && chmod 500 d2");
+  let (code, said) = code_of(&dir, "$NV restore . g 2>&1");
+  ok(&dir, "chmod 755 d2");
+  assert_eq!(code, 2, "{said}");
+  assert_eq!(ok(&dir, "cat a.txt d2/sub/f"), "zz\nf", "nothing was written: {said}");
+  ok(&dir, "$NV restore . g >/dev/null && cat d2");
+  // A pipe nobody tracks, where a tracked file has to go: refused, and the pipe stays.
+  ok(&dir, "$NV mark . with-x >/dev/null; echo 1 > x && $NV mark . with-x >/dev/null && rm x && $NV snapshot . >/dev/null && mkfifo x");
+  assert_eq!(code_of(&dir, "$NV restore . with-x 2>/dev/null").0, 2);
+  assert_eq!(ok(&dir, "test -p x && echo pipe; rm x"), "pipe");
+}

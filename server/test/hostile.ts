@@ -156,4 +156,52 @@ assert.equal((await fetch(`${server}/t%zz/x/refs/main`)).status, 400, "a broken 
 assert.equal((await fetch(`${server}/t%2Fa/b/refs/main`)).status, 400, "a slash in an owner");
 for (const bad of ["abc", "-5", "1e300", "1.5"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);
 assert.equal((await fetch(`${server}/${repo}/since/main?after=0`)).status, 200);
+// ---------------------------------------------------------------- names a file system takes for one
+const twins: [string, string][] = [
+  ["README", "readme"],
+  ["caf\u00e9.txt", "cafe\u0301.txt"],
+];
+for (const [one, other] of twins) {
+  const a = text("a\n"), b = text("b\n");
+  const both = commit((await tip()).tip, [
+    { path: text(one), entry: { mode: 0o100644, id: blobIdOf(a) } },
+    { path: text(other), entry: { mode: 0o100644, id: blobIdOf(b) } },
+  ].sort((x, y) => (hex(x.path) < hex(y.path) ? -1 : 1)));
+  assert.equal((await push("main", both, a, b)).status, 400, `${one} and ${other} in one commit were taken`);
+  const pair = [[0o100644, text(one), blobIdOf(a)], [0o100644, text(other), blobIdOf(b)]].sort((x, y) => (hex(x[1] as Uint8Array) < hex(y[1] as Uint8Array) ? -1 : 1)) as [number, Uint8Array, Uint8Array][];
+  assert.equal((await adopt(tree(...pair))).status, 400, `a tree with ${one} and ${other} was taken`);
+}
+// A link and a directory of one name, as a file system that folds case sees them.
+const linkAndDir = commit((await tip()).tip, [
+  { path: text("Link"), entry: { mode: 0o120000, id: blobIdOf(text("../outside")) } },
+  { path: text("link/pwned"), entry: { mode: 0o100644, id: blobIdOf(payload) } },
+]);
+assert.equal((await push("main", linkAndDir, text("../outside"), payload)).status, 400);
+
+// ---------------------------------------------------------------- paths longer than a file system takes
+const long = text("d/".repeat(600) + "f");
+assert.equal((await push("main", commit((await tip()).tip, [{ path: long, entry: { mode: 0o100644, id: blobIdOf(payload) } }]), payload)).status, 400);
+// A chain of directories, each one name deep, handed over at once: too deep, refused whole.
+{
+  let below = tree([0o100644, text("f"), blobIdOf(payload)]);
+  const chain = [below];
+  for (let i = 0; i < 600; i++) {
+    below = tree([0o40000, text("d"), treeId(below)]);
+    chain.push(below);
+  }
+  assert.equal((await adopt(...chain.reverse())).status, 400, "a tree deeper than a path may be was taken");
+}
+
+// ---------------------------------------------------------------- a directory's id, taken over as a file
+{
+  const source = `t/hostile-source-${stamp}`;
+  const inner = tree([0o100644, text("x"), blobIdOf(good)]);
+  const handed = await fetch(`${server}/${source}/adopt/trees`, { method: "POST", body: frame(inner) });
+  assert.equal(handed.status, 200);
+  const disguised = tree([0o100644, text("f"), treeId(inner)]);
+  const taken = (await (await fetch(`${server}/${repo}/adopt/trees?from=/${source}`, { method: "POST", body: frame(disguised) })).json()) as { adopted: number };
+  assert.equal(taken.adopted, 0, "a directory of another repository was taken over as a file's content");
+  const now2 = await tip();
+  assert.equal((await push("main", commit(now2.tip, [{ path: text("f"), entry: { mode: 0o100644, id: treeId(inner) } }]))).status, 400);
+}
 console.log("ok");

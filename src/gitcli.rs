@@ -970,6 +970,9 @@ fn cloned(root: &Path, origin: &Path) -> Res<i32> {
   if let Some((_, tip)) = refs.heads.iter().find(|(name, _)| *name == branch) {
     repo.store.set_ref(&format!("heads/{branch}"), *tip)?;
     workspace::switch(&mut repo.store, &mut repo.ws, *tip)?;
+    // The commit the workspace was made at: where it goes back to if what it does next cannot go on a server's ref.
+    repo.ws.start = Some(*tip);
+    repo.ws.save()?;
   }
   Ok(0)
 }
@@ -1065,6 +1068,12 @@ fn stage(repo: &mut Repo, states: &std::collections::BTreeMap<Vec<u8>, State>, p
     let entry = match &state.disk {
       Some((mode, bytes)) => Some(Entry { mode: *mode, id: repo.store.put(Kind::Blob, bytes, state.index.or(state.head).map(|e| e.id))? }),
       None if state.disk_is_index => state.index,
+      // Known only as staged (a removal, say), and there on disk: what the look over the files did
+      // not list is as the last commit has it.
+      // (A directory standing there is not the file.)
+      None if std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok_and(|meta| !meta.is_dir()) => {
+        state.head
+      }
       None => None,
     };
     // An index entry that says what HEAD says is no entry at all.
@@ -1186,7 +1195,7 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
     // Git will not throw away what is in neither the last commit nor, for the file's edits, the index.
     let changed: Vec<String> = doomed
       .iter()
-      .filter(|p| states.get(*p).is_some_and(|s| s.unstaged() == Some('M') || s.staged().is_some()))
+      .filter(|p| states.get(*p).is_some_and(|s| !s.unmerged && (s.unstaged() == Some('M') || s.staged().is_some())))
       .map(|p| String::from_utf8_lossy(p).into_owned())
       .collect();
     if !changed.is_empty() {
@@ -1200,6 +1209,11 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
     }
   }
   doomed.sort();
+  if repo.merging().is_some() {
+    let mut unmerged = repo.unmerged();
+    unmerged.retain(|path| !doomed.contains(path));
+    repo.set_unmerged(&unmerged)?;
+  }
   let index = repo.ws.load_index();
   for path in &doomed {
     let full = repo.ws.root.join(std::ffi::OsStr::from_bytes(path));
@@ -1237,6 +1251,9 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   }
   if own_place(&to) || own_place(&from) {
     return unsupported(format_args!("mv {from_arg} {to_arg}` (into or out of nv's own directory)"));
+  }
+  if repo.unmerged().iter().any(|path| under(std::slice::from_ref(&from), path)) {
+    return fatal(128, format!("fatal: conflicted, source={from_arg}, destination={to_arg}"));
   }
   let mut staged = repo.staged();
   let index = repo.ws.load_index();
@@ -1305,6 +1322,11 @@ fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
       }
     }
     unstage(&repo, &paths)?;
+    if repo.merging().is_some() {
+      let mut unmerged = repo.unmerged();
+      unmerged.retain(|path| !under(&paths, path));
+      repo.set_unmerged(&unmerged)?;
+    }
     return Ok(0);
   }
   put_back(&mut repo, &given, &paths)
@@ -1421,6 +1443,8 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
     _ => {
       workspace::move_head(&mut repo.store, &mut repo.ws, target)?;
       repo.set_staged(&Staged::new())?;
+      // The index is the commit's again: nothing is unmerged, and no merge is under way.
+      repo.end_merge();
     }
   }
   if let (Some(name), Some(target)) = (repo.branch(), target) {

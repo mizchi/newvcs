@@ -70,6 +70,19 @@ export function decode(bytes: Uint8Array): Commit {
   // leave its history unreadable to whoever synced it.
   if (parents.length > 1) throw new Error("a commit with more than one parent is a merge, and a ref holds one line of commits");
   if (new Set(changes.map((c) => hex(c.path))).size !== changes.length) throw new Error("a commit says two things of one path");
+  // Nor two paths that macOS and Windows take for one: one would be written on, or through, the other.
+  // The directories on the way count as well: `Link` and `link/x` are a link and something through it.
+  const spelled = new Map<string, string>();
+  for (const c of changes) {
+    const parts = utf8.decode(c.path).split("/");
+    for (let n = 1; n <= parts.length; n++) {
+      const text = parts.slice(0, n).join("/");
+      const key = folded(text);
+      const other = spelled.get(key);
+      if (other !== undefined && other !== text) throw new Error("a commit names two paths that differ only in case or in how their characters are composed");
+      spelled.set(key, text);
+    }
+  }
   return { parents, rest, changes };
 }
 
@@ -80,7 +93,7 @@ const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 /// Whether a path may be in a tree (`manifest::path_ok` on the other side), and is text:
 /// every client that syncs writes the paths a commit names, and the server keeps them as text.
 export function pathOk(path: Uint8Array): boolean {
-  if (path.length === 0 || path.length > 4096 || path.includes(0)) return false;
+  if (path.length === 0 || path.length > MAX_PATH || path.includes(0)) return false;
   let text: string;
   try {
     text = utf8.decode(path);
@@ -109,6 +122,12 @@ export function nameOk(name: Uint8Array): boolean {
     return false;
   }
 }
+
+/// The longest path a tree may have (`manifest::MAX_PATH`): what macOS takes in one path.
+export const MAX_PATH = 1024;
+
+/// A name as a file system that does not tell case or composed characters apart sees it.
+export const folded = (text: string) => text.normalize("NFC").toLowerCase();
 
 /// A ref's name: parts of letters, digits and `-_.`, with `/` between them.
 export const refOk = (name: string) => name.length <= 255 && name.split("/").every((part) => /^[A-Za-z0-9_.-]+$/.test(part) && part !== "." && part !== "..");

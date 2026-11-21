@@ -188,8 +188,11 @@ fn mirror(store: &mut Store, ws: &Workspace, was: Option<Id>) -> Result<()> {
   // Git's history holds every version of every file; what came from a server came with the
   // latest only. The rest is fetched before Git is written to.
   crate::remote::fetch_for_export(store, ws)?;
-  // `HEAD` is the branch Git is on, or HEAD itself when it is on none.
-  let (oid, _) = crate::git::export(store, &head, &ws.root, "HEAD")?;
+  // In an order a kill cannot turn into Git on the new commit with an index of the old one: the
+  // objects first, under a ref of nv's; then the index; then HEAD. Killed before HEAD moves, Git
+  // is where it was with the new commit staged, and the next command, finding nv ahead of Git,
+  // does all of it again.
+  let (oid, _) = crate::git::export(store, &head, &ws.root, "refs/nv/mirroring")?;
   match was.filter(|was| *was != head) {
     // Told path by path what changed since the two agreed: Git need not compare two trees to find out.
     Some(was) => {
@@ -216,9 +219,12 @@ fn mirror(store: &mut Store, ws: &Workspace, was: Option<Id>) -> Result<()> {
       }
     }
     None => {
-      run_git(&ws.root, &["reset", "-q", "--no-refresh"])?;
+      run_git(&ws.root, &["read-tree", "--reset", &hex(&oid)])?;
     }
   }
+  // `HEAD` is the branch Git is on, or HEAD itself when it is on none.
+  run_git(&ws.root, &["update-ref", "-m", "nv: where nv is", "HEAD", &hex(&oid)])?;
+  let _ = run_git(&ws.root, &["update-ref", "-d", "refs/nv/mirroring"]);
   let (branch, _) = git_head(&ws.root);
   write_point(&ws.root, &Point { git: Some(hex(&oid)), branch, nv: Some(head) })
 }
@@ -517,6 +523,18 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   if changed.is_empty() {
     return Ok(None);
   }
+  // A removal nv recorded of a file that is on disk again and not in Git's index (the user
+  // removed it from Git with `git rm --cached`): the removal is the user's, staged by them, and
+  // naming the path to `git commit --only` would put the file back in.
+  let changed: Vec<&(Vec<u8>, Option<crate::manifest::Entry>)> = changed
+    .into_iter()
+    .filter(|(path, entry)| {
+      entry.is_some() || in_index.contains(&git_name(&dir, path)) || std::fs::symlink_metadata(dir.join(workspace::to_path(path))).is_err()
+    })
+    .collect();
+  if changed.is_empty() {
+    return Ok(None);
+  }
   let to_add: Vec<&Vec<u8>> =
     changed.iter().filter(|(path, entry)| entry.is_some() || in_index.contains(&git_name(&dir, path))).map(|(path, _)| path).collect();
   let all: Vec<&Vec<u8>> = changed.iter().map(|(path, _)| path).collect();
@@ -691,7 +709,20 @@ fn bring_index_up(root: &Path, ours: bool) -> Result<()> {
   }
   if whole {
     let _ = git(root).args(["reset", "-q"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-  } else if !paths.is_empty() {
+  } else {
+    // Every path the commit changed, not only those nv gave it: a hook may have added others to
+    // it, and Git's index has to know of them too, or the user's next commit takes them back.
+    let changed = match before {
+      "-" => git(root).args(["ls-tree", "-r", "--name-only", "-z", "HEAD"]).output(),
+      _ => git(root).args(["diff-tree", "-r", "--no-renames", "--name-only", "-z", before, "HEAD"]).output(),
+    }
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    let mut paths = paths.to_vec();
+    paths.extend_from_slice(&changed.stdout);
+    if paths.is_empty() {
+      let _ = std::fs::remove_file(note);
+      return Ok(());
+    }
     let mut child = git(root)
       .env("GIT_LITERAL_PATHSPECS", "1")
       .args(["reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"])
@@ -700,7 +731,7 @@ fn bring_index_up(root: &Path, ours: bool) -> Result<()> {
       .stderr(std::process::Stdio::null())
       .spawn()
       .map_err(|e| format!("cannot run git: {e}"))?;
-    child.stdin.take().expect("piped").write_all(paths).map_err(|e| e.to_string())?;
+    child.stdin.take().expect("piped").write_all(&paths).map_err(|e| e.to_string())?;
     child.wait().map_err(|e| e.to_string())?;
   }
   let _ = std::fs::remove_file(note);

@@ -1,5 +1,24 @@
 # newvcs
 
+> [!WARNING]
+> **This is a prototype, not something to use.** newvcs is a proof of
+> concept, written to find out whether its direction holds up: a store
+> that keeps Git's object ids without Git's storage, recording that costs
+> what was written, and many agents writing to one branch at once. It is
+> not meant for real work, and it is not safe for it.
+>
+> - Ten rounds of independent review have each found ways to lose data
+>   that the tests had not ("What reviewers found" below). Each was fixed;
+>   there is no reason to think the eleventh will find none.
+> - The on-disk format, the commands and the server protocol will change
+>   without notice or migration.
+> - The server has no authentication and has never been deployed.
+> - Beside a Git repository (`nv adopt`) it can still leave Git's state
+>   other than you would expect.
+>
+> Do not point it at a repository whose history or working tree you
+> cannot afford to lose. Use a throwaway clone.
+
 An experiment: a version-control store that keeps Git's object ids but not
 Git's storage, shaped for many writers (agents) snapshotting continuously.
 
@@ -1359,8 +1378,106 @@ The other reviewers of the round, on the same build:
   system that takes them for one file, where Git does; merging a tag gave
   another message than Git's, and another id.
 
+The last two reviewers of the round, with random testers again (about
+290,000 steps between them), found:
+
+- **Beside Git, `nv restore <dir> before-sync` left Git on the commits
+  the sync had brought** until the next command of nv's, and a plain
+  `git commit` in between recorded the undoing of another writer's work,
+  which the next push published. Git goes with nv at once now.
+- **Beside Git, a sync killed while it brought Git along left Git's
+  index on the old tree** with every command saying all was in step; a
+  plain `git commit` then reverted what had arrived. Git is brought along
+  in an order a kill cannot break: objects, then the index, then `HEAD`.
+- **A push that landed without the workspace hearing so (killed) made
+  the next commit of the same file a conflict with itself.** A
+  workspace's commits are now known on the ref by their message and
+  their changes, wherever the server put them.
+- A restore wrote half its files before finding a tracked directory it
+  could not go into; a watcher missed a directory moved away and another
+  made in its place; `nv git status` changed what `nv status` listed; a
+  file put back with a sync's markers in it could be committed; a
+  checkout went through a link to a directory; a workspace made by
+  `nv git clone` had nowhere to set its work aside to.
+
 Those are fixed, each with a test that failed first. The concurrency,
-kill and store results of the rounds before held again.
+kill and store results of the rounds before held again: no lost content
+in 27,000 restores, no panic, no hang, no store damaged, every `verify`
+clean.
+
+In the tenth round the reviewer sending crafted input found the ninth's
+checks holding, name by name, and went around them:
+
+- **Two names a file system takes for one let a checkout write outside
+  its directory.** A tree with a link `Link` to `../outside` and a file
+  `link/pwned` is two paths to Git; on macOS the directory `link` made
+  for the file became the link, and the file was written through it. The
+  server now refuses a commit or a tree with names that differ only in
+  case or in how their characters are composed (the directories on the
+  way included), and a client on a file system that takes them for one
+  refuses to check out or sync such a tree.
+- **A path longer than a file system takes, or a tree 20,000 directories
+  deep, made a ref nobody could sync**, the deep one by overflowing the
+  client's stack. Paths are held to 1,024 bytes on both sides, and the
+  depth of what is handed over with them.
+- **A directory's id, taken over from another repository, could be given
+  to a file**, and the ref could not be synced again. A server that went
+  silent on a connection kept from an earlier request was waited for
+  until the command's own limit; each request now has a connection of
+  its own. A client took a ref that went backwards, and a merge, from a
+  server: it refuses both.
+
+The reviewer of recording, with 180,000 steps of random testing (no lost
+content in 24,000 restores, nothing written outside, no store damaged):
+
+- **One file reported under two spellings (`a` and `A`, on a file system
+  that takes them for one) recorded a state with the same path twice**,
+  which nothing could read again: not `since`, not `commit`, not
+  `restore base`. A watcher seeing a rename that changes only the case,
+  and an edit, did the same. Reported paths are taken once each, as the
+  file system has them.
+- **A link to a pipe made every walk wait for ever**: checking whether a
+  file could be read opened what the link led to. A link is read as a
+  link and nothing more.
+- Before the first commit, `nv git status` changed what a later commit
+  published; a restore wrote half its files before finding a directory
+  it could list and not empty; a pipe nobody tracked was replaced by a
+  file; the snapshot made before the first commit could not be gone back
+  to; a fork that failed left a copy that was not a workspace.
+
+The reviewer of many writers (55,000 steps, 1,500 kills; nothing lost
+under concurrency, no duplicate, no panic) found the worst thing of the
+round, and it was a fix of the eighth's:
+
+- **After `nv git status`, a command of nv's killed in its first
+  milliseconds made what was not committed the workspace's commit**, and
+  the next push published it, as a commit called "snapshot". Taking the
+  snapshots back up after a look wrote where the workspace stood twice,
+  and the first write said the snapshots were the last commit. It is one
+  write now.
+- A push that landed unheard, of a commit a sync had put on another's
+  tip, still made the next commit of those lines a conflict with itself:
+  a commit the server took as it was was not counted as the workspace's
+  own. A file with a sync's markers in it, committed with `nv git commit`
+  after a restore, was pushed; a push refuses it now.
+
+The reviewer beside Git and of nv's own Git commands (32,000 compared
+steps, 790 kills of publishing) found nothing lost, written outside,
+hung or damaged, and:
+
+- **Beside Git, a hook that staged a file of its own, while the user had
+  something else staged, left Git's index without that file**, and the
+  user's next `git commit` removed it from history. After a commit, every
+  path the commit changed is brought up in Git's index, not only those
+  nv named.
+- **Beside Git, a file the user had removed from Git (`git rm --cached`)
+  was put back by `nv commit --recorded`** when nv had once seen it go
+  and come back. Its removal is the user's.
+- `nv git add` of a file removed with `git rm` and made again as it was
+  did not take the removal back, and the next `commit -a` removed it; in
+  a merge that stopped, `reset`, `restore --staged`, `rm` and `mv` of the
+  conflicted file did not do what Git does (`mv` is now refused as Git
+  refuses it; the others end the merge or settle the path as Git does).
 
 Publishing beside Git was measured by a reviewer at 3 to 14 times
 `git commit`, on a clone with no commit-graph: taking Git's new commit in
@@ -1490,6 +1607,14 @@ stops.
   `reset --soft` refuse in the middle of a merge, as Git does.
 - `nv status` lists what no snapshot has yet, not what differs from the
   last commit; `nv since <dir> base` lists that.
+- A server refuses names that differ only in case or composition, on any
+  platform: a repository with `README` and `readme` cannot be pushed,
+  though Git on Linux holds it. nv checks a tree for such names once,
+  the first time it is checked out on a file system that folds them.
+- Each request to a server is made on a new connection.
+- A ref started by a push of a commit its other writers do not have (an
+  amended first commit) cannot be synced by them: "the ref's history does
+  not reach any commit of this workspace". The push is not refused.
 - A repository can take over another's contents by naming their ids when
   it is handed a directory (`adopt/trees?from=`): with no authentication
   there is no telling whose they were. This is the linking of a directory
@@ -1501,6 +1626,14 @@ stops.
   replaced by a directory is listed as `?? f/`, where Git lists nothing.
 - A command killed while it writes where the workspace stands can leave a
   temporary file in `.nv` (one at most of each kind).
+- Found by the ninth round and not yet fixed: restoring the state that
+  `before-sync` kept, which stands on commits the workspace is no longer
+  on, brings other writers' changes back as this workspace's own edits; a
+  sync can write back, with markers, a file the workspace renamed and
+  has not committed; a push that moves commits onto a newer tip can
+  report having caught up when it has not (the next sync does); a
+  reviewer once saw a killed push leave an uncommitted edit as a commit,
+  which 500 tries on a later build did not make happen again.
 - `nv git add -A; nv git commit` commits a file that still holds the
   markers of a sync's conflict (`nv commit` refuses; so do push and sync
   until they are gone).

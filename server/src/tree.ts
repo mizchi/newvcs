@@ -1,7 +1,7 @@
 // A directory as nv stores it: for each name, in order, a mode, the name and the id of
 // what is there (`src/manifest.rs`). The server reads one only to learn what is below it.
 
-import { MODES, nameOk } from "./commit.ts";
+import { folded, MODES, nameOk } from "./commit.ts";
 
 export const MODE_DIR = 0o40000;
 /// A commit of another repository. Its id is Git's and names nothing here.
@@ -15,6 +15,8 @@ export type TreeEntry = { mode: number; name: Uint8Array; id: Uint8Array };
 export function decodeTree(bytes: Uint8Array): TreeEntry[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const entries: TreeEntry[] = [];
+  const spelled = new Set<string>();
+  const text = new TextDecoder();
   for (let at = 0; at < bytes.length; ) {
     if (at + 8 > bytes.length) throw new Error("a tree object is cut short");
     const [mode, length] = [view.getUint32(at, true), view.getUint32(at + 4, true)];
@@ -26,6 +28,9 @@ export function decodeTree(bytes: Uint8Array): TreeEntry[] {
     // In order and once each, as every tree is written.
     const last = entries[entries.length - 1];
     if (last && compare(last.name, name) >= 0) throw new Error("a tree has an entry out of order, or twice");
+    const key = folded(text.decode(name));
+    if (spelled.has(key)) throw new Error("a tree has two entries that differ only in case or in how their characters are composed");
+    spelled.add(key);
     // The id is a copy: ids are passed on to a repository's object, and a view would take the tree along.
     entries.push({ mode, name, id: bytes.slice(at + 8 + length, end) });
     at = end;
