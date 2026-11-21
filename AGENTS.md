@@ -35,8 +35,13 @@ the README or undone. "Tree" means the files of one commit.
 | Operation | Must scale with | Never with | Reference |
 | --- | --- | --- | --- |
 | `snapshot --recorded` | paths reported | tree size | 1.9 ms at 100,000 files |
+| The hook after a tool wrote a file | that file | tree size | 5.6 ms on oxc, process start included |
+| `restore`, `mark`, `since`, `commit` with `--recorded` | paths that differ or were reported | tree size | 5–6 ms on oxc; 39 ms for a commit with Git brought along |
+| The watcher | writes made | tree size, time spent idle | no CPU when idle; a write is a snapshot 40 ms later |
 | `commit` (publishing snapshots) | paths changed | tree size, history | 59 ms for 52 snapshots |
-| `git add`, `git commit`, the index file | paths staged | tree size | an untouched index is an empty file |
+| `git commit`, the index file | paths staged | tree size | 8.3 ms on oxc; an untouched index is an empty file |
+| Git's id of an object | nothing | how many objects have one | 5.9 ms for `rev-parse HEAD` on oxc |
+| Bringing a Git repository in the same directory along | paths changed | tree size, history | 27 ms on top of the commit |
 | Checkout of a directory | files under it | tree size | 12.5 ms of 100,000 files |
 | Checkout of a tree seen before, `fork` | one directory clone | file count, to first order | 263 ms / 200 ms on oxc |
 | Opening the store | nothing | store size | 5 ms on a 206 MB segment |
@@ -63,9 +68,24 @@ allocation that is not the path itself, no read unless the time is in doubt.
 - **The store is append-only.** Opening it writes nothing. Only a command
   that appends may cut a torn end.
 - **A snapshot is private and a commit is published.** Recording often must
-  not make history noisy.
+  not make history noisy. A snapshot never reaches Git, a server or
+  `nv git log`; to those it is an uncommitted change.
+- **One writer at a time in a workspace.** Every command holds the
+  workspace's lock while it runs; a watcher holds it per snapshot. Nothing
+  reads the workspace's state, changes it and writes it back outside it.
+- **Trusting reported writes is never a guess.** A command given
+  `--recorded` waits for a running watcher to have reported every write
+  made before it, starts one that should be running and is not (which
+  looks at every file once), and looks itself at any file it is about to
+  overwrite.
+- **Going back loses nothing.** `restore` records what is on disk before it
+  overwrites a file, and the state left behind keeps its id.
 - **A workspace owns its files and shares the store.** Workspaces never
   share mutable state other than through the store and its refs.
+- **Where Git shares the directory, nv knows who moved.** The state in
+  which the two last agreed is written down; a command that writes never
+  builds on a head Git has left, and nothing either side committed is
+  dropped to bring them back together.
 - **What `nv git` does not speak, it refuses.** Exit 125 and "not
   supported", with the repository as it was. Never an approximation.
 

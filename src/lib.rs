@@ -11,6 +11,7 @@
 //! - `workspace`: checkouts of a set of path prefixes, shared copy-on-write.
 //! - `remote`: pushing to and catching up with a server that owns the refs.
 
+pub mod colocated;
 pub mod commit;
 pub mod eol;
 pub mod git;
@@ -21,6 +22,7 @@ pub mod manifest;
 pub mod remote;
 pub mod store;
 pub mod textdiff;
+pub mod watch;
 pub mod workspace;
 
 /// An object id: BLAKE3 over the object's kind and bytes.

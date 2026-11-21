@@ -877,9 +877,12 @@ pub fn status(ws: &Workspace, look: Look) -> Result<(Vec<Difference>, Looked)> {
   let (out, looked, refreshed) = if look == Look::Recorded {
     let (mut looked, mut out, mut refreshed) = (Looked::default(), Vec::new(), Refreshed::new());
     let mut eols = Eols::of_worktree(&ws.root);
+    let mut rules = crate::ignore::Checker::new(&ws.root);
     for path in ws.recorded() {
-      if in_view(&ws.prefixes, &path, false) {
-        compare(ws, &path, index.get(&path).as_ref(), &mut looked, &mut out, &mut refreshed, &mut eols)?;
+      let known = index.get(&path);
+      // A reported write to a file the rules ignore is not a file to track, as with a walk.
+      if in_view(&ws.prefixes, &path, false) && (known.is_some() || !rules.ignored(&path)) {
+        compare(ws, &path, known.as_ref(), &mut looked, &mut out, &mut refreshed, &mut eols)?;
       }
     }
     (out, looked, refreshed)
@@ -954,8 +957,8 @@ pub fn snapshot(store: &mut Store, ws: &mut Workspace, author: &str, look: Look)
 /// Publish: one commit on the last published one, holding everything the
 /// snapshots since then changed. Takes a snapshot first if the disk has
 /// moved on. `None` when there is nothing to publish.
-pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str) -> Result<Option<Id>> {
-  snapshot(store, ws, author, Look::Everywhere)?;
+pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str, look: Look) -> Result<Option<Id>> {
+  snapshot(store, ws, author, look)?;
   if ws.head == ws.base {
     return Ok(None);
   }
@@ -981,6 +984,226 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   ws.save()?;
   ws.log("commit", &id)?;
   Ok(Some(id))
+}
+
+/// Hold the workspace for one writer at a time, until the returned file is
+/// dropped. A hook, a watcher and a person's command can all arrive at once,
+/// and each reads the workspace's state, changes it and writes it back.
+pub fn lock(root: &Path) -> Result<std::fs::File> {
+  use std::os::fd::AsRawFd;
+  let path = root.join(META).join("lock");
+  let file = std::fs::File::options().create(true).append(true).open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+  // SAFETY: the descriptor is open for as long as `file` is.
+  if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    return Err(format!("cannot lock {}: {}", path.display(), std::io::Error::last_os_error()));
+  }
+  Ok(file)
+}
+
+/// Report what the operating system said was written. A file is reported
+/// as it is; a directory that appeared, with what is in it; a path that is
+/// gone, with every known file that was under it: a directory renamed or
+/// removed is one event, and says nothing of its files. Returns how many
+/// paths were reported.
+pub fn record_events(ws: &Workspace, events: &std::collections::BTreeSet<Vec<u8>>) -> Result<usize> {
+  fn files_under(dir: &Path, rel: &mut Vec<u8>, out: &mut Vec<Vec<u8>>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+      let len = rel.len();
+      rel.push(b'/');
+      rel.extend_from_slice(entry.file_name().as_bytes());
+      if entry.file_type().is_ok_and(|t| t.is_dir()) {
+        files_under(&entry.path(), rel, out);
+      } else {
+        out.push(rel.clone());
+      }
+      rel.truncate(len);
+    }
+  }
+  let index = ws.load_index();
+  let mut rules = crate::ignore::Checker::new(&ws.root);
+  let mut reported = Vec::new();
+  for path in events {
+    let full = ws.root.join(to_path(path));
+    match std::fs::symlink_metadata(&full) {
+      Ok(meta) if meta.is_dir() => {
+        // Build output arrives as directories by the hundred; they are not walked.
+        if !rules.ignored(&[path.as_slice(), b"/."].concat()) || index.has_under(path) {
+          files_under(&full, &mut path.clone(), &mut reported);
+        }
+      }
+      Ok(_) => reported.push(path.clone()),
+      Err(_) => {
+        reported.push(path.clone());
+        if index.has_under(path) {
+          let below = |known: &[u8]| known.len() > path.len() && known.starts_with(path) && known[path.len()] == b'/';
+          reported.extend(index.entries().into_iter().map(|(known, _)| known).filter(|known| below(known)));
+        }
+      }
+    }
+  }
+  for path in &reported {
+    ws.record(path)?;
+  }
+  Ok(reported.len())
+}
+
+/// What going back to a recorded state did.
+pub struct Restored {
+  /// The snapshot taken of what was on disk and not yet recorded, if there was any such thing.
+  pub kept: Option<Id>,
+  pub written: usize,
+  pub removed: usize,
+}
+
+/// Make the files what they were at `target`, a snapshot or a commit.
+///
+/// What is on disk is recorded first, so going back loses nothing: the state
+/// left behind has an id and can be gone back to in turn. Only the files that
+/// differ between the two states are touched, and what is published is not:
+/// the next commit holds whatever lies between the last one and the files.
+///
+/// With `Look::Recorded` the tree is not walked: the writer is trusted to
+/// have reported every write, and besides the reported paths only the files
+/// about to be overwritten are looked at. A change nobody reported, to a
+/// file the two states agree on, then stays as it is on disk.
+pub fn restore_to(store: &mut Store, ws: &mut Workspace, target: Id, author: &str, look: Look) -> Result<Restored> {
+  let before = ws.head;
+  if look == Look::Recorded {
+    let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+    let (from, to) = (root(store, ws.head)?, root(store, Some(target))?);
+    for (path, _) in crate::manifest::diff(store, from, to)? {
+      ws.record(&path)?;
+    }
+  }
+  snapshot(store, ws, author, look)?;
+  let kept = ws.head.filter(|head| Some(*head) != before);
+  let from = match ws.head {
+    Some(head) => root_of(store, &head)?,
+    None => None,
+  };
+  let to = root_of(store, &target)?;
+  let mut done = Restored { kept, written: 0, removed: 0 };
+  let mut index = ws.load_index();
+  let mut eols = Eols::of_worktree(&ws.root);
+  for (path, entry) in crate::manifest::diff(store, from, to)? {
+    if !in_view(&ws.prefixes, &path, false) {
+      continue;
+    }
+    match entry {
+      Some(entry) => {
+        index.insert(path.clone(), place_with(store, &ws.root, &path, entry, &mut eols)?);
+        done.written += 1;
+      }
+      None => {
+        unplace(&ws.root, &path);
+        index.remove(&path);
+        done.removed += 1;
+      }
+    }
+  }
+  ws.head = Some(target);
+  index.save()?;
+  ws.save()?;
+  ws.log("restore", &target)?;
+  Ok(done)
+}
+
+fn mark_file(ws: &Workspace, name: &str) -> PathBuf {
+  ws.root.join(META).join("marks").join(name)
+}
+
+/// Record what is on disk and give that state a name, taking the name from
+/// whatever state had it before.
+pub fn mark(store: &mut Store, ws: &mut Workspace, name: &str, author: &str, look: Look) -> Result<Id> {
+  let plain = !name.is_empty()
+    && name.len() <= 64
+    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    && !name.starts_with('.');
+  if !plain || name == "base" {
+    return Err(format!("`{name}` cannot be a name: letters, digits, `-`, `_` and `.` only, and not `base`"));
+  }
+  snapshot(store, ws, author, look)?;
+  let id = ws.head.ok_or("there is nothing to name yet")?;
+  let file = mark_file(ws, name);
+  std::fs::create_dir_all(file.parent().expect("under .nv")).map_err(|e| e.to_string())?;
+  std::fs::write(&file, hex(&id)).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+  ws.log(&format!("mark:{name}"), &id)?;
+  Ok(id)
+}
+
+/// A recorded state by what someone would call it: a name given with
+/// `mark`, `base` for the last published commit, `~N` for the Nth snapshot
+/// or commit before the latest, or the start of an id.
+pub fn state_named(ws: &Workspace, spec: &str) -> Result<Id> {
+  let parse = |text: &str| unhex(text.trim()).and_then(|b| Id::try_from(b).ok());
+  if spec == "base" {
+    return ws.base.ok_or_else(|| "nothing has been published yet".to_string());
+  }
+  if let Some(id) = std::fs::read_to_string(mark_file(ws, spec)).ok().and_then(|text| parse(&text)) {
+    return Ok(id);
+  }
+  let logged: Vec<(String, String)> = ws.operations().into_iter().map(|(_, what, id)| (what, id)).collect();
+  if let Some(back) = spec.strip_prefix('~').and_then(|n| n.parse::<usize>().ok()) {
+    let states: Vec<&String> = logged.iter().filter(|(what, _)| what == "snapshot" || what == "commit").map(|(_, id)| id).collect();
+    let at = states.len().checked_sub(back + 1).ok_or_else(|| format!("there are only {} recorded states", states.len()))?;
+    return parse(states[at]).ok_or_else(|| "the log of operations is damaged".to_string());
+  }
+  let hexish = spec.len() >= 6 && spec.bytes().all(|b| b.is_ascii_hexdigit());
+  let mut found: Vec<&String> = logged.iter().map(|(_, id)| id).filter(|id| hexish && id.starts_with(&spec.to_ascii_lowercase())).collect();
+  found.sort();
+  found.dedup();
+  match found[..] {
+    [one] => parse(one).ok_or_else(|| "the log of operations is damaged".to_string()),
+    [] => Err(format!("`{spec}` is not a name given with `nv mark`, `base`, `~N`, or the start of a recorded state's id")),
+    _ => Err(format!("`{spec}` is the start of {} ids", found.len())),
+  }
+}
+
+/// The paths that differ between a recorded state and the files now, with
+/// `A`, `M` or `D` for what happened to each since.
+pub fn since(store: &mut Store, ws: &Workspace, state: Id, look: Look) -> Result<Vec<(Vec<u8>, char)>> {
+  let from = root_of(store, &state)?;
+  let to = match ws.head {
+    Some(head) => root_of(store, &head)?,
+    None => None,
+  };
+  // What that state had, for every path that has changed since: recorded changes first, then the files.
+  let mut then: std::collections::BTreeMap<Vec<u8>, Option<Entry>> = std::collections::BTreeMap::new();
+  let mut now: std::collections::BTreeMap<Vec<u8>, Option<Entry>> = std::collections::BTreeMap::new();
+  for (path, entry) in crate::manifest::diff(store, from, to)? {
+    let was = match from {
+      Some(root) => crate::manifest::lookup(store, root, &path)?,
+      None => None,
+    };
+    then.insert(path.clone(), was);
+    now.insert(path, entry);
+  }
+  for (path, new, old) in status(ws, look)?.0 {
+    then.entry(path.clone()).or_insert(old);
+    now.insert(path, new.map(|(mode, bytes)| Entry { mode, id: object_id(Kind::Blob, &bytes) }));
+  }
+  let mut out = Vec::new();
+  for (path, was) in then {
+    match (was, now.get(&path).copied().flatten()) {
+      (a, b) if a == b => {}
+      (None, _) => out.push((path, 'A')),
+      (_, None) => out.push((path, 'D')),
+      _ => out.push((path, 'M')),
+    }
+  }
+  Ok(out)
+}
+
+/// Turn the snapshots since the last published commit back into plain
+/// differences from it. The files are not touched and the snapshots stay in
+/// the store, to be gone back to by id or by name. For a view of the
+/// workspace that has no notion of snapshots, such as Git's.
+pub fn fold(store: &mut Store, ws: &mut Workspace) -> Result<()> {
+  if ws.head == ws.base {
+    return Ok(());
+  }
+  let base = ws.base;
+  move_head(store, ws, base)
 }
 
 /// A workspace with no commit yet, and a store of its own inside it: what

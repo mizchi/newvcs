@@ -24,6 +24,10 @@ gix-attributes = "0.37"
 gix-merge = { version = "0.23", default-features = false, features = ["sha1"] }
 imara-diff = { package = "gix-imara-diff", version = "0.3" }
 bstr = "1"
+# The operating system's file events, for `nv watch`.
+notify = "8"
+# Git's loose objects are zlib streams.
+flate2 = "1"
 # Plain HTTP only: the server is local so far.
 ureq = { version = "2", default-features = false }
 serde_json = "1"

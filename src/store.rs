@@ -174,10 +174,59 @@ impl Stats {
   }
 }
 
+/// Git's ids for objects, both ways. Most are in `git.idx`, sorted and
+/// mapped, so that asking for one does not mean reading them all; the ones
+/// recorded since it was written are in the two maps.
 #[derive(Default)]
 struct GitIds {
+  sorted: Option<(memmap2::Mmap, usize)>,
   of: HashMap<Id, GitOid>,
   back: HashMap<GitOid, Id>,
+  /// Whether this process recorded any: only then is `git.idx` worth rewriting.
+  added: bool,
+}
+
+const GIT_RECORD: usize = 53;
+const GIT_PAIR: usize = 52;
+const GIT_IDX_MAGIC: &[u8; 8] = b"nvgitid1";
+/// With this many ids outside `git.idx`, a store that recorded some rewrites it on closing.
+const GIT_CHECKPOINT_AT: usize = 1024;
+
+impl GitIds {
+  /// The `at`th pair of the table sorted by nv id (`by_git` false) or by Git id.
+  fn pair(&self, by_git: bool, at: usize) -> &[u8] {
+    let (map, count) = self.sorted.as_ref().expect("asked only when there is one");
+    let start = 16 + if by_git { count * GIT_PAIR } else { 0 } + at * GIT_PAIR;
+    &map[start..start + GIT_PAIR]
+  }
+
+  fn find(&self, by_git: bool, key: &[u8]) -> Option<&[u8]> {
+    let (_, count) = self.sorted.as_ref()?;
+    let (mut lo, mut hi) = (0, *count);
+    while lo < hi {
+      let mid = (lo + hi) / 2;
+      match self.pair(by_git, mid)[..key.len()].cmp(key) {
+        std::cmp::Ordering::Less => lo = mid + 1,
+        std::cmp::Ordering::Greater => hi = mid,
+        std::cmp::Ordering::Equal => return Some(&self.pair(by_git, mid)[key.len()..]),
+      }
+    }
+    None
+  }
+
+  fn git_of(&self, id: &Id) -> Option<GitOid> {
+    self.of.get(id).copied().or_else(|| self.find(false, id).map(|oid| oid.try_into().expect("twenty bytes")))
+  }
+
+  fn of_git(&self, oid: &GitOid) -> Option<Id> {
+    self.back.get(oid).copied().or_else(|| self.find(true, oid).map(|id| id.try_into().expect("thirty-two bytes")))
+  }
+
+  fn all(&self) -> Vec<(Id, GitOid)> {
+    let count = self.sorted.as_ref().map_or(0, |(_, count)| *count);
+    let sorted = (0..count).map(|at| self.pair(false, at)).map(|p| (p[..32].try_into().unwrap(), p[32..].try_into().unwrap()));
+    sorted.chain(self.of.iter().map(|(id, oid)| (*id, *oid))).collect()
+  }
 }
 
 pub fn object_id(kind: Kind, bytes: &[u8]) -> Id {
@@ -279,6 +328,7 @@ impl Store {
   /// that the next open has nothing to scan.
   pub fn checkpoint(&mut self) -> Result<()> {
     self.flush()?;
+    self.checkpoint_git()?;
     if self.index.is_empty() && self.sorted.is_some() {
       return Ok(());
     }
@@ -323,22 +373,70 @@ impl Store {
   }
 
   fn git_ids(&mut self) -> &mut GitIds {
+    let (dir, log) = (&self.dir, &self.git_log);
     self.git.get_or_insert_with(|| {
-      let mut bytes = Vec::new();
-      let _ = self.git_log.read_to_end(&mut bytes);
+      let records = log.metadata().map_or(0, |m| m.len() as usize / GIT_RECORD);
       let mut ids = GitIds::default();
-      for record in bytes.as_chunks::<53>().0 {
-        let (id, oid): (Id, GitOid) = (record[1..33].try_into().unwrap(), record[33..53].try_into().unwrap());
-        ids.of.insert(id, oid);
-        ids.back.insert(oid, id);
+      // The sorted table says how many records of the log it holds; the rest are read.
+      let mut covered = 0;
+      if let Ok(file) = File::open(dir.join("git.idx"))
+        && let Ok(map) = unsafe { memmap2::Mmap::map(&file) }
+        && map.len() >= 16
+        && &map[..8] == GIT_IDX_MAGIC
+      {
+        let in_log = u32::from_le_bytes(map[8..12].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(map[12..16].try_into().unwrap()) as usize;
+        if in_log <= records && map.len() == 16 + count * GIT_PAIR * 2 {
+          covered = in_log;
+          ids.sorted = Some((map, count));
+        }
+      }
+      let mut tail = vec![0u8; (records - covered) * GIT_RECORD];
+      if log.read_exact_at(&mut tail, (covered * GIT_RECORD) as u64).is_ok() {
+        for record in tail.as_chunks::<GIT_RECORD>().0 {
+          let (id, oid): (Id, GitOid) = (record[1..33].try_into().unwrap(), record[33..53].try_into().unwrap());
+          ids.of.insert(id, oid);
+          ids.back.insert(oid, id);
+        }
       }
       ids
     })
   }
 
+  /// Write every Git id into the sorted table, so that the next process reads none of the log.
+  fn checkpoint_git(&mut self) -> Result<()> {
+    let records = self.git_log.metadata().map_or(0, |m| m.len() as usize / GIT_RECORD);
+    let ids = self.git_ids();
+    if ids.of.is_empty() && ids.sorted.is_some() {
+      return Ok(());
+    }
+    let mut all = ids.all();
+    all.sort_unstable();
+    all.dedup_by_key(|pair| pair.0);
+    let mut out = Vec::with_capacity(16 + all.len() * GIT_PAIR * 2);
+    out.extend_from_slice(GIT_IDX_MAGIC);
+    out.extend_from_slice(&(records as u32).to_le_bytes());
+    out.extend_from_slice(&(all.len() as u32).to_le_bytes());
+    for (id, oid) in &all {
+      out.extend_from_slice(id);
+      out.extend_from_slice(oid);
+    }
+    all.sort_unstable_by_key(|pair| pair.1);
+    for (id, oid) in &all {
+      out.extend_from_slice(oid);
+      out.extend_from_slice(id);
+    }
+    let path = self.dir.join("git.idx");
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&temp, &out).and_then(|_| std::fs::rename(&temp, &path)).map_err(|e| format!("cannot write the Git id index: {e}"))?;
+    // Read again from the table just written.
+    self.git = None;
+    Ok(())
+  }
+
   /// Git's id of an object, if it has been given one.
   pub fn git_of(&mut self, id: &Id) -> Option<GitOid> {
-    self.git_ids().of.get(id).copied()
+    self.git_ids().git_of(id)
   }
 
   /// What kind of object this is, read from its record.
@@ -363,12 +461,12 @@ impl Store {
 
   /// The object Git knows by this id.
   pub fn of_git(&mut self, oid: &GitOid) -> Option<Id> {
-    self.git_ids().back.get(oid).copied()
+    self.git_ids().of_git(oid)
   }
 
   /// Every object that has a Git id.
   pub fn with_git_ids(&mut self) -> Vec<(Id, GitOid)> {
-    self.git_ids().back.iter().map(|(oid, id)| (*id, *oid)).collect()
+    self.git_ids().all()
   }
 
   pub fn flush(&mut self) -> Result<()> {
@@ -488,11 +586,12 @@ impl Store {
   /// Record Git's id for an object.
   pub fn map_git(&mut self, kind: Kind, id: Id, oid: GitOid) -> Result<()> {
     let ids = self.git_ids();
-    if ids.of.insert(id, oid).is_some() {
+    if ids.git_of(&id).is_some() {
       return Ok(());
     }
-    let _ = kind;
+    ids.of.insert(id, oid);
     ids.back.insert(oid, id);
+    ids.added = true;
     let mut record = Vec::with_capacity(53);
     record.push(kind as u8);
     record.extend_from_slice(&id);
@@ -613,6 +712,9 @@ impl Drop for Store {
     let _ = self.flush();
     if self.index.len() >= CHECKPOINT_AT {
       let _ = self.checkpoint();
+    }
+    if self.git.as_ref().is_some_and(|ids| ids.added && ids.of.len() >= GIT_CHECKPOINT_AT) {
+      let _ = self.checkpoint_git();
     }
   }
 }

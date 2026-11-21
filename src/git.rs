@@ -25,6 +25,8 @@ pub fn git(repo: &Path) -> Command {
   let mut c = Command::new(std::env::var_os("NV_REAL_GIT").unwrap_or_else(|| "git".into()));
   // A partial clone would otherwise fetch what it lacks, one object at a time.
   c.env("GIT_NO_LAZY_FETCH", "1").arg("-C").arg(repo);
+  // A repository nv shares a directory with has hooks that stop everyone else.
+  c.env(crate::colocated::WRITING, "1");
   c
 }
 
@@ -448,7 +450,7 @@ pub fn git_tree_of(
 }
 
 /// Git's id of a blob: known from import, or hashed now and remembered.
-fn git_blob_of(store: &mut Store, id: &Id, emit: &mut dyn FnMut(&str, &[u8]) -> Result<()>) -> Result<GitOid> {
+pub fn git_blob_of(store: &mut Store, id: &Id, emit: &mut dyn FnMut(&str, &[u8]) -> Result<()>) -> Result<GitOid> {
   if let Some(oid) = store.git_of(id) {
     return Ok(oid);
   }
@@ -541,7 +543,36 @@ impl Drop for Has {
   }
 }
 
+/// Where a repository keeps its loose objects, when that is where one would guess.
+fn objects_dir(repo: &Path) -> Option<std::path::PathBuf> {
+  [repo.join(".git").join("objects"), repo.join("objects")]
+    .into_iter()
+    .find(|dir| dir.is_dir() && dir.parent().is_some_and(|git| git.join("HEAD").is_file()))
+}
+
+/// A loose object, written as Git writes one: no process is started for it.
+fn write_loose(dir: &Path, kind: &str, bytes: &[u8]) -> std::io::Result<()> {
+  use std::os::unix::fs::PermissionsExt;
+  let name = hex(&git_hash(kind, bytes));
+  let (fan, path) = (dir.join(&name[..2]), dir.join(&name[..2]).join(&name[2..]));
+  if path.exists() {
+    return Ok(());
+  }
+  std::fs::create_dir_all(&fan)?;
+  let mut packed = flate2::write::ZlibEncoder::new(Vec::with_capacity(bytes.len() / 2 + 64), flate2::Compression::fast());
+  packed.write_all(format!("{kind} {}\0", bytes.len()).as_bytes())?;
+  packed.write_all(bytes)?;
+  // Under another name first: Git must never find half an object under its id.
+  let temp = fan.join(format!("tmp_obj_nv{}", std::process::id()));
+  std::fs::write(&temp, packed.finish()?)?;
+  std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o444))?;
+  std::fs::rename(&temp, &path)
+}
+
 fn write_object(repo: &Path, kind: &str, bytes: &[u8]) -> Result<()> {
+  if let Some(dir) = objects_dir(repo) {
+    return write_loose(&dir, kind, bytes).map_err(|e| format!("cannot write a {kind} object into {}: {e}", dir.display()));
+  }
   let mut child = git(repo)
     .args(["hash-object", "-w", "-t", kind, "--stdin"])
     .stdin(Stdio::piped())

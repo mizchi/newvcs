@@ -92,7 +92,7 @@ fn a_workspace_of_one_directory_commits_without_the_rest() {
   assert!(!ws_dir.join("README.md").exists() && !ws_dir.join("pkg/ui").exists());
   let mut ws = Workspace::open(&ws_dir).unwrap();
   assert!(workspace::status(&ws, Look::Everywhere).unwrap().0.is_empty());
-  assert_eq!(workspace::commit(&mut store, &mut ws, "t <t@example.com>", "nothing").unwrap(), None);
+  assert_eq!(workspace::commit(&mut store, &mut ws, "t <t@example.com>", "nothing", Look::Everywhere).unwrap(), None);
 
   // Edit, add and delete inside the view; a file outside it is not this workspace's business.
   std::fs::write(ws_dir.join("pkg/core/a.ts"), "export const a = 100;\n").unwrap();
@@ -105,7 +105,9 @@ fn a_workspace_of_one_directory_commits_without_the_rest() {
     .map(|(p, new, old)| format!("{}{}{}", String::from_utf8_lossy(p), new.is_some() as u8, old.is_some() as u8))
     .collect();
   assert_eq!(marks, ["pkg/core/a.ts11", "pkg/core/new.ts10"]);
-  let made = workspace::commit(&mut store, &mut ws, "t <t@example.com>", "from a subdirectory").unwrap().expect("there were changes");
+  let made = workspace::commit(&mut store, &mut ws, "t <t@example.com>", "from a subdirectory", Look::Everywhere)
+    .unwrap()
+    .expect("there were changes");
 
   // Git accepts the result, and sees exactly those two paths changed on top of HEAD.
   let (oid, written) = git::export(&mut store, &made, &repo, "refs/heads/from-nv").unwrap();
@@ -187,7 +189,8 @@ fn snapshots_record_work_and_a_commit_publishes_it_as_one() {
   assert_eq!((ws.base, ws.head), (Some(head), Some(three)));
 
   // Published: one commit on the imported head, with the net change only.
-  let published = workspace::commit(&mut store, &mut ws, author, "three steps").unwrap().expect("there is work to publish");
+  let published =
+    workspace::commit(&mut store, &mut ws, author, "three steps", Look::Everywhere).unwrap().expect("there is work to publish");
   assert_eq!((ws.base, ws.head), (Some(published), Some(published)));
   git::export(&mut store, &published, &repo, "refs/heads/published").unwrap();
   assert_eq!(sh(&repo, "git diff --name-status main published"), "M\tpkg/core/a.ts\nD\trun.sh\n");
@@ -196,7 +199,7 @@ fn snapshots_record_work_and_a_commit_publishes_it_as_one() {
   // The steps are still there to go back to.
   let kinds: Vec<String> = ws.operations().into_iter().map(|(_, what, _)| what).collect();
   assert_eq!(kinds, ["snapshot", "snapshot", "snapshot", "commit"]);
-  assert_eq!(workspace::commit(&mut store, &mut ws, author, "again").unwrap(), None);
+  assert_eq!(workspace::commit(&mut store, &mut ws, author, "again", Look::Everywhere).unwrap(), None);
 }
 
 #[test]
@@ -302,7 +305,7 @@ fn a_whole_checkout_is_cloned_from_a_tree_the_store_keeps_or_derives() {
   let mut ws = Workspace::open(&dir.join("w3")).unwrap();
   assert!(workspace::status(&ws, Look::Everywhere).unwrap().0.is_empty());
   std::fs::write(dir.join("w3/docs/guide.md"), "edited\n").unwrap();
-  let made = workspace::commit(&mut store, &mut ws, "t <t@example.com>", "on the old commit").unwrap().unwrap();
+  let made = workspace::commit(&mut store, &mut ws, "t <t@example.com>", "on the old commit", Look::Everywhere).unwrap().unwrap();
   git::export(&mut store, &made, &repo, "refs/heads/old-line").unwrap();
   assert_eq!(sh(&repo, "git diff --name-status HEAD~3 old-line"), "M\tdocs/guide.md\n");
   // Writing in a workspace does not reach the store's tree, nor a sibling cloned from it.

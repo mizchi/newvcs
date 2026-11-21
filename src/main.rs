@@ -20,11 +20,29 @@ nv: an experiment in keeping Git's object ids without Git's storage
         look only at the paths given to `nv record`
   nv record <dir> <path>...
         Say that these paths were written (for a tool that knows its writes)
-  nv commit <dir> <message>
+  nv commit <dir> <message> [--recorded]
         Publish the snapshots since the last commit as one commit; the rest
         of the tree is not needed
+  nv watch <dir> [--start | --stop | --status]
+        Stay, and snapshot whatever is written there by whatever writes it:
+        the operating system reports the writes, so nothing has to. With
+        --start it stays after this command returns, and is started again
+        by a hook or a command with --recorded should it ever be found gone
   nv log <dir>
         The workspace's operations
+  nv restore <dir> <state> [--recorded]
+        Make the files what they were at a recorded state: a name given with
+        `nv mark`, `base`, `~N` (N snapshots or commits ago), or the start of
+        an id. What is on disk is recorded first, so nothing is lost by going
+  nv mark <dir> <name> [--recorded]
+        Record what is on disk and name that state, e.g. `green`
+  nv since <dir> <state> [--recorded]
+        The paths that differ between a recorded state and the files now.
+        With --recorded these three look only at the paths given to
+        `nv record` (and at what a restore would overwrite), not at the tree
+  nv hook claude
+        Read a Claude Code PostToolUse event on stdin and record what the
+        tool wrote. `nv agent-init claude` prints the settings that run it
   nv remote <dir> <url-of-repository> <ref>
         Point the workspace at a server, e.g. http://localhost:8799/myrepo main
   nv push <dir>
@@ -35,6 +53,15 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Clone a workspace copy-on-write, build output included
   nv export <dir> <git-repo> <ref>
         Write the workspace's commit into a Git repository
+  nv adopt <dir>
+        Make an nv workspace of a Git repository, in place: both then answer
+        for the same files, and Git is stopped from moving on its own
+  nv check <dir>
+        Say whether Git and nv are in step there, and if not, who moved
+  nv reconcile <dir>
+        Put them back in step, whichever moved
+  nv shell-init
+        A shell function that sends `git` to nv inside a workspace
   nv stats <store>
   nv git <command> [<args>]
         The everyday Git commands, on an nv store (see tools/git-shim)
@@ -42,10 +69,53 @@ nv: an experiment in keeping Git's object ids without Git's storage
 
 const AUTHOR: &str = "nv <nv@localhost>";
 
+/// What to put in `.claude/settings.json` so that every write a tool makes is recorded.
+const CLAUDE_HOOKS: &str = r#"{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [{ "type": "command", "command": "nv hook claude" }] },
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "nv hook claude" }] }
+    ]
+  }
+}"#;
+
+/// A Claude Code `PostToolUse` event: record what the tool wrote. A tool
+/// that names the file it wrote costs a look at that file; one that does not
+/// (a shell command) costs a walk. Whatever goes wrong, the tool is not
+/// failed for it: this is called for every tool call there is.
+fn claude_hook() -> Option<()> {
+  let mut input = String::new();
+  std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).ok()?;
+  let event: serde_json::Value = serde_json::from_str(&input).ok()?;
+  let text = |value: &serde_json::Value| value.as_str().map(PathBuf::from);
+  let written = text(&event["tool_input"]["file_path"]).or_else(|| text(&event["tool_input"]["notebook_path"]));
+  let cwd = text(&event["cwd"]).or_else(|| std::env::current_dir().ok())?;
+  let written = written.map(|path| if path.is_absolute() { path } else { cwd.join(path) });
+  // The workspace the file is in, or the one the tool ran in.
+  let from = written.as_ref().and_then(|path| path.parent().map(Path::to_path_buf)).unwrap_or(cwd);
+  let root = from.ancestors().find(|dir| dir.join(".nv").join("workspace").is_file())?.to_path_buf();
+  // A workspace that is meant to be watched and is not gets its watcher back here: this runs on every tool call.
+  newvcs::watch::ensure(&root);
+  let _lock = workspace::lock(&root).ok()?;
+  let mut ws = Workspace::open(&root).ok()?;
+  let mut store = Store::open(&ws.store).ok()?;
+  let look = match written.as_ref().and_then(|path| path.strip_prefix(&root).ok()) {
+    Some(relative) => {
+      ws.record(relative.as_os_str().as_encoded_bytes()).ok()?;
+      Look::Recorded
+    }
+    None => Look::Everywhere,
+  };
+  workspace::snapshot(&mut store, &mut ws, AUTHOR, look).ok()?;
+  Some(())
+}
+
 fn run(args: &[String]) -> Result<()> {
   let arg = |i: usize| args.get(i).map(String::as_str).ok_or_else(|| USAGE.to_string());
   let started = Instant::now();
   let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+  // `--recorded` after the arguments: the writer reported every write, so the tree need not be walked.
+  let look = |at: usize| if args.get(at).is_some_and(|a| a == "--recorded") { Look::Recorded } else { Look::Everywhere };
   match arg(0)? {
     "import" => {
       let mut store = Store::open(Path::new(arg(2)?))?;
@@ -119,11 +189,51 @@ fn run(args: &[String]) -> Result<()> {
     "commit" => {
       let mut ws = Workspace::open(Path::new(arg(1)?))?;
       let mut store = Store::open(&ws.store)?;
-      match workspace::commit(&mut store, &mut ws, AUTHOR, arg(2)?)? {
-        Some(id) => println!("{} in {:.0} ms", hex(&id), ms(started)),
+      newvcs::colocated::guard(&ws)?;
+      match workspace::commit(&mut store, &mut ws, AUTHOR, arg(2)?, look(3))? {
+        Some(id) => {
+          newvcs::colocated::published(&mut store, &ws)?;
+          println!("{} in {:.0} ms", hex(&id), ms(started));
+        }
         None => println!("nothing to commit"),
       }
     }
+    "restore" => {
+      let mut ws = Workspace::open(Path::new(arg(1)?))?;
+      let mut store = Store::open(&ws.store)?;
+      let target = workspace::state_named(&ws, arg(2)?)?;
+      let done = workspace::restore_to(&mut store, &mut ws, target, AUTHOR, look(3))?;
+      let kept = done.kept.map(|id| format!("; what was on disk is kept as {}", hex(&id))).unwrap_or_default();
+      println!(
+        "restored to {}: {} files written, {} removed, in {:.1} ms{kept}",
+        &hex(&target)[..12],
+        done.written,
+        done.removed,
+        ms(started)
+      );
+    }
+    "mark" => {
+      let mut ws = Workspace::open(Path::new(arg(1)?))?;
+      let mut store = Store::open(&ws.store)?;
+      let id = workspace::mark(&mut store, &mut ws, arg(2)?, AUTHOR, look(3))?;
+      println!("{} is {}", arg(2)?, hex(&id));
+    }
+    "since" => {
+      let ws = Workspace::open(Path::new(arg(1)?))?;
+      let mut store = Store::open(&ws.store)?;
+      let state = workspace::state_named(&ws, arg(2)?)?;
+      for (path, what) in workspace::since(&mut store, &ws, state, look(3))? {
+        println!("{what} {}", String::from_utf8_lossy(&path));
+      }
+    }
+    "agent-init" if arg(1)? == "claude" => println!("{CLAUDE_HOOKS}"),
+    "watch" => match args.get(2).map(String::as_str) {
+      None => newvcs::watch::watch(Path::new(arg(1)?), AUTHOR)?,
+      Some("--start") => println!("{}", newvcs::watch::start(Path::new(arg(1)?))?),
+      Some("--stop") => println!("{}", newvcs::watch::stop(Path::new(arg(1)?))?),
+      Some("--status") => println!("{}", newvcs::watch::status(Path::new(arg(1)?))),
+      Some(_) => return Err(USAGE.to_string()),
+    },
     "log" => {
       for (at, what, id) in Workspace::open(Path::new(arg(1)?))?.operations() {
         println!("{at} {what:<8} {id}");
@@ -162,6 +272,8 @@ fn run(args: &[String]) -> Result<()> {
       let (oid, written) = git::export(&mut store, &base, Path::new(arg(2)?), arg(3)?)?;
       println!("{} at {} ({written} git objects written) in {:.0} ms", arg(3)?, hex(&oid), ms(started));
     }
+    "adopt" => println!("{}", newvcs::colocated::adopt(Path::new(arg(1)?))?),
+    "shell-init" => print!("{}", newvcs::colocated::SHELL_INIT),
     "stats" => print_stats(&Store::open(Path::new(arg(1)?))?),
     _ => return Err(USAGE.to_string()),
   }
@@ -201,6 +313,41 @@ fn main() -> ExitCode {
   if args.first().is_some_and(|a| a == "git") {
     return ExitCode::from(newvcs::gitcli::run(&args[1..]) as u8);
   }
+  if args.first().is_some_and(|a| a == "hook") && args.get(1).is_some_and(|a| a == "claude") {
+    claude_hook();
+    return ExitCode::SUCCESS;
+  }
+  // These answer with an exit code that says how things stand.
+  let told = match args.first().map(String::as_str) {
+    Some("check") => args.get(1).map(|dir| newvcs::colocated::check(Path::new(dir))),
+    Some("reconcile") => args.get(1).map(|dir| newvcs::colocated::reconcile(Path::new(dir))),
+    _ => None,
+  };
+  if let Some(Ok((code, text))) = &told {
+    println!("{text}");
+    // Being watched, or meant to be and not, is part of how a workspace stands.
+    let dir = Path::new(&args[1]);
+    let (watched, expected) = (newvcs::watch::alive(dir), newvcs::watch::expected(dir));
+    if args[0] == "check" && (watched || expected) {
+      println!("{}", newvcs::watch::status(dir));
+    }
+    return ExitCode::from(if args[0] == "check" && expected && !watched { 1 } else { *code as u8 });
+  }
+  if let Some(Err(why)) = told {
+    eprintln!("{why}");
+    return ExitCode::from(2);
+  }
+  // A command that trusts reported writes first lets a watcher report the last of them.
+  if let Some(dir) = args.get(1).filter(|_| args.iter().any(|a| a == "--recorded")) {
+    newvcs::watch::settle(Path::new(dir));
+  }
+  // One writer at a time in a workspace. A watcher takes the lock for each snapshot instead, not for as long as it runs.
+  let _lock = match (args.first().map(String::as_str), args.get(1)) {
+    (Some(command), Some(dir)) if command != "watch" && command != "fork" && Path::new(dir).join(".nv").join("workspace").is_file() => {
+      workspace::lock(Path::new(dir)).ok()
+    }
+    _ => None,
+  };
   match run(&args) {
     Ok(()) => ExitCode::SUCCESS,
     Err(e) => {

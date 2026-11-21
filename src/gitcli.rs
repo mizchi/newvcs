@@ -112,6 +112,8 @@ struct Repo {
   store: Store,
   /// Where the command was run, relative to the workspace root.
   prefix: Vec<u8>,
+  /// Held for as long as the repository is open: one writer at a time.
+  _lock: std::fs::File,
 }
 
 fn out(bytes: &[u8]) {
@@ -124,10 +126,13 @@ impl Repo {
     let mut dir = start.as_path();
     loop {
       if dir.join(".nv").join("workspace").is_file() {
-        let ws = Workspace::open(dir)?;
-        let store = Store::open(&ws.store)?;
+        let _lock = workspace::lock(dir)?;
+        let mut ws = Workspace::open(dir)?;
+        let mut store = Store::open(&ws.store)?;
+        // Git has commits and uncommitted changes and nothing between: snapshots are seen as the latter.
+        workspace::fold(&mut store, &mut ws)?;
         let prefix = start.strip_prefix(dir).map(|p| p.as_os_str().as_bytes().to_vec()).unwrap_or_default();
-        return Ok(Repo { ws, store, prefix });
+        return Ok(Repo { ws, store, prefix, _lock });
       }
       match dir.parent() {
         Some(parent) => dir = parent,
@@ -537,6 +542,18 @@ pub fn run(args: &[String]) -> i32 {
   }
   let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
   let open = || Repo::open(&at);
+  // Where a Git repository shares the directory and has moved on its own, nothing here may build on what nv believes.
+  const READS: &[&str] = &["status", "log", "show", "diff", "rev-parse", "cat-file", "ls-tree", "config", "fsck"];
+  let shared = |repo: &Repo| crate::colocated::drift(&repo.ws);
+  if !matches!(command.as_str(), "init" | "clone")
+    && let Ok(repo) = open()
+    && let Some(warning) = shared(&repo).as_ref().and_then(crate::colocated::warning)
+  {
+    eprintln!("{warning}");
+    if !READS.contains(&command.as_str()) {
+      return 1;
+    }
+  }
   let result = permitted(command, &rest).and_then(|()| match command.as_str() {
     "init" => init(&at, &rest),
     "clone" => clone(&at, &rest),
@@ -565,6 +582,14 @@ pub fn run(args: &[String]) -> i32 {
     "push" => push(open()?),
     other => unsupported(other),
   });
+  // And where nv has moved, Git is brought along before anyone looks at it.
+  if !READS.contains(&command.as_str())
+    && let Ok(mut repo) = open()
+    && shared(&repo) == Some(crate::colocated::Drift::NvMoved)
+    && let Err(why) = crate::colocated::mirror(&mut repo.store, &repo.ws)
+  {
+    eprintln!("nv: Git was not brought along: {why}");
+  }
   match result {
     Ok(code) => code,
     Err(fail) => {
@@ -1099,8 +1124,9 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     let states = repo.states()?;
     stage(&mut repo, &states, &|_, state| state.index.is_some())?;
   }
-  let changes: Vec<Change> =
-    repo.states()?.into_iter().filter(|(_, state)| state.staged().is_some()).map(|(path, state)| (path, state.index)).collect();
+  // What the index has that the last commit does not say: read off the index, with no look at the files.
+  let known = repo.ws.load_index();
+  let changes: Vec<Change> = repo.staged().into_iter().filter(|(path, entry)| known.get(path).map(|k| k.entry) != *entry).collect();
   if changes.is_empty() && !allow_empty && !amend && merging.is_none() {
     // There is nothing to commit, and why is what status says.
     let (lines, untracked) = status_lines(&mut repo)?;

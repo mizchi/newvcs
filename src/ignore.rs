@@ -47,6 +47,38 @@ impl Ignores {
   }
 }
 
+/// `is_ignored` for many paths: a directory found to be ignored is remembered,
+/// so that the thousand files a build writes into one cost one question.
+pub struct Checker {
+  root: PathBuf,
+  ignored_dirs: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Checker {
+  pub fn new(root: &Path) -> Self {
+    Checker { root: root.to_path_buf(), ignored_dirs: Default::default() }
+  }
+
+  pub fn ignored(&mut self, path: &[u8]) -> bool {
+    let parent = path.iter().rposition(|&b| b == b'/').map_or(&path[..0], |at| &path[..at]);
+    if self
+      .ignored_dirs
+      .iter()
+      .any(|dir| parent == dir.as_slice() || (parent.len() > dir.len() && parent.starts_with(dir) && parent[dir.len()] == b'/'))
+    {
+      return true;
+    }
+    if !is_ignored(&self.root, path) {
+      return false;
+    }
+    // Ignored through its directory, or only by its own name?
+    if !parent.is_empty() && is_ignored(&self.root, parent) {
+      self.ignored_dirs.insert(parent.to_vec());
+    }
+    true
+  }
+}
+
 /// Whether a path of the workspace is ignored: by a rule for it, or by being
 /// inside a directory that is.
 pub fn is_ignored(root: &Path, path: &[u8]) -> bool {

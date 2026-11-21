@@ -197,6 +197,206 @@ Where it is not Git even inside those commands:
 - Patches come from a plain shortest-edit diff. Where Git's heuristics pick
   among equally short ones, the lines shown can differ.
 
+## For a writer that changes files all day
+
+An agent knows which files it wrote, changes them hundreds of times between
+commits, and most wants to get back to the last state that worked. The
+commands for that are few, and most are not typed by anyone:
+
+| When | What runs | Who runs it |
+| --- | --- | --- |
+| A task starts | `nv fork <workspace> <task>` | the agent |
+| A tool wrote a file | `nv hook claude` (records that file, snapshots) | a hook |
+| A shell command ran | `nv hook claude` (walks the tree, snapshots) | a hook |
+| Anything wrote anything | `nv watch <dir> --start`, once (the system reports writes, the watcher snapshots) | a watcher, left running |
+| The tests pass | `nv mark <dir> green` | the agent |
+| What changed since they passed | `nv since <dir> green` | the agent |
+| Something broke | `nv restore <dir> green`, or `~3`, or an id | the agent |
+| Someone says commit | `nv commit <dir> "<message>"` | the agent, when told |
+| Someone wants to look | `nv git status`, `diff`, `log` | a person |
+
+`nv agent-init claude` prints the two `PostToolUse` entries for
+`.claude/settings.json`. The hook reads the event on stdin, finds the
+workspace the file is in, and never fails the tool: outside a workspace, or
+handed something it cannot read, it does nothing.
+
+A snapshot is private. It is not in `nv git log`, and where a Git
+repository shares the directory it never reaches Git: nv's Git commands see
+the snapshots since the last commit as uncommitted changes, which is what
+they are to anyone but the workspace. `nv commit` publishes them as one
+commit and, there, brings Git along in the same command.
+
+`restore` records what is on disk before it overwrites anything, and says
+under which id, so going back can itself be gone back on. It touches the
+files that differ between the two states and no others, and it does not
+publish: the next commit holds whatever lies between the last commit and
+the files. Build output and anything else nv does not track stays put.
+
+On oxc (14,716 files), with Git in the same directory:
+
+| | walking the tree | writes reported (`--recorded`) |
+| --- | ---: | ---: |
+| Hook after a file edit | | 5.6 ms |
+| Hook after a shell command | 65 ms | |
+| Hook outside any workspace | | 4.0 ms |
+| `nv mark` | 60 ms | 5.0 ms |
+| `nv since` | 61 ms | 4.8 ms |
+| `nv restore` (two files differ) | 62 ms | 5.8 ms |
+| `nv commit`, Git brought along | 93 ms | |
+
+The left column is one walk of the tree, to find changes nobody reported.
+With `--recorded` only the reported paths are looked at, and `restore`
+also looks at each file it is about to overwrite, so an unreported change
+to one of those is still kept. An unreported change to a file the two
+states agree on stays on disk as it is.
+
+### A hook, a watcher, or both
+
+Both were run against a real Claude Code session (`claude -p`, asked to use
+Edit, Write and one shell command that wrote two files), and both recorded
+every write: a walk of the tree afterwards found nothing left over.
+
+| | hook (`nv hook claude`) | watcher (`nv watch`) |
+| --- | --- | --- |
+| Needs | two entries in `.claude/settings.json` | a process left running per workspace |
+| Sees | what the agent's tools did | every write, whoever made it: an editor, a formatter, a build, a person |
+| A tool that names its file | 5.6 ms, one file looked at | recorded about 40 ms after the write |
+| A shell command | 65 ms on oxc: the tree is walked, because nothing says what was written | the same 40 ms, and no walk |
+| Snapshots | one per tool call | one per burst of writes (25 ms of quiet ends a burst) |
+| When it is not there | nothing is recorded, silently | started again by the next hook or `--recorded` command, and looks at every file once |
+
+So the hook is exact and immediate for the agent's own tools and pays a
+walk for every shell command; the watcher pays nothing per tool and makes
+`--recorded` true for everything, at the price of a process and a short
+lag. They compose: with both, the hook records an edit at once and never
+needs the walk.
+
+The lag would be a hole: a command that trusts reported writes, run in the
+40 ms after a write, would not see it. So such a command first asks a
+running watcher whether it has caught up (a file in `.nv` that the watcher
+removes once every event before it has been recorded) and waits for the
+answer. With a watcher on oxc, a shell write followed at once by
+`nv mark --recorded` takes 48 ms, and by `nv commit --recorded` 77 ms with
+Git brought along; without a watcher and the writes reported, that commit
+takes 39 ms, against 97 ms when the tree is walked.
+
+The watcher under load, on oxc:
+
+- Idle, it uses no CPU.
+- 208 tracked files appended to by one loop: one snapshot, nothing left for
+  a walk.
+- 5,000 files written into an ignored directory: no snapshot, 0.12 s of CPU
+  to find out that none of them matter.
+- A directory of 112 files renamed: one snapshot holding the 112 removals
+  and 112 additions. The system reports the rename as two paths and says
+  nothing of the files, so the watcher lists them itself.
+- Memory: 83 MB resident, most of it the store mapped for each snapshot.
+
+A hook, a watcher and a person's command can arrive at once, and each
+reads the workspace's state, changes it and writes it back. There was
+nothing to stop two of them from doing so together. There is now one lock
+per workspace (`.nv/lock`), held by every command for as long as it runs
+and by the watcher for each snapshot.
+
+A watcher that has stopped would be the worst kind of failure here: nothing
+recorded, nothing said, and every `--recorded` command trusting reports
+that are not being made. So a workspace remembers that it is meant to be
+watched (`nv watch <dir> --start` says so, `--stop` unsays it), and whether
+a watcher lives is a lock the watcher holds, not a process id that could
+have passed to another process. A hook, and any command with `--recorded`,
+starts a missing watcher before doing anything else; a watcher starting
+looks at every file once, so what was written while nobody watched is
+found. `nv check` says how the workspace is watched and exits non-zero
+when it should be and is not.
+
+On oxc: `nv watch --start` returns in 71 ms, most of it that one look;
+`--status` takes 4.7 ms; a hook with a watcher running, 6.7 ms; and
+`nv since --recorded` right after the watcher was killed, 114 ms, with the
+file written while it was down in the answer.
+
+The watcher uses the `notify` crate: 26.8 s to build from clean where it
+was 21.9 s, 218 KB more in the stripped binary.
+
+Not done: nothing searches the snapshots for the one that broke a test,
+`~N` counts states in the workspace's own log (not across forks), a
+watcher does not come back after a restart of the machine until something
+asks for it, and it has only been run on macOS.
+
+## Sharing a directory with Git
+
+A directory can be a Git repository and an nv workspace at once: `nv adopt
+<dir>` imports the branch Git is on and leaves the files alone. Both then
+keep a head for the same files, and nothing in Git tells nv when Git's
+moves. A raw `git commit` there used to leave nv believing in the old head,
+showing the committed changes as uncommitted, and the next nv commit forked
+the history without a word.
+
+nv now writes down where the two last agreed (`.nv/git-synced`: Git's
+commit, the branch, nv's commit) and tells from that who has moved since:
+
+| | What happened | What puts it right |
+| --- | --- | --- |
+| nv moved | a commit, merge, reset or switch through `nv git` | done at the end of that command: Git gets the objects, the branch and its index |
+| Git moved | a raw `git commit`, `checkout`, `reset`, `pull` | `nv reconcile <dir>`: nv takes Git's commits in, with their ids, and follows its branch |
+| both moved | each has a commit the other lacks | `nv reconcile <dir>` takes Git's in as `git/<branch>`; after `nv git merge git/<branch>` Git is brought along. Neither side's commit is dropped |
+
+Four things stand between a raw Git command and a silent fork:
+
+- **Hooks** (`.git/hooks`, written by `nv adopt`). `pre-commit` stops a
+  commit before it is written. `reference-transaction` stops anything that
+  would move a branch or `HEAD`, whatever the command: `--no-verify`,
+  `--amend`, `checkout -b`, `reset`, `pull`. Both say that nv manages the
+  repository and what to run instead. A `pre-commit` that is someone
+  else's (pkfire's, say) is left as it is; `reference-transaction` still
+  stops the commit. Reading with Git (`log`, `diff`, `status`, `fetch`,
+  `stash`) is not touched.
+- **A check on every `nv git` command**, for when the hooks were bypassed
+  (`-c core.hooksPath=…`) or never installed. Commands that only read say
+  that Git has moved and go on; commands that write refuse until
+  `nv reconcile` has run. It reads two small files and starts no process.
+- **`nv check <dir>`** says how the two stand and exits non-zero unless
+  they are in step, for a script or a prompt.
+- **A shell function** (`eval "$(nv shell-init)"`, bash and zsh): inside a
+  workspace `git` is `nv git`, so what nv does not speak is refused rather
+  than run by Git; `NV_GIT=raw git …` reaches the real Git, and outside a
+  workspace nothing changes. It only covers what is typed into that shell,
+  which is why the hooks and the check exist.
+
+Without a `.git` beside it there is nothing to guard: raw Git in an nv
+workspace says "not a git repository".
+
+On oxc (14,716 files), a commit of one staged file:
+
+| | first version | now |
+| --- | ---: | ---: |
+| `nv git commit`, no Git beside it | 42 ms | 8.3 ms |
+| `nv git commit`, Git brought along | 127 ms | 35 ms |
+| `nv git commit -a`, no Git beside it | 174 ms | 73 ms |
+| `nv git commit -a`, Git brought along | 269 ms | 97 ms |
+| `nv git rev-parse HEAD` | 40.5 ms | 5.9 ms |
+| `nv adopt` | 205 s | 21 s |
+| raw `git commit -a`, for scale | 32 ms | |
+
+The first version was measured because the policy asks for it, and three
+things in it scaled with the wrong quantity:
+
+- `commit` walked the tree to find what was staged. It now reads the index.
+  (`commit -a` still walks it once, and looks for untracked files it does
+  not need, where Git only stats the files it tracks.)
+- Any command that printed a Git id read every Git id in the store: 34 ms
+  here, more with more history. They are now in a sorted, memory-mapped
+  table (`git.idx`) beside a short log of the ones added since.
+- Bringing Git along started a `git hash-object` per object and reset
+  Git's whole index. Loose objects are now written directly, and Git's
+  index is told the paths that changed. What is left of the 27 ms is three
+  Git processes: `cat-file`, `update-ref`, `update-index`.
+
+Not done here: only the branch Git is on is imported by `adopt` (the
+others when Git goes to them), tags are not mirrored either way, a Git
+worktree (`.git` as a file) is not recognised, and `nv sync` moves the
+head without bringing Git along until `nv reconcile` (`nv commit` does
+bring it along, and refuses where Git has moved).
+
 ## The model
 
 - **A commit is a list of changes** (`src/commit.rs`): its parents, the paths

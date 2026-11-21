@@ -7,7 +7,7 @@
 
 use newvcs::remote::{self, Synced};
 use newvcs::store::Store;
-use newvcs::workspace::{self, Workspace};
+use newvcs::workspace::{self, Look, Workspace};
 use newvcs::{Id, git};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,7 +59,7 @@ impl Peer {
     std::fs::read_to_string(self.dir.join(path)).ok()
   }
   fn commit(&mut self, message: &str) -> Id {
-    workspace::commit(&mut self.store, &mut self.ws, AUTHOR, message).unwrap().expect("there is something to commit")
+    workspace::commit(&mut self.store, &mut self.ws, AUTHOR, message, Look::Everywhere).unwrap().expect("there is something to commit")
   }
   fn push(&mut self) -> Result<remote::Pushed, String> {
     remote::push(&mut self.store, &mut self.ws, AUTHOR)
