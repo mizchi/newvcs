@@ -78,6 +78,14 @@ function objectId(kind: number, bytes: Uint8Array): Uint8Array {
 }
 
 export const idOf = (encoded: Uint8Array) => objectId(KIND_COMMIT, encoded);
+
+/// A blob's id, worked out as its bytes go by: for content too large to hold.
+export function blobHasher() {
+  const hasher = blake3.create();
+  hasher.update(Uint8Array.of(KIND_BLOB));
+  return hasher;
+}
+
 export const blobIdOf = (bytes: Uint8Array) => objectId(KIND_BLOB, bytes);
 
 export const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");

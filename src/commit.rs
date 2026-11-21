@@ -7,6 +7,11 @@
 //! subdirectory can commit to it; the full tree is derived afterwards by
 //! whoever has the parent's tree (`manifest::apply`), and cached.
 //!
+//! A change sets a path to a file, removes what is there, or sets it to a
+//! whole directory by that directory's id. The last is what a link is
+//! (`links`): one change however many files the directory has, for which
+//! the directory's tree objects have to be in the store.
+//!
 //! `rest` is everything of a Git commit object after its `tree` and `parent`
 //! lines, byte for byte: author, committer, signatures, message. With the
 //! derived tree it is enough to write the Git commit back unchanged.
@@ -154,7 +159,7 @@ mod tests {
   fn roots_are_derived_along_the_first_parent() {
     let dir = std::env::temp_dir().join(format!("newvcs-commit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut store = Store::open(&dir).unwrap();
+    let mut store = Store::create(&dir).unwrap();
     let file = |n: u8| Some(Entry { mode: 0o100644, id: [n; 32] });
     let first = Commit { parents: vec![], rest: b"1".to_vec(), changes: vec![(b"a".to_vec(), file(1)), (b"d/b".to_vec(), file(2))] }
       .store(&mut store)

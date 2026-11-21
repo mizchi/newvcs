@@ -11,7 +11,7 @@
 
 use crate::store::{Kind, Store};
 use crate::{Id, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub const MODE_DIR: u32 = 0o40000;
 pub const MODE_LINK: u32 = 0o120000;
@@ -93,23 +93,25 @@ fn apply_dir(store: &mut Store, id: Option<Id>, changes: &[(&[u8], Option<Entry>
     }
   }
   for (name, (own, nested)) in groups {
-    match own {
-      // The name becomes a file. Whatever else is said about paths below it
-      // can only be the removal of the directory that was there.
+    let below = match own {
+      // The name becomes that directory, and the paths below it are changes to it.
+      Some(Some(entry)) if entry.is_dir() && !nested.is_empty() => Some(entry.id),
+      // The name becomes a file, or a directory as it is. Whatever else is said about
+      // paths below a file can only be the removal of the directory that was there.
       Some(Some(entry)) => {
         dir.insert(name.to_vec(), entry);
         continue;
       }
-      // A file goes away, perhaps to make room for a directory of that name.
+      // What was there goes away, perhaps to make room for a directory of that name.
       Some(None) => {
         dir.remove(name);
+        None
       }
-      None => {}
-    }
+      None => dir.get(name).filter(|e| e.is_dir()).map(|e| e.id),
+    };
     if nested.is_empty() {
       continue;
     }
-    let below = dir.get(name).filter(|e| e.is_dir()).map(|e| e.id);
     match apply_dir(store, below, &nested)? {
       Some(id) => dir.insert(name.to_vec(), Entry { mode: MODE_DIR, id }),
       None => dir.remove(name),
@@ -125,7 +127,14 @@ fn apply_dir(store: &mut Store, id: Option<Id>, changes: &[(&[u8], Option<Entry>
 /// The changes that turn tree `a` into tree `b`. Subtrees with the same id
 /// are the same subtree and are not opened.
 pub fn diff(store: &mut Store, a: Option<Id>, b: Option<Id>) -> Result<Vec<Change>> {
-  fn go(store: &mut Store, a: Option<Id>, b: Option<Id>, at: &mut Vec<u8>, out: &mut Vec<Change>) -> Result<()> {
+  diff_keeping(store, a, b, &HashSet::new())
+}
+
+/// `diff`, except that a directory of `b` whose id is in `whole` is one
+/// change, however many files it has: it was put there as that directory,
+/// and is still exactly it.
+pub fn diff_keeping(store: &mut Store, a: Option<Id>, b: Option<Id>, whole: &HashSet<Id>) -> Result<Vec<Change>> {
+  fn go(store: &mut Store, a: Option<Id>, b: Option<Id>, whole: &HashSet<Id>, at: &mut Vec<u8>, out: &mut Vec<Change>) -> Result<()> {
     if a == b {
       return Ok(());
     }
@@ -146,20 +155,57 @@ pub fn diff(store: &mut Store, a: Option<Id>, b: Option<Id>) -> Result<Vec<Chang
       }
       at.extend_from_slice(name);
       let dir_of = |e: Option<Entry>| e.filter(Entry::is_dir).map(|e| e.id);
-      // A file that is gone or replaced by a directory is removed; one that appears or changed is set.
-      match (o.filter(|e| !e.is_dir()), n.filter(|e| !e.is_dir())) {
-        (_, Some(file)) => out.push((at.clone(), Some(file))),
-        (Some(_), None) => out.push((at.clone(), None)),
-        (None, None) => {}
+      if let Some(kept) = n.filter(|e| e.is_dir() && whole.contains(&e.id)) {
+        // Whatever was there, file or directory, this takes its place.
+        out.push((at.clone(), Some(kept)));
+      } else {
+        // A file that is gone or replaced by a directory is removed; one that appears or changed is set.
+        match (o.filter(|e| !e.is_dir()), n.filter(|e| !e.is_dir())) {
+          (_, Some(file)) => out.push((at.clone(), Some(file))),
+          (Some(_), None) => out.push((at.clone(), None)),
+          (None, None) => {}
+        }
+        go(store, dir_of(o), dir_of(n), whole, at, out)?;
       }
-      go(store, dir_of(o), dir_of(n), at, out)?;
       at.truncate(len);
     }
     Ok(())
   }
   let mut out = Vec::new();
-  go(store, a, b, &mut Vec::new(), &mut out)?;
+  go(store, a, b, whole, &mut Vec::new(), &mut out)?;
   Ok(out)
+}
+
+/// `changes`, made on `root`, with every change to a whole directory opened
+/// into the files it sets and removes. For whoever has to touch the files.
+pub fn expand(store: &mut Store, root: Option<Id>, changes: &[Change]) -> Result<Vec<Change>> {
+  let mut out = Vec::with_capacity(changes.len());
+  for (path, entry) in changes {
+    let was = match root {
+      Some(root) => lookup(store, root, path)?,
+      None => None,
+    };
+    let (was_dir, now_dir) = (was.filter(Entry::is_dir).map(|e| e.id), entry.filter(Entry::is_dir).map(|e| e.id));
+    if was_dir.is_none() && now_dir.is_none() {
+      out.push((path.clone(), *entry));
+      continue;
+    }
+    // A file on either side is a change of its own; the directories are opened against each other.
+    match (was.filter(|e| !e.is_dir()), entry.filter(|e| !e.is_dir())) {
+      (_, Some(file)) => out.push((path.clone(), Some(file))),
+      (Some(_), None) => out.push((path.clone(), None)),
+      (None, None) => {}
+    }
+    for (below, entry) in diff(store, was_dir, now_dir)? {
+      out.push(([path.as_slice(), b"/", below.as_slice()].concat(), entry));
+    }
+  }
+  Ok(out)
+}
+
+/// The ids of the directories that `changes` set whole.
+pub fn whole_dirs<'a>(changes: impl IntoIterator<Item = &'a Change>) -> impl Iterator<Item = Id> {
+  changes.into_iter().filter_map(|(_, entry)| entry.filter(Entry::is_dir).map(|e| e.id))
 }
 
 /// The entry at `path`, if the tree has one.
@@ -222,7 +268,7 @@ mod tests {
   fn store(name: &str) -> Store {
     let dir = std::env::temp_dir().join(format!("newvcs-manifest-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    Store::open(&dir).unwrap()
+    Store::create(&dir).unwrap()
   }
 
   fn file(n: u8) -> Option<Entry> {
@@ -335,5 +381,58 @@ mod tests {
     assert_eq!(paths(&mut s, root, &["pkg/ui", "docs"]), ["docs/a.md", "pkg/ui/z.ts"]);
     assert_eq!(paths(&mut s, root, &["pkg/core/x.ts"]), ["pkg/core/x.ts"]);
     assert_eq!(paths(&mut s, root, &["nowhere"]), Vec::<String>::new());
+  }
+
+  /// A tree to stand in for a directory of another repository.
+  fn library(s: &mut Store) -> Id {
+    apply(s, None, &[change("a", file(1)), change("deep/b", file(2)), change("deep/c", file(3))]).unwrap().unwrap()
+  }
+
+  #[test]
+  fn a_change_can_set_a_whole_directory() {
+    let mut s = store("dir-change");
+    let lib = library(&mut s);
+    let dir = Some(Entry { mode: MODE_DIR, id: lib });
+    let root = apply(&mut s, None, &[change("src/main", file(9)), change("vendor/lib", file(8))]).unwrap();
+    // Where a file was, where nothing was, and with changes below it in the same list.
+    let linked =
+      apply(&mut s, root, &[change("vendor/lib", dir), change("other", dir), change("other/deep/b", None), change("other/new", file(7))])
+        .unwrap()
+        .unwrap();
+    assert_eq!(lookup(&mut s, linked, b"vendor/lib").unwrap(), dir);
+    assert_eq!(
+      paths(&mut s, linked, &[]),
+      ["other/a", "other/deep/c", "other/new", "src/main", "vendor/lib/a", "vendor/lib/deep/b", "vendor/lib/deep/c"]
+    );
+    // And a directory goes away in one change.
+    let gone = apply(&mut s, Some(linked), &[change("vendor/lib", None)]).unwrap().unwrap();
+    assert_eq!(paths(&mut s, gone, &[]), ["other/a", "other/deep/c", "other/new", "src/main"]);
+  }
+
+  #[test]
+  fn a_directory_named_whole_stays_one_change_in_a_diff_and_opens_into_its_files() {
+    let mut s = store("dir-diff");
+    let lib = library(&mut s);
+    let dir = Some(Entry { mode: MODE_DIR, id: lib });
+    let before = apply(&mut s, None, &[change("src/main", file(9)), change("vendor/lib", file(8))]).unwrap();
+    let after = apply(&mut s, before, &[change("vendor/lib", dir), change("src/main", file(10))]).unwrap();
+    let kept: std::collections::HashSet<Id> = [lib].into();
+    let whole = diff_keeping(&mut s, before, after, &kept).unwrap();
+    assert_eq!(whole, [change("src/main", file(10)), change("vendor/lib", dir)]);
+    assert_eq!(apply(&mut s, before, &whole).unwrap(), after);
+    // Nobody named it whole: every file, as before.
+    assert_eq!(diff(&mut s, before, after).unwrap().len(), 5);
+    // Opened against what was there: the file it replaces goes, its files arrive.
+    let files = expand(&mut s, before, &whole).unwrap();
+    assert_eq!(files, diff(&mut s, before, after).unwrap());
+    // Changed since: no longer that directory, so its changes are listed.
+    let touched = apply(&mut s, after, &[change("vendor/lib/a", file(11))]).unwrap();
+    assert_eq!(diff_keeping(&mut s, after, touched, &kept).unwrap(), [change("vendor/lib/a", file(11))]);
+    // Another directory taking its place is opened against the one that was there.
+    let other = apply(&mut s, Some(lib), &[change("a", file(12))]).unwrap().unwrap();
+    let replaced = apply(&mut s, after, &[change("vendor/lib", Some(Entry { mode: MODE_DIR, id: other }))]).unwrap();
+    let step = [change("vendor/lib", Some(Entry { mode: MODE_DIR, id: other }))];
+    assert_eq!(expand(&mut s, after, &step).unwrap(), [change("vendor/lib/a", file(12))]);
+    assert_eq!(apply(&mut s, after, &step).unwrap(), replaced);
   }
 }

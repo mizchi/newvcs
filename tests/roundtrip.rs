@@ -61,7 +61,7 @@ fn repository(name: &str) -> PathBuf {
 #[test]
 fn a_git_history_maps_back_to_the_same_ids() {
   let dir = repository("ids");
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   let done = git::import(&mut store, &dir.join("repo"), "HEAD", None).unwrap();
   assert_eq!(done.commits, 6);
   assert_eq!(done.mismatches, Vec::<String>::new());
@@ -71,7 +71,7 @@ fn a_git_history_maps_back_to_the_same_ids() {
   drop(store);
 
   // From the store alone, in another process's shoes: every commit id comes out again.
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   let (checked, wrong) = git::verify(&mut store).unwrap();
   assert_eq!((checked, wrong), (6, Vec::new()));
 }
@@ -80,7 +80,7 @@ fn a_git_history_maps_back_to_the_same_ids() {
 fn a_workspace_of_one_directory_commits_without_the_rest() {
   let dir = repository("subdir");
   let (repo, store_dir) = (dir.join("repo"), dir.join("store"));
-  let mut store = Store::open(&store_dir).unwrap();
+  let mut store = Store::create(&store_dir).unwrap();
   git::import(&mut store, &repo, "HEAD", None).unwrap();
   let head = store.resolve(sh(&repo, "git rev-parse HEAD").trim()).expect("imported");
 
@@ -122,7 +122,7 @@ fn a_workspace_of_one_directory_commits_without_the_rest() {
 #[test]
 fn workspaces_share_files_and_a_fork_keeps_untracked_output() {
   let dir = repository("share");
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   git::import(&mut store, &dir.join("repo"), "HEAD", None).unwrap();
   let head = store.resolve(sh(&dir.join("repo"), "git rev-parse HEAD").trim()).unwrap();
 
@@ -165,7 +165,7 @@ fn workspaces_share_files_and_a_fork_keeps_untracked_output() {
 #[test]
 fn snapshots_record_work_and_a_commit_publishes_it_as_one() {
   let dir = repository("snapshots");
-  let (repo, mut store) = (dir.join("repo"), Store::open(&dir.join("store")).unwrap());
+  let (repo, mut store) = (dir.join("repo"), Store::create(&dir.join("store")).unwrap());
   git::import(&mut store, &repo, "HEAD", None).unwrap();
   let head = store.resolve(sh(&repo, "git rev-parse HEAD").trim()).unwrap();
   let ws_dir = dir.join("ws");
@@ -205,7 +205,7 @@ fn snapshots_record_work_and_a_commit_publishes_it_as_one() {
 #[test]
 fn unchanged_files_are_not_read() {
   let dir = repository("index");
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   git::import(&mut store, &dir.join("repo"), "HEAD", None).unwrap();
   let head = store.resolve(sh(&dir.join("repo"), "git rev-parse HEAD").trim()).unwrap();
   let ws_dir = dir.join("ws");
@@ -246,7 +246,7 @@ fn unchanged_files_are_not_read() {
 #[test]
 fn a_writer_that_reports_its_writes_is_not_walked_after() {
   let dir = repository("recorded");
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   git::import(&mut store, &dir.join("repo"), "HEAD", None).unwrap();
   let head = store.resolve(sh(&dir.join("repo"), "git rev-parse HEAD").trim()).unwrap();
   let ws_dir = dir.join("ws");
@@ -274,7 +274,7 @@ fn a_writer_that_reports_its_writes_is_not_walked_after() {
 #[test]
 fn a_whole_checkout_is_cloned_from_a_tree_the_store_keeps_or_derives() {
   let dir = repository("trees");
-  let (repo, mut store) = (dir.join("repo"), Store::open(&dir.join("store")).unwrap());
+  let (repo, mut store) = (dir.join("repo"), Store::create(&dir.join("store")).unwrap());
   git::import(&mut store, &repo, "HEAD", None).unwrap();
   let files = |ws: &Path| -> Vec<String> {
     let listing = sh(ws, "find . -path ./.nv -prune -o \\( -type f -o -type l \\) -print | sed 's|^./||' | LC_ALL=C sort");
@@ -355,10 +355,10 @@ fn a_tree_with_a_mode_git_no_longer_writes_keeps_its_id() {
   // What Git reports hides the mode; what Git stored has it.
   assert!(sh(&repo, "git log --raw --format= main").contains(":000000 100644"));
   assert!(sh(&repo, "git cat-file tree 'main^{tree}' | head -c 6").starts_with("100664"));
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   let done = git::import(&mut store, &repo, "main", None).unwrap();
   assert_eq!((done.commits, done.mismatches), (2, Vec::<String>::new()));
   drop(store);
-  let mut store = Store::open(&dir.join("store")).unwrap();
+  let mut store = Store::create(&dir.join("store")).unwrap();
   assert_eq!(git::verify(&mut store).unwrap(), (2, Vec::new()));
 }

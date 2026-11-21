@@ -1139,6 +1139,7 @@ dependencies = [
  "notify",
  "serde_json",
  "sha1",
+ "unicode-normalization",
  "ureq",
  "zstd",
 ]

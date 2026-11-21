@@ -18,6 +18,7 @@ pub mod git;
 pub mod gitcli;
 pub mod ignore;
 pub mod index;
+pub mod links;
 pub mod manifest;
 pub mod remote;
 pub mod store;
@@ -40,3 +41,18 @@ pub fn unhex(text: &str) -> Option<Vec<u8>> {
 }
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// Replace a file's contents so that whoever reads it, at any moment and
+/// after a process is killed at any moment, finds the old contents or the
+/// new, never a part of either. Every file that says where a workspace or
+/// a ref stands is written this way.
+pub fn write_whole(path: &std::path::Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+  let fail = |e: std::io::Error| format!("cannot write {}: {e}", path.display());
+  let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+  let temp = path.with_file_name(format!(".{name}.tmp{}", std::process::id()));
+  std::fs::write(&temp, bytes).map_err(fail)?;
+  std::fs::rename(&temp, path).map_err(|e| {
+    let _ = std::fs::remove_file(&temp);
+    fail(e)
+  })
+}

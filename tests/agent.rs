@@ -182,12 +182,12 @@ fn snapshots_stay_private_and_a_commit_reaches_git_in_the_same_directory() {
   assert_eq!(ok(&dir, "git status --porcelain"), "");
   assert_eq!(ok(&dir, "$NV check ."), "in step");
   ok(&dir, "git fsck --strict");
-  // And where Git moved on its own, publishing waits for the two to be reconciled.
-  ok(&dir, "echo raw > b.txt && git -c core.hooksPath=/dev/null commit -q -am 'raw git'");
-  let refused = sh_with(&dir, "echo a9 > a.txt && $NV commit . 'on a head Git left'", "");
-  assert!(!refused.status.success() && text(&refused).contains("nv reconcile"), "{}", text(&refused));
-  ok(&dir, "$NV reconcile . && $NV commit . 'after reconciling'");
-  assert_eq!(ok(&dir, "git log --format=%s"), "after reconciling\nraw git\ntwo changes, published\nbase");
+  // And where Git moved on its own, nv takes that in and publishes on top of it.
+  ok(&dir, "echo raw > b.txt && git commit -q -am 'raw git'");
+  let said = sh_with(&dir, "echo a9 > a.txt && $NV commit . 'on where Git went'", "");
+  assert!(said.status.success() && text(&said).contains("took in Git's commits"), "{}", text(&said));
+  assert_eq!(ok(&dir, "git log --format=%s"), "on where Git went\nraw git\ntwo changes, published\nbase");
+  assert_eq!(ok(&dir, "git status --porcelain; $NV check ."), "in step");
 }
 
 #[test]
@@ -292,4 +292,254 @@ fn a_watcher_that_stopped_is_noticed_and_what_it_missed_is_found() {
   ok(&dir, "echo quiet > quiet.txt && $NV since . start --recorded");
   assert!(ok(&dir, "$NV watch . --status").contains("not watched"));
   assert!(ok(&dir, "$NV check .").contains("no Git repository"));
+}
+
+#[test]
+fn a_command_killed_at_any_moment_leaves_a_workspace_that_works() {
+  let dir = workspace("killed");
+  ok(&dir, "echo good > a.txt && $NV mark . green");
+  // Killed two hundred times, somewhere in its first few milliseconds.
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 200 ]; do i=$((i+1)); echo \"edit $i\" >> a.txt; echo \"edit $i\" >> b.txt; $NV snapshot . >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.004))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; done; true",
+  );
+  let state = ok(&dir, "cat .nv/workspace");
+  assert!(state.contains("store ") && state.contains("head ") && state.contains("base "), "the workspace file is whole:\n{state}");
+  // What is on disk is recorded and published, and nothing recorded before is out of reach.
+  ok(&dir, "$NV snapshot . && $NV commit . 'after two hundred kills'");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "");
+  assert_eq!(ok(&dir, "$NV git show HEAD:a.txt | tail -1"), "edit 200");
+  ok(&dir, "$NV restore . green >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt b.txt"), "good\nb1");
+  // No store appeared where the command was run.
+  assert!(!dir.join("objects.seg").exists() && !dir.join("git.map").exists());
+}
+
+#[test]
+fn looking_in_the_wrong_place_creates_nothing() {
+  let dir = workspace("wrong-place");
+  ok(&dir, "mkdir empty");
+  for command in
+    ["$NV verify empty", "$NV stats empty", "$NV stats nowhere", "$NV verify .", "$NV names empty", "$NV checkout nowhere HEAD out"]
+  {
+    let out = sh_with(&dir, command, "");
+    assert!(!out.status.success(), "`{command}` passed: {}", text(&out));
+    assert!(text(&out).contains("is not a store"), "`{command}`: {}", text(&out));
+  }
+  assert_eq!(ok(&dir, "ls empty | wc -l").trim(), "0");
+  assert!(!dir.join("nowhere").exists() && !dir.join("out").exists() && !dir.join("objects.seg").exists());
+}
+
+#[test]
+fn only_paths_inside_the_workspace_can_be_reported() {
+  let dir = workspace("outside");
+  ok(&dir, "echo secret > ../agent-outside-secret.txt && echo a2 > a.txt && rm b.txt");
+  for bad in ["../agent-outside-secret.txt", "/etc/hosts", "d/../../agent-outside-secret.txt", ".nv/workspace", ""] {
+    let out = sh_with(&dir, &format!("$NV record . '{bad}'"), "");
+    assert!(!out.status.success(), "`{bad}` was taken: {}", text(&out));
+  }
+  // A directory that is a link out of the workspace is not a way out of it either.
+  ok(&dir, "ln -s .. way-out");
+  let out = sh_with(&dir, "$NV record . way-out/agent-outside-secret.txt", "");
+  assert!(!out.status.success() && text(&out).contains("beyond a symbolic link"), "{}", text(&out));
+  let out = sh_with(&dir, "$NV record . \"$PWD/way-out/agent-outside-secret.txt\"", "");
+  assert!(!out.status.success(), "{}", text(&out));
+  ok(&dir, "rm way-out && $NV record . d/../a.txt");
+  // A path inside it, given from the root of the file system, a removed file, and a path through `.`: all fine.
+  ok(&dir, "$NV record . \"$PWD/a.txt\" b.txt ./d/x.txt && $NV commit . 'reported' --recorded");
+  assert_eq!(ok(&dir, "$NV git ls-tree -r --name-only HEAD"), "a.txt\nd/x.txt");
+  let _ = std::fs::remove_file(dir.join("../agent-outside-secret.txt"));
+}
+
+#[test]
+fn a_workspace_can_be_moved() {
+  let dir = workspace("moved-from");
+  let to = dir.with_file_name("agent-moved-to");
+  let _ = std::fs::remove_dir_all(&to);
+  ok(&dir, "echo a2 > a.txt && $NV snapshot . >/dev/null");
+  std::fs::rename(&dir, &to).unwrap();
+  ok(&to, "echo a3 > a.txt && $NV commit . 'after the move' >/dev/null");
+  assert_eq!(ok(&to, "$NV git show HEAD:a.txt"), "a3");
+  assert!(!dir.exists(), "nothing was made where the workspace used to be");
+}
+
+#[test]
+fn forks_that_commit_at_once_share_a_store_without_harming_it() {
+  let dir = fresh("forks");
+  ok(
+    &dir,
+    "mkdir main && cd main && $NV git init -q -b main . && for i in $(seq 1 60); do echo \"line $i\" > f$i.txt; done && $NV git add -A && $NV git commit -q -m base",
+  );
+  ok(&dir, "for k in 1 2 3 4 5 6 7 8; do $NV fork main fork$k >/dev/null; done");
+  // Eight forks, six commits each, all at the same time, each to files of its own and one they all have.
+  let out = sh_with(
+    &dir,
+    "for k in 1 2 3 4 5 6 7 8; do ( for n in 1 2 3 4 5 6; do echo \"fork $k commit $n\" >> fork$k/f$k.txt; echo \"$k.$n\" >> fork$k/f60.txt; $NV commit fork$k \"fork $k commit $n\" || echo \"FAILED $k $n\"; done ) & done; wait",
+    "",
+  );
+  assert!(!text(&out).contains("FAILED") && !text(&out).contains("cannot") && !text(&out).contains("not in the store"), "{}", text(&out));
+  for k in 1..=8 {
+    assert_eq!(ok(&dir, &format!("$NV git -C fork{k} log --format=%s | head -6 | wc -l")).trim(), "6", "fork {k}");
+    assert_eq!(ok(&dir, &format!("$NV git -C fork{k} show HEAD:f{k}.txt | tail -1")), format!("fork {k} commit 6"));
+    assert_eq!(ok(&dir, &format!("$NV git -C fork{k} show HEAD:f60.txt | wc -l")).trim(), "7");
+    ok(&dir, &format!("$NV git -C fork{k} fsck"));
+    assert_eq!(ok(&dir, &format!("$NV status fork{k} 2>/dev/null")), "");
+  }
+}
+
+#[test]
+fn files_written_outside_a_view_are_pointed_out() {
+  let dir = fresh("outside-view");
+  ok(
+    &dir,
+    "git init -q -b main repo && cd repo && mkdir -p pkg/core pkg/ui docs && echo a > pkg/core/a.ts && echo b > pkg/ui/b.ts && echo g > docs/g.md && echo r > README.md && git add -A && git commit -q -m first",
+  );
+  ok(&dir, "$NV import repo store >/dev/null && $NV checkout store $(git -C repo rev-parse HEAD) ws pkg/core >/dev/null");
+  // Inside the view nothing is said. Outside it, each thing written is named once, at the top of what is new.
+  let quiet = sh_with(&dir, "echo a2 > ws/pkg/core/a.ts && $NV status ws", "");
+  assert!(!text(&quiet).contains("outside"), "{}", text(&quiet));
+  ok(&dir, "mkdir -p ws/docs/deep ws/pkg/ui && echo x > ws/docs/deep/g.md && echo y > ws/README.md && echo z > ws/pkg/ui/b.ts");
+  for command in ["$NV status ws", "$NV snapshot ws", "$NV commit ws 'inside only'"] {
+    let said = text(&sh_with(&dir, command, ""));
+    assert!(said.contains("not recorded: README.md, docs/, pkg/ui/") && said.contains("the view is pkg/core"), "`{command}`: {said}");
+  }
+}
+
+#[test]
+fn a_command_given_wrongly_says_what_was_wrong_and_does_nothing() {
+  let dir = workspace("usage");
+  ok(&dir, "echo a2 > a.txt");
+  // A misspelt option is not silently the slow way of doing the same thing.
+  for (command, complaint) in [
+    ("$NV snapshot . --recoded", "unknown option `--recoded` (it takes --recorded, --tracked)"),
+    ("$NV commit .", "too few arguments"),
+    ("$NV commit . ''", "a message that says something"),
+    ("$NV log . extra", "too many arguments"),
+    ("$NV frobnicate", "is not a command"),
+    ("$NV restore . ab", "too short"),
+    ("$NV hook", "nv hook claude"),
+  ] {
+    let out = sh_with(&dir, command, "");
+    assert_eq!(out.status.code(), Some(2), "`{command}`: {}", text(&out));
+    assert!(text(&out).contains(complaint), "`{command}`: {}", text(&out));
+    assert!(text(&out).lines().count() < 8, "`{command}` printed the whole usage: {}", text(&out));
+  }
+  assert_eq!(ok(&dir, "$NV log . | grep -c snapshot || true"), "0", "none of those recorded anything");
+  // Help and version are answers, not errors.
+  assert!(ok(&dir, "$NV --version").starts_with("nv "));
+  assert!(ok(&dir, "$NV help").contains("nv snapshot <dir>") && ok(&dir, "$NV --help").contains("nv commit <dir>"));
+  assert_eq!(ok(&dir, "$NV snapshot --help | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
+  assert_eq!(ok(&dir, "$NV help snapshot | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
+  // States counted back reach behind the first one recorded here, to the commit the work began on.
+  ok(&dir, "$NV snapshot . >/dev/null && echo a3 > a.txt && $NV snapshot . >/dev/null && $NV restore . '~1' >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt"), "a2");
+  ok(&dir, "$NV restore . '~2' >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt"), "a1");
+  assert!(!sh_with(&dir, "$NV restore . '~40'", "").status.success());
+}
+
+#[test]
+fn a_name_that_differs_only_in_case_or_in_how_its_letters_are_built_is_the_same_file() {
+  let dir = workspace("names");
+  if !dir.join(".NV").exists() {
+    eprintln!("this file system tells names apart by case: nothing to check");
+    return;
+  }
+  ok(&dir, "$NV mark . h >/dev/null && mv a.txt A.TXT");
+  // The file system says it is the same file, and so does Git on such a file system: nothing changed.
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null; $NV since . h"), "");
+  ok(&dir, "echo changed > A.TXT");
+  assert_eq!(
+    ok(&dir, "$NV status . 2>/dev/null; $NV record . A.TXT && $NV snapshot . --recorded >/dev/null && $NV since . h"),
+    "M a.txt\nM a.txt"
+  );
+  // Going back writes the file; it does not write it and then remove it under its other name.
+  ok(&dir, "$NV restore . h >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt; ls | wc -l"), "a1\n       3");
+  // A name the file system hands back with its accents apart is the name Git has with them joined.
+  let apart = "cafe\u{301}.txt";
+  let joined = "caf\u{e9}.txt";
+  ok(&dir, &format!("echo one > '{apart}' && $NV commit . 'an accent' >/dev/null && $NV status . 2>/dev/null"));
+  assert_eq!(
+    ok(&dir, "$NV git ls-tree --name-only HEAD | grep caf | od -c | head -1 | grep -c '314 201' || true"),
+    "0",
+    "stored as the joined name"
+  );
+  ok(&dir, &format!("echo two > '{joined}'"));
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null | wc -l").trim(), "1", "one file, changed: not one changed and one new");
+}
+
+#[test]
+fn going_back_says_so_when_a_file_could_not_be_removed() {
+  let dir = workspace("stuck");
+  ok(&dir, "$NV mark . g >/dev/null && mkdir ro && echo c > ro/x.txt && echo a2 > a.txt && $NV mark . h >/dev/null && chmod 555 ro");
+  let out = sh_with(&dir, "$NV restore . g", "");
+  ok(&dir, "chmod 755 ro");
+  assert!(!out.status.success() && text(&out).contains("could not be removed") && text(&out).contains("ro/x.txt"), "{}", text(&out));
+  // The rest was done, and what is left over shows as what it is.
+  assert_eq!(ok(&dir, "cat a.txt; $NV status . 2>/dev/null"), "a1\nA ro/x.txt");
+}
+
+#[test]
+fn a_commit_with_no_git_beside_it_is_signed_as_git_would_sign_it() {
+  let dir = workspace("signed");
+  // The environment first, author and committer each; a time given is the time.
+  ok(
+    &dir,
+    "echo a2 > a.txt && GIT_COMMITTER_NAME=Com GIT_COMMITTER_EMAIL=com@example.com GIT_AUTHOR_DATE='1700000000 +0900' $NV commit . one >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae> %at | %cn <%ce>'"), "A <a@example.com> 1700000000 | Com <com@example.com>");
+  // Then what the workspace was told, then what the user's Git configuration says.
+  ok(&dir, "printf '[user]\\n\\tname = Global\\n\\temail = global@example.com\\n' > ../agent-signed-gitconfig");
+  let bare = "env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL GIT_CONFIG_GLOBAL=$PWD/../agent-signed-gitconfig";
+  ok(&dir, &format!("echo a3 > a.txt && {bare} $NV commit . two >/dev/null"));
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae> | %cn'"), "Global <global@example.com> | Global");
+  ok(
+    &dir,
+    &format!(
+      "$NV git config user.name Own && $NV git config user.email own@example.com && echo a4 > a.txt && {bare} $NV commit . three >/dev/null"
+    ),
+  );
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>'"), "Own <own@example.com>");
+  // The time is said in the zone the machine is in.
+  let zone = ok(&dir, "date +%z");
+  assert!(ok(&dir, "$NV git cat-file -p HEAD | grep '^committer'").ends_with(&zone), "{zone}");
+  let _ = std::fs::remove_file(dir.join("../agent-signed-gitconfig"));
+}
+
+#[test]
+fn smaller_things_a_reviewer_tripped_on() {
+  let dir = workspace("smaller");
+  // From a directory inside the workspace, with paths told from there.
+  ok(&dir, "echo x2 > d/x.txt && cd d && $NV record . x.txt && $NV snapshot . --recorded >/dev/null && $NV since . base");
+  assert_eq!(ok(&dir, "cd d && $NV since . base"), "M d/x.txt");
+  // A path with a newline in it is printed so that a line is still a path.
+  ok(&dir, "printf 'odd' > \"$(printf 'two\\nlines.txt')\"");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "A \"two\\nlines.txt\"");
+  ok(&dir, "rm two*");
+  // A fork goes beside the workspace; a server is a URL with an owner and a repository in it.
+  for (command, complaint) in [
+    ("$NV fork . ./inside", "a fork goes beside"),
+    ("$NV remote . notaurl main", "http://host/<owner>/<repo>"),
+    ("$NV remote . http://localhost:1/only-one main", "http://host/<owner>/<repo>"),
+    ("$NV help frobnicate", "is not a command"),
+    ("$NV mark . before-sync", "cannot be a name"),
+  ] {
+    let out = sh_with(&dir, command, "");
+    assert!(!out.status.success() && text(&out).contains(complaint), "`{command}`: {}", text(&out));
+  }
+  assert!(!dir.join("inside").exists());
+  assert_eq!(ok(&dir, "$NV help hook | head -1"), "nv hook claude");
+  // A name given again moves, and says from where.
+  ok(&dir, "$NV mark . spot >/dev/null && echo a9 > a.txt");
+  assert!(ok(&dir, "$NV mark . spot").contains("(it was "));
+  // What was imported can be checked out by the name it was imported by.
+  ok(&dir, "git init -q -b main ../agent-smaller-git && cd ../agent-smaller-git && echo g > g.txt && git add -A && git commit -q -m g");
+  ok(
+    &dir,
+    "$NV import ../agent-smaller-git ../agent-smaller-store >/dev/null && $NV checkout ../agent-smaller-store HEAD ../agent-smaller-ws >/dev/null && cat ../agent-smaller-ws/g.txt",
+  );
+  for left in ["agent-smaller-git", "agent-smaller-store", "agent-smaller-ws"] {
+    let _ = std::fs::remove_dir_all(dir.join("..").join(left));
+  }
 }

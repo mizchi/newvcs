@@ -70,6 +70,16 @@ pub struct Seen {
   other: BTreeSet<Vec<u8>>,
 }
 
+impl Seen {
+  /// Take in what another walk of the same index came across.
+  pub fn merge(&mut self, other: Seen) {
+    for (mine, theirs) in self.base.iter_mut().zip(other.base) {
+      *mine |= theirs;
+    }
+    self.other.extend(other.other);
+  }
+}
+
 impl Index {
   /// Open the index kept in a workspace's metadata directory. A missing or
   /// damaged file is an empty index: everything is then looked at afresh.

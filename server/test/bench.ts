@@ -10,7 +10,7 @@
 import { encode, idOf, unhex, type Commit } from "../src/commit.ts";
 
 const server = process.env.NV_SERVER ?? "http://localhost:8799";
-const run = `bench-${Date.now()}`;
+const run = `t/bench-${Date.now()}`;
 const text = (s: string) => new TextEncoder().encode(s);
 /// A push is frames, each a length and bytes: the commit, then the contents it names.
 function frame(bytes: Uint8Array): Uint8Array {

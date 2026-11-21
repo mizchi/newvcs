@@ -9,8 +9,11 @@ use gix_ignore::search::Ignore;
 
 use crate::workspace::to_path;
 
-/// The ignore files in force at one place of a walk: the workspace's own
-/// `.nv/exclude`, then the `.gitignore` of each directory from the root down.
+/// The ignore files in force at one place of a walk: where a Git repository
+/// shares the directory, the files Git reads that are not in the tree; the
+/// workspace's own `.nv/exclude`; then the `.gitignore` of each directory
+/// from the root down.
+#[derive(Clone)]
 pub struct Ignores {
   root: PathBuf,
   search: gix_ignore::Search,
@@ -19,6 +22,16 @@ pub struct Ignores {
 impl Ignores {
   pub fn new(root: &Path) -> Self {
     let mut search = gix_ignore::Search::default();
+    // Beside a Git repository, what Git leaves out is left out here: the user's file for
+    // every repository, then this clone's own. A `.gitignore` in the tree outranks both.
+    if crate::colocated::shared(root) {
+      let files = crate::git::global_excludes(root).into_iter().chain([root.join(".git").join("info").join("exclude")]);
+      for file in files {
+        if let Ok(bytes) = std::fs::read(&file) {
+          let _ = search.add_patterns_buffer(&bytes, file, None, Ignore::default());
+        }
+      }
+    }
     if let Ok(bytes) = std::fs::read(root.join(crate::workspace::META).join("exclude")) {
       let _ = search.add_patterns_buffer(&bytes, root.join(".nv/exclude"), None, Ignore::default());
     }

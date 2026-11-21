@@ -1,37 +1,29 @@
 //! A directory that is a Git repository and an nv workspace at once.
 //!
-//! Both keep a head, and nothing in Git tells nv when Git's moves. Git's is
-//! compared with nv's last published commit: snapshots are nobody's business
-//! but the workspace's, and never reach Git. So nv
-//! writes down the state in which the two last agreed (`.nv/git-synced`),
-//! and from that can tell which side has moved since:
+//! There Git is Git. Its commands, index, configuration and hooks are its
+//! own: `nv git` in such a directory runs Git, and nothing of nv's stands in
+//! Git's way. A hook that stopped Git from moving a branch would stop it
+//! after it had rewritten the files, which is worse than letting it move.
 //!
-//! - nv moved: Git is brought along (`mirror`), which nv's own Git commands
-//!   do after every command that moves the head.
-//! - Git moved: nv takes Git's commits in, with their ids (`reconcile`).
-//! - both moved: Git's commit is taken in under the name `git/<branch>`,
-//!   and nv's branch has to be merged with it before Git is brought along.
+//! So nv follows. It writes down the state in which the two last agreed
+//! (`.nv/git-synced`), and a command of its own that finds Git elsewhere
+//! takes Git's commits in, with their ids, before it does anything. Its
+//! snapshots are nobody's business but the workspace's and never reach Git;
+//! `nv commit` publishes them by having Git make the commit, from the files,
+//! so that what is excluded, filtered, signed or refused is so by Git's
+//! rules and nobody else's.
 //!
-//! Two hooks stop Git from moving a branch on its own in the first place,
-//! and a shell function sends `git` typed inside a workspace to nv. Neither
-//! can be relied on to always be there, which is why the state is checked.
+//! The one way nv moves first is by catching up with a server (`nv sync`).
+//! Git is then brought along (`mirror`).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::commit::Commit;
-use crate::git::{git, git_id_of, import};
+use crate::commit::{Commit, root_of};
+use crate::git::{git, git_id_of};
 use crate::store::Store;
 use crate::workspace::{self, Look, Workspace};
 use crate::{Id, Result, hex, unhex};
-
-/// Set for every Git process nv starts: the hooks let those through.
-pub const WRITING: &str = "NV_WRITING";
-
-const MARK: &str = "# installed by nv";
-const STOPPED: &str = "\
-nv: this repository is managed by nv, and Git must not move its branches on its own.
-nv: use `nv git <command>`, or the shell function that `nv shell-init` prints.
-nv: if Git has moved already, `nv check .` says how and `nv reconcile .` puts it right.";
 
 /// What `eval \"$(nv shell-init)\"` defines, for bash and zsh.
 pub const SHELL_INIT: &str = r#"# Inside an nv workspace, `git` is nv. Elsewhere, and with NV_GIT=raw, it is Git.
@@ -71,6 +63,11 @@ fn meta(root: &Path, name: &str) -> PathBuf {
   root.join(".nv").join(name)
 }
 
+/// Whether a Git repository has its directory here.
+pub fn shared(root: &Path) -> bool {
+  root.join(".git").is_dir()
+}
+
 fn read_point(root: &Path) -> Option<Point> {
   let text = std::fs::read_to_string(meta(root, "git-synced")).ok()?;
   let mut fields = text.split_whitespace().map(|f| Some(f).filter(|f| *f != "-"));
@@ -84,10 +81,11 @@ fn read_point(root: &Path) -> Option<Point> {
 fn write_point(root: &Path, point: &Point) -> Result<()> {
   let or_dash = |field: Option<String>| field.unwrap_or_else(|| "-".into());
   let text = format!("{} {} {}\n", or_dash(point.git.clone()), or_dash(point.branch.clone()), or_dash(point.nv.map(|id| hex(&id))));
-  std::fs::write(meta(root, "git-synced"), text).map_err(|e| format!("cannot note where Git is: {e}"))
+  crate::write_whole(&meta(root, "git-synced"), text)
 }
 
 /// Git's branch and commit, read from its files: no process is started.
+/// The branch is `None` when Git is on no branch.
 fn git_head(root: &Path) -> (Option<String>, Option<String>) {
   let dir = root.join(".git");
   let head = std::fs::read_to_string(dir.join("HEAD")).unwrap_or_default();
@@ -103,48 +101,34 @@ fn git_head(root: &Path) -> (Option<String>, Option<String>) {
   (branch, oid)
 }
 
-fn nv_branch(root: &Path) -> Option<String> {
-  std::fs::read_to_string(meta(root, "git-head")).ok()?.trim().strip_prefix("ref: ").map(str::to_string)
-}
-
 /// Which side has moved since the two last agreed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Drift {
   InStep,
-  /// Only nv moved: Git can be brought along.
+  /// Only nv moved, by catching up with a server: Git can be brought along.
   NvMoved,
-  /// Only Git moved, to this commit: nv has to take it in.
-  GitMoved(String),
-  BothMoved(String),
+  /// Only Git moved, to this commit if it has one: nv takes it in.
+  GitMoved(Option<String>),
+  BothMoved(Option<String>),
 }
 
 /// `None` for a workspace with no Git repository in its directory, or one never joined to it.
 /// Reads two small files of each side and starts nothing.
 pub fn drift(ws: &Workspace) -> Option<Drift> {
-  if !ws.root.join(".git").is_dir() {
+  if !shared(&ws.root) {
     return None;
   }
   let point = read_point(&ws.root)?;
-  let (branch, oid) = git_head(&ws.root);
-  let git_moved = (branch.as_ref(), oid.as_ref()) != (point.branch.as_ref(), point.git.as_ref());
-  let nv_moved = ws.base != point.nv || nv_branch(&ws.root) != point.branch;
-  let at = oid.unwrap_or_else(|| "no commit".into());
+  let (_, oid) = git_head(&ws.root);
+  // Which branch Git is on is Git's affair: the two agree when they are on the same commit.
+  let git_moved = oid != point.git;
+  let nv_moved = ws.base != point.nv;
   Some(match (git_moved, nv_moved) {
     (false, false) => Drift::InStep,
     (false, true) => Drift::NvMoved,
-    (true, false) => Drift::GitMoved(at),
-    (true, true) => Drift::BothMoved(at),
+    (true, false) => Drift::GitMoved(oid),
+    (true, true) => Drift::BothMoved(oid),
   })
-}
-
-/// What to tell someone about a drift that nv's Git commands will not work across.
-pub fn warning(drift: &Drift) -> Option<String> {
-  let short = |oid: &str| oid.chars().take(7).collect::<String>();
-  match drift {
-    Drift::GitMoved(oid) => Some(format!("nv: Git moved to {} without nv. Run `nv reconcile .` to take that in.", short(oid))),
-    Drift::BothMoved(oid) => Some(format!("nv: Git moved to {} without nv, and nv moved too. Run `nv reconcile .`.", short(oid))),
-    _ => None,
-  }
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<String> {
@@ -171,33 +155,35 @@ fn holds(store: &mut Store, tip: Id, wanted: Id) -> Result<bool> {
   Ok(false)
 }
 
-/// A commit of Git's that nv's branch has yet to be merged with, if there is one.
-fn unjoined(root: &Path) -> Option<Id> {
-  std::fs::read_to_string(meta(root, "git-unjoined")).ok().and_then(|t| unhex(t.trim())).and_then(|b| Id::try_from(b).ok())
+/// Whether Git is in the middle of something it has to finish itself.
+fn busy(root: &Path) -> Option<&'static str> {
+  let dir = root.join(".git");
+  [
+    ("MERGE_HEAD", "a merge"),
+    ("rebase-merge", "a rebase"),
+    ("rebase-apply", "a rebase"),
+    ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ("REVERT_HEAD", "a revert"),
+  ]
+  .into_iter()
+  .find(|(file, _)| dir.join(file).exists())
+  .map(|(_, what)| what)
 }
 
-/// Bring Git to where nv is: the commits, the branch, HEAD and Git's index.
-/// Refused while Git has a commit nv's branch does not hold.
-pub fn mirror(store: &mut Store, ws: &Workspace) -> Result<()> {
-  let (Some(head), Some(branch)) = (ws.base, nv_branch(&ws.root)) else { return Ok(()) };
-  if let Some(theirs) = unjoined(&ws.root) {
-    if !holds(store, head, theirs)? {
-      return Err(apart(&branch));
-    }
-    let _ = std::fs::remove_file(meta(&ws.root, "git-unjoined"));
+/// Bring Git to where nv is, after nv caught up with a server: the commits,
+/// whatever HEAD names, and Git's index for the paths that changed. Files
+/// are not touched; nv wrote them as it caught up.
+fn mirror(store: &mut Store, ws: &Workspace, was: Option<Id>) -> Result<()> {
+  let Some(head) = ws.base else { return Ok(()) };
+  if let Some(what) = busy(&ws.root) {
+    return Err(format!("Git is in the middle of {what}: finish or abort it with Git, and Git will be brought along then"));
   }
-  // nv's commit when the two last agreed, while Git has not moved since.
-  let was = read_point(&ws.root).filter(|point| git_head(&ws.root) == (point.branch.clone(), point.git.clone())).and_then(|point| point.nv);
-  let name = format!("refs/heads/{branch}");
-  let (oid, _) = crate::git::export(store, &head, &ws.root, &name)?;
-  if git_head(&ws.root).0.as_deref() != Some(branch.as_str()) {
-    run_git(&ws.root, &["symbolic-ref", "HEAD", &name])?;
-  }
-  // Git's index is made to say what the commit says. Files are not looked at, and not touched.
+  // `HEAD` is the branch Git is on, or HEAD itself when it is on none.
+  let (oid, _) = crate::git::export(store, &head, &ws.root, "HEAD")?;
   match was.filter(|was| *was != head) {
     // Told path by path what changed since the two agreed: Git need not compare two trees to find out.
     Some(was) => {
-      let (from, to) = (crate::commit::root_of(store, &was)?, crate::commit::root_of(store, &head)?);
+      let (from, to) = (root_of(store, &was)?, root_of(store, &head)?);
       let mut lines = Vec::new();
       for (path, entry) in crate::manifest::diff(store, from, to)? {
         let (mode, oid) = match entry {
@@ -214,7 +200,7 @@ pub fn mirror(store: &mut Store, ws: &Workspace) -> Result<()> {
         .stdin(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run git: {e}"))?;
-      std::io::Write::write_all(&mut child.stdin.take().expect("piped"), &lines).map_err(|e| e.to_string())?;
+      child.stdin.take().expect("piped").write_all(&lines).map_err(|e| e.to_string())?;
       if !child.wait().map_err(|e| e.to_string())?.success() {
         return Err("git would not take the changes into its index".into());
       }
@@ -223,19 +209,33 @@ pub fn mirror(store: &mut Store, ws: &Workspace) -> Result<()> {
       run_git(&ws.root, &["reset", "-q", "--no-refresh"])?;
     }
   }
-  write_point(&ws.root, &Point { git: Some(hex(&oid)), branch: Some(branch), nv: Some(head) })
+  let (branch, _) = git_head(&ws.root);
+  write_point(&ws.root, &Point { git: Some(hex(&oid)), branch, nv: Some(head) })
 }
 
-fn apart(branch: &str) -> String {
-  format!(
-    "nv and Git each have a commit the other's branch does not hold.\nGit's is in nv as `git/{branch}`. Join the two, then reconcile again:\n  nv git merge git/{branch}\n  nv reconcile ."
-  )
+/// Moving nv's head to a commit of Git's, with Git asked which files are as
+/// that commit has them where it stores files other than as they are on disk
+/// (a filter, `core.autocrlf`): for those, comparing bytes would call every
+/// such file changed.
+fn move_to(store: &mut Store, ws: &mut Workspace, target: Option<Id>) -> Result<()> {
+  let config = std::fs::read_to_string(ws.root.join(".git").join("config")).unwrap_or_default().to_ascii_lowercase();
+  if !config.contains("[filter") {
+    return workspace::move_head(store, ws, target);
+  }
+  // The paths Git finds changed against its index, and those it has staged: every other is as committed.
+  let mut changed = std::collections::HashSet::new();
+  for args in [&["diff-files", "--name-only", "-z"][..], &["diff-index", "--cached", "--name-only", "-z", "HEAD"][..]] {
+    let out = git(&ws.root).args(args).output().map_err(|e| format!("cannot run git: {e}"))?;
+    changed.extend(out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec));
+  }
+  workspace::move_head_trusting(store, ws, target, &|path| !changed.contains(path))
 }
 
 /// Say how the two stand. The exit code is 0 only when they are in step.
+/// Nothing is changed: the next command of nv's that needs to catches up.
 pub fn check(root: &Path) -> Result<(i32, String)> {
   let ws = Workspace::open(root)?;
-  if !root.join(".git").is_dir() {
+  if !shared(root) {
     return Ok((0, "no Git repository here: nothing to be out of step with".into()));
   }
   let (branch, oid) = git_head(root);
@@ -248,153 +248,228 @@ pub fn check(root: &Path) -> Result<(i32, String)> {
     Some(head) => Some(hex(&git_id_of(&mut store, &head)?)),
     None => None,
   };
-  let both = format!(
-    "Git is at {} on {}, nv at {} on {}",
-    short(&oid),
-    branch.as_deref().unwrap_or("no branch"),
-    short(&nv),
-    nv_branch(root).as_deref().unwrap_or("no branch")
-  );
+  let both = format!("Git is at {} on {}, nv at {}", short(&oid), branch.as_deref().unwrap_or("no branch"), short(&nv));
   Ok(match drift {
     Drift::InStep => (0, "in step".into()),
-    Drift::NvMoved if unjoined(root).is_some() => (1, format!("apart: {both}\n{}", apart(branch.as_deref().unwrap_or("HEAD")))),
-    Drift::NvMoved => (1, format!("nv moved, Git did not: {both}\n`nv reconcile .` brings Git along")),
-    Drift::GitMoved(_) => (1, format!("Git moved, nv did not: {both}\n`nv reconcile .` takes Git's commits in")),
-    Drift::BothMoved(_) => (1, format!("both moved: {both}\n`nv reconcile .` takes Git's commits in and says what is left to do")),
+    Drift::NvMoved => (1, format!("nv caught up with a server and Git was not brought along: {both}\n`nv reconcile .` brings it")),
+    Drift::GitMoved(_) => (1, format!("Git moved: {both}\nnv takes that in the next time it is used, or now with `nv reconcile .`")),
+    Drift::BothMoved(_) => (1, format!("both moved: {both}\n`nv reconcile .` takes Git's commits in and keeps nv's beside them")),
   })
 }
 
 /// Take in where Git is. Returns nv's id for Git's commit.
 fn take_in(store: &mut Store, root: &Path, oid: &str) -> Result<Id> {
-  import(store, root, oid, None)?;
   let bytes = unhex(oid).and_then(|b| <[u8; 20]>::try_from(b).ok()).ok_or("Git's HEAD is not a commit id")?;
+  if let Some(id) = store.of_git(&bytes) {
+    return Ok(id);
+  }
+  // What nv took in last is behind this commit as a rule, and then only what is new is asked for.
+  let have: Vec<String> = read_point(root)
+    .and_then(|point| point.git)
+    .filter(|known| unhex(known).and_then(|b| <[u8; 20]>::try_from(b).ok()).is_some_and(|known| store.of_git(&known).is_some()))
+    .into_iter()
+    .collect();
+  crate::git::import_beyond(store, root, oid, None, &have)?;
   store.of_git(&bytes).ok_or_else(|| format!("commit {oid} did not import"))
 }
 
-/// Put the two back in step, whichever moved. Nothing either side committed is dropped.
+/// Put the two in step, whichever moved, and say what was done if anything
+/// was. Nothing either side committed is dropped. Every command of nv's
+/// that builds on where the workspace stands does this first.
+pub fn follow(store: &mut Store, ws: &mut Workspace) -> Result<Option<String>> {
+  let Some(state) = drift(ws) else { return Ok(None) };
+  let root = ws.root.clone();
+  let (branch, _) = git_head(&root);
+  let was = read_point(&root).and_then(|point| point.nv);
+  match state {
+    Drift::InStep => Ok(None),
+    Drift::NvMoved => mirror(store, ws, was).map(|()| Some("Git brought along to where nv is".to_string())),
+    Drift::GitMoved(oid) | Drift::BothMoved(oid) => {
+      let id = match &oid {
+        Some(oid) => Some(take_in(store, &root, oid)?),
+        None => None,
+      };
+      // What nv has that Git's commit does not hold came from a server. It is given to Git under a name.
+      let mut kept = None;
+      if let (Some(mine), Some(theirs)) = (ws.base, id)
+        && Some(mine) != was
+        && !holds(store, theirs, mine)?
+      {
+        let name = format!("refs/heads/nv-kept-{}", &hex(&mine)[..8]);
+        crate::git::export(store, &mine, &root, &name)?;
+        kept = Some(name);
+      }
+      // Git wrote the files as it moved, so only what nv believes has to change.
+      move_to(store, ws, id)?;
+      store.flush()?;
+      write_point(&root, &Point { git: oid.clone(), branch, nv: id })?;
+      let at = oid.map_or("no commit".to_string(), |oid| oid[..7].to_string());
+      Ok(Some(match kept {
+        Some(name) => format!("took in Git's commits: nv is at {at}. What nv had from the server is in Git as {name}: merge it with Git"),
+        None => format!("took in Git's commits: nv is at {at}"),
+      }))
+    }
+  }
+}
+
+/// `follow`, as a command: the exit code says whether they are in step now.
 pub fn reconcile(root: &Path) -> Result<(i32, String)> {
   let mut ws = Workspace::open(root)?;
-  if !root.join(".git").is_dir() {
+  if !shared(root) {
     return Err("there is no Git repository in this directory".into());
   }
   let mut store = Store::open(&ws.store)?;
-  // nv's own commands move the workspace's head and know nothing of branches: the branch is where the head is.
-  if let (Some(head), Some(branch)) = (ws.base, nv_branch(root))
-    && store.read_ref(&format!("heads/{branch}")) != Some(head)
-  {
-    store.set_ref(&format!("heads/{branch}"), head)?;
+  if read_point(root).is_none() {
+    write_point(root, &Point::default())?;
   }
-  let (branch, oid) = git_head(root);
-  let Some(branch) = branch else {
-    return Err("Git's HEAD is on no branch, which nv does not follow: check a branch out with Git first".into());
+  Ok((0, follow(&mut store, &mut ws)?.unwrap_or_else(|| "in step".to_string())))
+}
+
+/// Publish the workspace's snapshots as one commit made by Git: the paths
+/// that differ are added to Git's index from the files and committed. Git's
+/// rules apply to what goes in, Git's identity signs it, Git's hooks may
+/// change or refuse it. `None` when there is nothing to commit.
+///
+/// What the user had staged is the user's. If no commit comes of this, Git's
+/// index is put back exactly as it was found.
+pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str, look: Look) -> Result<Option<String>> {
+  // A merge or a rebase that stopped is Git's to conclude: its index says what is settled and what is
+  // not, and a commit made around it would lose that.
+  if let Some(what) = busy(&ws.root) {
+    return Err(format!(
+      "Git is in the middle of {what}: conclude it or abort it with Git first. Nothing was touched, and what nv recorded is kept."
+    ));
+  }
+  workspace::snapshot(store, ws, author, look)?;
+  if ws.head == ws.base {
+    return Ok(None);
+  }
+  let root = |store: &mut Store, id: Option<Id>| match id {
+    Some(id) => root_of(store, &id),
+    None => Ok(None),
   };
-  let state = match drift(&ws) {
-    Some(state) => state,
-    // Never joined: in step if they are on the same commit already, and otherwise as if both had moved.
-    None => Drift::BothMoved(oid.clone().unwrap_or_default()),
+  let (from, to) = (root(store, ws.base)?, root(store, ws.head)?);
+  let changed = crate::manifest::diff(store, from, to)?;
+  if changed.is_empty() {
+    // The snapshots undid each other.
+    ws.head = ws.base;
+    ws.save()?;
+    return Ok(None);
+  }
+  let dir = ws.root.clone();
+  let listed = |paths: &[&Vec<u8>]| -> Vec<u8> { paths.iter().flat_map(|path| git_name(&dir, path).into_iter().chain([0])).collect() };
+  let with_paths = |args: &[&str], paths: &[u8]| -> Result<std::process::Output> {
+    let mut child = git(&dir)
+      .env("GIT_LITERAL_PATHSPECS", "1")
+      .args(args)
+      .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .map_err(|e| format!("cannot run git: {e}"))?;
+    child.stdin.take().expect("piped").write_all(paths).map_err(|e| e.to_string())?;
+    child.wait_with_output().map_err(|e| e.to_string())
   };
-  match (state, oid) {
-    (Drift::InStep, _) => Ok((0, "in step".into())),
-    (Drift::NvMoved, _) => {
-      mirror(&mut store, &ws).map(|()| (0, "Git brought along to where nv is".to_string())).or_else(|why| Ok((1, why)))
+  let said = |out: &std::process::Output| {
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_string()
+  };
+
+  // Git's index as it is now, to put back should no commit come of this.
+  let (index, kept) = (dir.join(".git").join("index"), meta(&dir, "git-index-before"));
+  let had_index = std::fs::copy(&index, &kept).is_ok();
+  let put_back = || {
+    if had_index && !dir.join(".git").join("index.lock").exists() {
+      let _ = std::fs::rename(&kept, &index);
     }
-    (Drift::GitMoved(_), Some(oid)) => {
-      // Git wrote the files as it moved, so only what nv believes has to change.
-      let id = take_in(&mut store, root, &oid)?;
-      workspace::move_head(&mut store, &mut ws, Some(id))?;
-      store.set_ref(&format!("heads/{branch}"), id)?;
-      store.flush()?;
-      std::fs::write(meta(root, "git-head"), format!("ref: {branch}\n")).map_err(|e| e.to_string())?;
-      // What was added through nv was added against a head that is no longer the head.
-      for stale in ["git-staged", "git-merge", "git-unmerged"] {
-        let _ = std::fs::remove_file(meta(root, stale));
-      }
-      write_point(root, &Point { git: Some(oid.clone()), branch: Some(branch), nv: Some(id) })?;
-      Ok((0, format!("took in Git's commits: nv is at {}", &oid[..7])))
+  };
+  // Whether the user has anything staged of their own. If not, the commit is the plain one, of the
+  // whole index: a hook that changes a file and adds it again then leaves the index as the commit.
+  let only_ours = git(&dir).args(["diff", "--cached", "--quiet"]).status().is_ok_and(|status| status.success());
+
+  // A path that is gone from the disk and that Git's index does not have either (the user removed
+  // it with Git already) is nothing to add.
+  let gone: Vec<&Vec<u8>> = changed.iter().filter(|(_, entry)| entry.is_none()).map(|(path, _)| path).collect();
+  let mut in_index = std::collections::HashSet::new();
+  if !gone.is_empty() {
+    let known = with_paths(&["ls-files", "-z"], &listed(&gone))?;
+    in_index.extend(known.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec));
+  }
+  let to_add: Vec<&Vec<u8>> =
+    changed.iter().filter(|(path, entry)| entry.is_some() || in_index.contains(&git_name(&dir, path))).map(|(path, _)| path).collect();
+  // Staged first and committed after. Git's partial commit works on a copy of the index and
+  // brings the real one up to date last; a process killed in between would leave the index
+  // behind the commit. With the content staged already, the two agree whenever that happens.
+  if !to_add.is_empty() {
+    let added = with_paths(&["add", "-A", "--ignore-errors"], &listed(&to_add))?;
+    // A path Git ignores is not an error here: it is simply not committed.
+    if !added.status.success() && !said(&added).contains("ignored by one of your .gitignore files") {
+      put_back();
+      return Err(format!("Git would not add the changes, and its index is as it was:\n{}", said(&added)));
     }
-    (Drift::BothMoved(_), Some(oid)) => {
-      let id = take_in(&mut store, root, &oid)?;
-      store.set_ref(&format!("remotes/git/{branch}"), id)?;
-      store.flush()?;
-      if ws.base.is_none() {
-        // nv has nothing of its own: this is the first joining.
-        workspace::move_head(&mut store, &mut ws, Some(id))?;
-        store.set_ref(&format!("heads/{branch}"), id)?;
-        store.flush()?;
-        std::fs::write(meta(root, "git-head"), format!("ref: {branch}\n")).map_err(|e| e.to_string())?;
-      }
-      // Git's side is known now; what remains is nv being ahead of it, or apart from it.
-      let nv_branch = nv_branch(root);
-      if ws.base != Some(id) {
-        std::fs::write(meta(root, "git-unjoined"), hex(&id)).map_err(|e| e.to_string())?;
-      }
-      write_point(root, &Point { git: Some(oid), branch: Some(branch), nv: (ws.base == Some(id) && nv_branch.is_some()).then_some(id) })?;
-      if ws.base == Some(id) {
-        return Ok((0, "in step".into()));
-      }
-      mirror(&mut store, &ws).map(|()| (0, "Git brought along to where nv is".to_string())).or_else(|why| Ok((1, why)))
+  }
+  let (_, before) = git_head(&dir);
+  let committed = if only_ours {
+    git(&dir).args(["commit", "-q", "-m", message]).output().map_err(|e| format!("cannot run git: {e}"))?
+  } else {
+    let all: Vec<&Vec<u8>> = changed.iter().map(|(path, _)| path).collect();
+    with_paths(&["commit", "-q", "-m", message, "--only"], &listed(&all))?
+  };
+  let (branch, after) = git_head(&dir);
+  if after == before {
+    put_back();
+    // Git found nothing in those paths to commit, or one of its hooks said no.
+    if committed.status.success()
+      || said(&committed).contains("nothing to commit")
+      || said(&committed).contains("no changes added to commit")
+    {
+      return Ok(None);
     }
-    (_, None) => Err("Git has no commit to take in".into()),
+    return Err(format!("Git did not make the commit. Nothing recorded was lost, and Git's index is as it was:\n{}", said(&committed)));
+  }
+  let _ = std::fs::remove_file(&kept);
+  let oid = after.ok_or("Git has no commit after committing")?;
+  let id = take_in(store, &dir, &oid)?;
+  move_to(store, ws, Some(id))?;
+  store.flush()?;
+  write_point(&dir, &Point { git: Some(oid.clone()), branch, nv: Some(id) })?;
+  ws.log("commit", &id)?;
+  Ok(Some(oid))
+}
+
+/// A path as Git names it. On macOS Git composes the characters of a name
+/// the file system gave it decomposed (`core.precomposeunicode`), and a path
+/// given to Git has to be the composed one.
+fn git_name(root: &Path, path: &[u8]) -> Vec<u8> {
+  if path.is_ascii() || !cfg!(target_os = "macos") {
+    return path.to_vec();
+  }
+  static COMPOSES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  let composes = *COMPOSES.get_or_init(|| crate::git::config_value(root, "core", "precomposeunicode").as_deref() != Some("false"));
+  match std::str::from_utf8(path) {
+    Ok(text) if composes => crate::workspace::composed(text).into_bytes(),
+    _ => path.to_vec(),
   }
 }
 
-/// Before a command of nv's own publishes: refused where Git has moved and nv has not caught up.
-pub fn guard(ws: &Workspace) -> Result<()> {
-  match drift(ws).as_ref().and_then(warning) {
-    Some(warning) => Err(warning),
-    None => Ok(()),
-  }
-}
-
-/// After a command of nv's own published a commit: the branch nv's Git
-/// commands know is where the commit is, and a Git repository in the same
-/// directory is brought along.
+/// After a command of nv's own published a commit in a workspace with no
+/// Git repository: the branch nv's Git commands know is where the commit is.
 pub fn published(store: &mut Store, ws: &Workspace) -> Result<()> {
-  if let (Some(base), Some(branch)) = (ws.base, nv_branch(&ws.root)) {
+  let branch =
+    std::fs::read_to_string(meta(&ws.root, "git-head")).ok().and_then(|text| text.trim().strip_prefix("ref: ").map(str::to_string));
+  if let (Some(base), Some(branch)) = (ws.base, branch) {
     store.set_ref(&format!("heads/{branch}"), base)?;
-  }
-  if drift(ws) == Some(Drift::NvMoved) {
-    mirror(store, ws)?;
   }
   Ok(())
 }
 
-/// Stop Git from moving a branch on its own, and say why. A hook that is
-/// someone else's is left as it is.
-pub fn install_hooks(root: &Path) -> Result<Vec<String>> {
-  let hooks = root.join(".git").join("hooks");
-  std::fs::create_dir_all(&hooks).map_err(|e| e.to_string())?;
-  let message: String = STOPPED.lines().map(|line| format!("  echo '{line}' >&2\n")).collect();
-  let scripts = [
-    // Before a commit is even written. `--no-verify` skips this one.
-    ("pre-commit", format!("#!/bin/sh\n{MARK}\nif [ -z \"${{{WRITING}:-}}\" ]; then\n{message}  exit 1\nfi\n")),
-    // Before any ref changes, whatever the command and its options.
-    (
-      "reference-transaction",
-      format!(
-        "#!/bin/sh\n{MARK}\n[ -n \"${{{WRITING}:-}}\" ] && exit 0\n[ \"$1\" = prepared ] || exit 0\nwhile read -r old new ref; do\n  case \"$ref\" in\n  HEAD | refs/heads/*)\n    [ \"$old\" = \"$new\" ] && continue\n{message}    exit 1\n    ;;\n  esac\ndone\nexit 0\n"
-      ),
-    ),
-  ];
-  let mut installed = Vec::new();
-  for (name, script) in scripts {
-    let path = hooks.join(name);
-    if std::fs::read_to_string(&path).is_ok_and(|existing| !existing.contains(MARK)) {
-      continue;
-    }
-    std::fs::write(&path, script).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    installed.push(name.to_string());
-  }
-  Ok(installed)
-}
+const EXCLUDED: &str = ".nv/";
 
-/// Make an nv workspace of a Git repository's directory, in place: its
-/// history is imported, its files are left as they are, and Git is told not
-/// to move on its own.
+/// Make an nv workspace of a Git repository's directory, in place: the
+/// history of the branch it is on is imported, its files are left as they
+/// are, and Git is left as it is.
 pub fn adopt(root: &Path) -> Result<String> {
-  if !root.join(".git").is_dir() {
+  if !shared(root) {
     return Err(format!("{} is not the top of a Git repository", root.display()));
   }
   if meta(root, "workspace").exists() {
@@ -403,34 +478,46 @@ pub fn adopt(root: &Path) -> Result<String> {
   let mut ws = workspace::init(root)?;
   let mut store = Store::open(&ws.store)?;
   let (branch, oid) = git_head(root);
-  let Some(branch) = branch else { return Err("Git's HEAD is on no branch: check a branch out first".into()) };
-  // The branch Git is on, and no other: the rest are taken in when Git goes to them.
+  // The commit Git is on, and what is behind it. The rest is taken in when Git goes there.
   let head = match &oid {
     Some(oid) => Some(take_in(&mut store, root, oid)?),
     None => None,
   };
-  if let Some(head) = head {
-    store.set_ref(&format!("heads/{branch}"), head)?;
-  }
-  workspace::move_head(&mut store, &mut ws, head)?;
+  move_to(&mut store, &mut ws, head)?;
+  ws.start = head;
+  ws.save()?;
   store.flush()?;
-  std::fs::write(meta(root, "git-head"), format!("ref: {branch}\n")).map_err(|e| e.to_string())?;
   // Git should not see nv's directory as something to add.
   let exclude = root.join(".git").join("info").join("exclude");
   let listed = std::fs::read_to_string(&exclude).unwrap_or_default();
-  if !listed.lines().any(|line| line.trim() == ".nv/") {
+  if !listed.lines().any(|line| line.trim() == EXCLUDED) {
     std::fs::create_dir_all(exclude.parent().expect("in .git")).map_err(|e| e.to_string())?;
     let sep = if listed.is_empty() || listed.ends_with('\n') { "" } else { "\n" };
-    std::fs::write(&exclude, format!("{listed}{sep}.nv/\n")).map_err(|e| e.to_string())?;
+    crate::write_whole(&exclude, format!("{listed}{sep}{EXCLUDED}\n"))?;
   }
-  let hooks = install_hooks(root)?;
-  write_point(root, &Point { git: oid, branch: Some(branch.clone()), nv: head })?;
+  write_point(root, &Point { git: oid, branch: branch.clone(), nv: head })?;
   // One look at every file, so that the next is as quick as any.
   let (differences, looked) = workspace::status(&ws, Look::Everywhere)?;
   Ok(format!(
-    "adopted: on {branch}, {} files, {} that differ from the commit; hooks installed: {}",
+    "adopted: on {}, {} files, {} that differ from the commit",
+    branch.as_deref().unwrap_or("no branch"),
     looked.stats,
-    differences.len(),
-    if hooks.is_empty() { "none (there were hooks already)".to_string() } else { hooks.join(", ") }
+    differences.len()
   ))
+}
+
+/// Take nv out of a Git repository's directory again. Git is as it was:
+/// nothing of nv's was ever in it but one line of an exclude file.
+pub fn unadopt(root: &Path) -> Result<String> {
+  if !shared(root) || !meta(root, "workspace").is_file() {
+    return Err(format!("{} is not a Git repository that nv was added to", root.display()));
+  }
+  let _ = crate::watch::stop(root);
+  let exclude = root.join(".git").join("info").join("exclude");
+  if let Ok(listed) = std::fs::read_to_string(&exclude) {
+    let kept: String = listed.lines().filter(|line| line.trim() != EXCLUDED).map(|line| format!("{line}\n")).collect();
+    crate::write_whole(&exclude, kept)?;
+  }
+  std::fs::remove_dir_all(root.join(".nv")).map_err(|e| format!("cannot remove {}: {e}", root.join(".nv").display()))?;
+  Ok("nv is out of this directory: the files and the Git repository are as they were, and what nv had recorded is gone".into())
 }

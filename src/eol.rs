@@ -73,18 +73,34 @@ pub struct Eols {
   /// `None`: every file there is was handed over at the start.
   root: Option<PathBuf>,
   dirs: HashMap<Vec<u8>, Vec<Rule>>,
+  /// What a file no rule speaks of is: as it is, unless Git's `core.autocrlf` says otherwise.
+  otherwise: How,
+}
+
+/// What `core.autocrlf` of the Git repository in `root`, if there is one, makes of a file with no rule.
+fn configured(root: &Path) -> How {
+  static KNOWN: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, How>>> = std::sync::OnceLock::new();
+  if !crate::colocated::shared(root) {
+    return How::AsIs;
+  }
+  let mut known = KNOWN.get_or_init(Default::default).lock().expect("not poisoned");
+  *known.entry(root.to_path_buf()).or_insert_with(|| match crate::git::config_value(root, "core", "autocrlf").as_deref() {
+    Some("true") => How::Text { auto: true, crlf: true },
+    Some("input") => How::Text { auto: true, crlf: false },
+    _ => How::AsIs,
+  })
 }
 
 impl Eols {
   /// The rules in the files of a workspace, read as they are needed.
   pub fn of_worktree(root: &Path) -> Self {
-    Eols { root: Some(root.to_path_buf()), dirs: HashMap::new() }
+    Eols { root: Some(root.to_path_buf()), dirs: HashMap::new(), otherwise: configured(root) }
   }
 
   /// The rules of the given `.gitattributes` files: `(directory, content)`.
   pub fn of_files(files: impl IntoIterator<Item = (Vec<u8>, Arc<Vec<u8>>)>) -> Self {
     let dirs = files.into_iter().map(|(dir, bytes)| (dir, rules(&bytes))).filter(|(_, rules)| !rules.is_empty()).collect();
-    Eols { root: None, dirs }
+    Eols { root: None, dirs, otherwise: How::AsIs }
   }
 
   /// No file will be converted, whatever its path.
@@ -142,7 +158,7 @@ impl Eols {
       (Some(Text::Set), crlf) => How::Text { auto: false, crlf: crlf.unwrap_or(false) },
       // `eol` alone makes a file text.
       (_, Some(crlf)) => How::Text { auto: false, crlf },
-      _ => How::AsIs,
+      _ => self.otherwise,
     }
   }
 }

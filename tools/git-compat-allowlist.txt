@@ -21,3 +21,6 @@
 19-ignore.sh
 20-line-endings.sh
 21-merge-conflict.sh
+22-everyday-odds.sh
+23-smaller-odds.sh
+24-from-below-and-by-path.sh

@@ -26,7 +26,7 @@ use crate::git::{TreeMemo, git_commit_bytes, git_commit_of, git_hash, git_tree_o
 use crate::manifest::{Change, Entry, MODE_GITLINK, MODE_LINK, diff, load, lookup};
 use crate::store::{Kind, Store};
 use crate::textdiff;
-use crate::workspace::{self, Look, Workspace};
+use crate::workspace::{self, Workspace};
 use crate::{Id, hex, unhex};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -43,7 +43,10 @@ struct Fail {
 type Res<T> = std::result::Result<T, Fail>;
 
 fn unsupported<T>(what: impl std::fmt::Display) -> Res<T> {
-  Err(Fail { code: UNSUPPORTED, message: format!("nv: `git {what}` is not supported") })
+  // `what` is a command line, or one whose own closing mark is followed by words about it.
+  let what = what.to_string();
+  let close = if what.matches('`').count() % 2 == 1 { "" } else { "`" };
+  Err(Fail { code: UNSUPPORTED, message: format!("nv: `git {what}{close} is not supported") })
 }
 
 fn fatal<T>(code: i32, message: impl Into<String>) -> Res<T> {
@@ -152,7 +155,7 @@ impl Repo {
   }
 
   fn set_branch(&self, name: &str) -> Res<()> {
-    std::fs::write(self.meta("git-head"), format!("ref: {name}\n")).map_err(|e| e.to_string())?;
+    crate::write_whole(&self.meta("git-head"), format!("ref: {name}\n"))?;
     Ok(())
   }
 
@@ -208,7 +211,7 @@ impl Repo {
 
   fn set_unmerged(&self, paths: &std::collections::BTreeSet<Vec<u8>>) -> Res<()> {
     let text: String = paths.iter().map(|p| format!("{}\n", hex(p))).collect();
-    std::fs::write(self.meta("git-unmerged"), text).map_err(|e| e.to_string())?;
+    crate::write_whole(&self.meta("git-unmerged"), text)?;
     Ok(())
   }
 
@@ -232,11 +235,28 @@ impl Repo {
         None => format!("{} -\n", hex(path)),
       });
     }
-    std::fs::write(self.meta("git-staged"), text).map_err(|e| e.to_string())?;
+    crate::write_whole(&self.meta("git-staged"), text)?;
     Ok(())
   }
 
   /// A path given on the command line, relative to the workspace root.
+  /// A path given after `<rev>:`, which Git reads from the top of the tree unless it begins with `./`.
+  fn rooted_from_top(&self, path: &str) -> Vec<u8> {
+    if path.starts_with("./") || path.starts_with("../") {
+      return self.rooted(path);
+    }
+    path.trim_matches('/').as_bytes().to_vec()
+  }
+
+  /// Git's id of any object: a commit, a tag, a directory or a file.
+  fn object_oid(&mut self, id: &Id) -> Res<String> {
+    Ok(match self.store.kind_of(id)? {
+      Some(Kind::Tree) => self.tree_oid(Some(*id))?,
+      Some(Kind::Blob) => hex(&crate::git::git_blob_of(&mut self.store, id, &mut |_, _| Ok(()))?),
+      _ => self.git_oid(id)?,
+    })
+  }
+
   fn rooted(&self, arg: &str) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = self.prefix.split(|&b| b == b'/').filter(|p| !p.is_empty()).collect();
     for part in arg.as_bytes().split(|&b| b == b'/') {
@@ -281,6 +301,26 @@ impl Repo {
   fn resolve_any(&mut self, spec: &str) -> Res<Id> {
     let unknown =
       || Fail { code: 128, message: format!("fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.") };
+    if spec.contains("..") {
+      return unsupported(format_args!("rev-parse {spec}` (a range of commits)"));
+    }
+    if spec.contains("@{") {
+      return unsupported(format_args!("rev-parse {spec}` (where a ref was before)"));
+    }
+    // `<rev>:<path>` is what that commit has at the path: a file or a directory.
+    if let Some((rev, path)) = spec.split_once(':') {
+      let commit = self.resolve(if rev.is_empty() { "HEAD" } else { rev })?;
+      let missing = || Fail { code: 128, message: format!("fatal: path '{path}' does not exist in '{rev}'") };
+      let root = root_of(&mut self.store, &commit)?.ok_or_else(missing)?;
+      let path = self.rooted_from_top(path);
+      if path.is_empty() {
+        return Ok(root);
+      }
+      return match crate::manifest::lookup(&mut self.store, root, &path)? {
+        Some(entry) if entry.mode != crate::manifest::MODE_GITLINK => Ok(entry.id),
+        _ => Err(missing()),
+      };
+    }
     let (spec, peeled) = match spec.strip_suffix("^{commit}").or_else(|| spec.strip_suffix("^{}")) {
       Some(inner) => (inner, true),
       None => (spec, false),
@@ -295,8 +335,17 @@ impl Repo {
       Some(tag)
     } else if let Some(remote) = self.store.read_ref(&format!("remotes/{name}")) {
       Some(remote)
-    } else {
+    } else if name.len() == 40 {
       unhex(name).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|oid| self.store.of_git(&oid))
+    } else if (4..40).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+      // The start of an id is the id, if only one object's begins so.
+      match self.store.of_git_beginning(&name.to_ascii_lowercase())[..] {
+        [one] => Some(one),
+        [] => None,
+        _ => return fatal(128, format!("error: short object ID {name} is ambiguous\nfatal: ambiguous argument '{name}': unknown revision or path not in the working tree.")),
+      }
+    } else {
+      None
     }
     .ok_or_else(unknown)?;
     if peeled || !steps.is_empty() {
@@ -318,8 +367,21 @@ impl Repo {
 
   /// Every path where the last commit, the index and the working tree are not all the same.
   fn states(&self) -> Res<std::collections::BTreeMap<Vec<u8>, State>> {
+    self.states_at(false, &[Vec::new()])
+  }
+
+  /// `states`, for a command that has no use for what is new and unknown: the files
+  /// Git tracks, which are those of the last commit and those added since.
+  fn states_of_tracked(&self) -> Res<std::collections::BTreeMap<Vec<u8>, State>> {
+    let added: Vec<Vec<u8>> = self.staged().into_keys().collect();
+    self.states_at(true, &added)
+  }
+
+  /// `states`, looking on disk only at the files the index knows (`tracked`) and at
+  /// what is at or below `under`. What the index itself says is always all there.
+  fn states_at(&self, tracked: bool, under: &[Vec<u8>]) -> Res<std::collections::BTreeMap<Vec<u8>, State>> {
     let (staged, unmerged) = (self.staged(), self.unmerged());
-    let (found, _) = workspace::status(&self.ws, Look::Everywhere)?;
+    let (found, _) = workspace::status_at(&self.ws, tracked, under)?;
     let index = self.ws.load_index();
     let mut states = std::collections::BTreeMap::new();
     // Where the working tree differs from the last commit.
@@ -356,7 +418,7 @@ impl Repo {
 
 /// A path as Git prints it: in double quotes with C escapes when it holds
 /// bytes Git will not print bare. `status` also quotes a path with a space.
-fn quoted(path: &[u8], and_spaces: bool) -> Vec<u8> {
+pub fn quoted(path: &[u8], and_spaces: bool) -> Vec<u8> {
   let plain = |b: u8| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\';
   if path.iter().all(|&b| plain(b)) && !(and_spaces && path.contains(&b' ')) {
     return path.to_vec();
@@ -467,8 +529,8 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
   ("reset", &["-q", "--quiet", "--hard", "--soft", "--mixed", "--"]),
   ("commit", &["-q", "--quiet", "-a", "--all", "--allow-empty", "--amend", "--no-edit", "-m=", "-am=", "-qm=", "-qam=", "-aqm="]),
   ("status", &["--porcelain", "--short", "-s"]),
-  ("log", &["--oneline", "--format=*", "--pretty=format:*", "-n=", "-n#", "-#"]),
-  ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*"]),
+  ("log", &["--oneline", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "-n=", "-n#", "-#"]),
+  ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*", "--pretty=tformat:*"]),
   ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged"]),
   ("rev-parse", &["--short", "--abbrev-ref", "--show-toplevel"]),
   ("cat-file", &["-t", "-p", "-e"]),
@@ -533,6 +595,11 @@ pub fn run(args: &[String]) -> i32 {
     eprintln!("usage: nv git <command> [<args>]");
     return 1;
   };
+  // Which Git this stands in for is a question about Git: tools ask it before anything else.
+  if matches!(command.as_str(), "--version" | "version" | "--help" | "help") {
+    let real = std::env::var_os("NV_REAL_GIT").unwrap_or_else(|| "git".into());
+    return std::process::Command::new(real).args(args).status().map_or(127, |status| status.code().unwrap_or(1));
+  }
   // The table itself, for whoever wants to know before running a script.
   if command == "--spoken" {
     for (name, options) in SPOKEN {
@@ -540,20 +607,27 @@ pub fn run(args: &[String]) -> i32 {
     }
     return 0;
   }
-  let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-  let open = || Repo::open(&at);
-  // Where a Git repository shares the directory and has moved on its own, nothing here may build on what nv believes.
-  const READS: &[&str] = &["status", "log", "show", "diff", "rev-parse", "cat-file", "ls-tree", "config", "fsck"];
-  let shared = |repo: &Repo| crate::colocated::drift(&repo.ws);
+  // Where a Git repository has the directory, Git answers: whatever it speaks, with its own
+  // index, configuration and hooks. nv's own commands follow it; nothing here stands in for it.
   if !matches!(command.as_str(), "init" | "clone")
-    && let Ok(repo) = open()
-    && let Some(warning) = shared(&repo).as_ref().and_then(crate::colocated::warning)
+    && let Ok(start) = std::fs::canonicalize(&at)
   {
-    eprintln!("{warning}");
-    if !READS.contains(&command.as_str()) {
-      return 1;
+    for dir in start.ancestors() {
+      let (workspace, repository) = (dir.join(".nv").join("workspace").is_file(), dir.join(".git").exists());
+      if repository {
+        use std::os::unix::process::CommandExt;
+        let real = std::env::var_os("NV_REAL_GIT").unwrap_or_else(|| "git".into());
+        let failed = std::process::Command::new(real).arg("-C").arg(&at).args(args).exec();
+        eprintln!("nv: cannot run git: {failed}");
+        return 127;
+      }
+      if workspace {
+        break;
+      }
     }
   }
+  let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+  let open = || Repo::open(&at);
   let result = permitted(command, &rest).and_then(|()| match command.as_str() {
     "init" => init(&at, &rest),
     "clone" => clone(&at, &rest),
@@ -582,20 +656,57 @@ pub fn run(args: &[String]) -> i32 {
     "push" => push(open()?),
     other => unsupported(other),
   });
-  // And where nv has moved, Git is brought along before anyone looks at it.
-  if !READS.contains(&command.as_str())
-    && let Ok(mut repo) = open()
-    && shared(&repo) == Some(crate::colocated::Drift::NvMoved)
-    && let Err(why) = crate::colocated::mirror(&mut repo.store, &repo.ws)
-  {
-    eprintln!("nv: Git was not brought along: {why}");
-  }
   match result {
     Ok(code) => code,
     Err(fail) => {
       eprintln!("{}", fail.message);
       fail.code
     }
+  }
+}
+
+/// Whether Git would take this as the name of a branch or a tag (`git check-ref-format`).
+fn ref_name_ok(name: &str) -> bool {
+  let part_ok = |part: &str| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock");
+  !name.is_empty()
+    && name != "@"
+    && name != "HEAD"
+    && !name.starts_with('-')
+    && !name.ends_with('.')
+    && !name.contains("..")
+    && !name.contains("@{")
+    && !name.bytes().any(|b| b <= b' ' || b == 0x7f || b"~^:?*[\\".contains(&b))
+    && name.split('/').all(part_ok)
+}
+
+impl Repo {
+  /// Refuse a name Git would refuse, for a branch (`heads`) or a tag (`tags`): one that is
+  /// not a name, or one that is, or is inside, a name there already.
+  fn new_ref(&self, kind: &str, name: &str) -> Res<()> {
+    let what = if kind == "heads" { "branch" } else { "tag" };
+    if !ref_name_ok(name) {
+      return fatal(128, format!("fatal: '{name}' is not a valid {what} name"));
+    }
+    let taken = self.store.refs_under(kind).into_iter().map(|(other, _)| other).find(|other| {
+      let inside = |a: &str, b: &str| a.len() > b.len() && a.starts_with(b) && a.as_bytes()[b.len()] == b'/';
+      inside(other, name) || inside(name, other)
+    });
+    match taken {
+      Some(other) => {
+        fatal(128, format!("fatal: cannot lock ref 'refs/{kind}/{name}': 'refs/{kind}/{other}' exists; cannot create 'refs/{kind}/{name}'"))
+      }
+      None => Ok(()),
+    }
+  }
+
+  /// A path of the repository as Git shows it to someone standing where the command was run.
+  fn shown(&self, path: &[u8]) -> Vec<u8> {
+    let here: Vec<&[u8]> = self.prefix.split(|&b| b == b'/').filter(|part| !part.is_empty()).collect();
+    let there: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    let shared = here.iter().zip(&there).take_while(|(a, b)| a == b).count().min(there.len().saturating_sub(1));
+    let mut parts: Vec<&[u8]> = vec![b".."; here.len() - shared];
+    parts.extend(&there[shared..]);
+    parts.join(&b'/')
   }
 }
 
@@ -643,7 +754,7 @@ fn init(at: &Path, args: &[&str]) -> Res<i32> {
     return unsupported("init` in a directory that already has a repository");
   }
   workspace::init(&root)?;
-  std::fs::write(root.join(".nv").join("git-head"), format!("ref: {branch}\n")).map_err(|e| e.to_string())?;
+  crate::write_whole(&root.join(".nv").join("git-head"), format!("ref: {branch}\n"))?;
   if !quiet(args) {
     let full = std::fs::canonicalize(&root).map_err(|e| e.to_string())?;
     println!("Initialized empty nv repository in {}/.nv/", full.display());
@@ -680,6 +791,23 @@ fn clone(at: &Path, args: &[&str]) -> Res<i32> {
   } else {
     std::env::current_dir().map_err(|e| e.to_string())?.join(at).join(source)
   };
+  // A path that was given from here is stored with `.` and `..` taken out, as Git stores it
+  // (no link is followed). One given whole is stored as it was typed.
+  let origin = if Path::new(source).is_absolute() {
+    origin
+  } else {
+    let mut plain = PathBuf::new();
+    for part in origin.components() {
+      match part {
+        std::path::Component::CurDir => {}
+        std::path::Component::ParentDir => {
+          plain.pop();
+        }
+        other => plain.push(other),
+      }
+    }
+    plain
+  };
   if !origin.is_dir() {
     return unsupported(format_args!("clone {source}` (only a Git repository on this machine)"));
   }
@@ -689,7 +817,7 @@ fn clone(at: &Path, args: &[&str]) -> Res<i32> {
   }
   std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
   workspace::init(&root)?;
-  std::fs::write(root.join(".nv").join("git-origin"), origin.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+  crate::write_whole(&root.join(".nv").join("git-origin"), origin.as_os_str().as_bytes())?;
   let mut repo = Repo::open(&root)?;
   let refs = fetch(&mut repo)?;
   // One local branch, the one the source is on, and the files of its tip.
@@ -720,7 +848,10 @@ fn pull(mut repo: Repo, args: &[&str]) -> Res<i32> {
   }
   let origin = std::fs::read_to_string(repo.meta("git-origin")).unwrap_or_default();
   let into = Some(&branch).filter(|b| *b != "main" && *b != "master").map(|b| format!(" into {b}")).unwrap_or_default();
-  let message = format!("Merge branch '{branch}' of {}{into}", origin.trim());
+  // Git names where it pulled from without the `.git` a repository's directory may end in.
+  let from = origin.trim().trim_end_matches('/');
+  let from = from.strip_suffix("/.git").or_else(|| from.strip_suffix(".git")).unwrap_or(from);
+  let message = format!("Merge branch '{branch}' of {from}{into}");
   let target = format!("origin/{branch}");
   let mut forwarded: Vec<&str> = args.iter().copied().filter(|a| *a == "-q" || *a == "--quiet" || *a == "--ff-only").collect();
   forwarded.extend(["-m", &message, &target]);
@@ -810,7 +941,8 @@ fn add(mut repo: Repo, args: &[&str]) -> Res<i32> {
       return fatal(128, format!("fatal: pathspec '{arg}' did not match any files"));
     }
   }
-  let states = repo.states()?;
+  // Only what was named is looked at: adding a file does not walk the tree.
+  let states = repo.states_at(false, &paths)?;
   // Naming a file the rules ignore is refused; a directory that holds some just leaves them out.
   let ignored: Vec<&str> = paths
     .iter()
@@ -875,9 +1007,11 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
   for path in &doomed {
     let full = repo.ws.root.join(std::ffi::OsStr::from_bytes(path));
     let _ = std::fs::remove_file(&full);
-    // Directories this empties go too, as with Git.
+    // Directories this empties go too, as with Git: except the one the command was run in,
+    // which is someone's place to stand.
+    let standing = repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.prefix));
     let mut dir = full.parent();
-    while let Some(d) = dir.filter(|d| *d != repo.ws.root) {
+    while let Some(d) = dir.filter(|d| *d != repo.ws.root && *d != standing) {
       if std::fs::remove_dir(d).is_err() {
         break;
       }
@@ -993,7 +1127,9 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let before_dashes = explicit.map_or(given.len(), |at| positional("reset", &args[..at]).len());
   let target = match given.first().filter(|_| before_dashes > 0) {
     Some(spec) if repo.resolve(spec).is_ok() => Some(repo.resolve(given.remove(0))?),
-    Some(spec) if explicit.is_some() => {
+    Some(spec)
+      if explicit.is_some() || mode != "--mixed" || !repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(spec))).exists() =>
+    {
       return fatal(128, format!("fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."));
     }
     _ => None,
@@ -1052,7 +1188,8 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if !quiet(args) {
     match (mode, target) {
       ("--hard", Some(target)) => {
-        let subject = told(&Commit::load(&mut repo.store, &target)?.rest).message.lines().next().unwrap_or("").to_string();
+        let message = told(&Commit::load(&mut repo.store, &target)?.rest).message;
+        let subject = message.lines().take_while(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" ");
         println!("HEAD is now at {} {subject}", &repo.git_oid(&target)?[..7]);
       }
       ("--mixed", _) => report_unstaged(&repo)?,
@@ -1119,9 +1256,12 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     }
     _ => return unsupported("commit` without -m (there is no editor)"),
   };
+  if message.is_empty() {
+    return fatal(1, "Aborting commit due to empty commit message.");
+  }
   // With -a, every file the index has goes in as it is on disk first.
   if all {
-    let states = repo.states()?;
+    let states = repo.states_of_tracked()?;
     stage(&mut repo, &states, &|_, state| state.index.is_some())?;
   }
   // What the index has that the last commit does not say: read off the index, with no look at the files.
@@ -1159,7 +1299,7 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     let branch = repo.branch().unwrap_or_else(|| "detached HEAD".into());
     println!(
       "[{branch}{} {}] {}",
-      if made.parents.is_empty() { " (root-commit)" } else { "" },
+      if made.parents.is_empty() && !amend { " (root-commit)" } else { "" },
       &oid[..7],
       message.lines().next().unwrap_or("")
     );
@@ -1250,7 +1390,17 @@ fn status(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if !positional("status", args).is_empty() {
     return unsupported("status` of named paths");
   }
-  let (lines, untracked) = status_lines(&mut repo)?;
+  let (mut lines, mut untracked) = status_lines(&mut repo)?;
+  // To someone in a subdirectory paths are told from there, except in the format meant for programs.
+  if !has(args, "--porcelain") {
+    for line in &mut lines {
+      line.path = repo.shown(&line.path);
+      line.from = line.from.take().map(|from| repo.shown(&from));
+    }
+    for path in &mut untracked {
+      *path = repo.shown(path);
+    }
+  }
   if !args.is_empty() {
     for line in &lines {
       let from = line.from.as_ref().map(|f| [quoted(f, true).as_slice(), b" -> "].concat()).unwrap_or_default();
@@ -1371,7 +1521,7 @@ fn rev_parse(mut repo: Repo, args: &[&str]) -> Res<i32> {
       }
       None => {
         let id = repo.resolve_any(spec)?;
-        println!("{}", repo.git_oid(&id)?);
+        println!("{}", repo.object_oid(&id)?);
       }
     },
     other => return unsupported(format_args!("rev-parse {}", other.join(" "))),
@@ -1416,7 +1566,15 @@ fn described(repo: &mut Repo, id: &Id, format: Option<&str>) -> Res<String> {
       Some('t') => line.push_str(&repo.tree_oid(root)?[..7]),
       Some('P') => line.push_str(&parents.join(" ")),
       Some('p') => line.push_str(&short(&parents)),
-      Some('s') => line.push_str(said.message.lines().next().unwrap_or("")),
+      // The subject is the first paragraph, on one line; the body is what follows it.
+      Some('s') => line.push_str(&said.message.lines().take_while(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" ")),
+      Some('B') => line.push_str(&(said.message.trim_end().to_string() + "\n")),
+      Some('b') => {
+        let body: Vec<&str> = said.message.lines().skip_while(|l| !l.trim().is_empty()).skip_while(|l| l.trim().is_empty()).collect();
+        if !body.is_empty() {
+          line.push_str(&(body.join("\n").trim_end().to_string() + "\n"));
+        }
+      }
       Some('n') => line.push('\n'),
       Some('%') => line.push('%'),
       Some(role @ ('a' | 'c')) => {
@@ -1431,16 +1589,33 @@ fn described(repo: &mut Repo, id: &Id, format: Option<&str>) -> Res<String> {
       other => return unsupported(format_args!("log --format` with `%{}", other.unwrap_or(' '))),
     }
   }
-  line.push('\n');
   Ok(line)
 }
 
 fn format_of<'a>(args: &[&'a str]) -> Option<&'a str> {
-  args.iter().find_map(|a| a.strip_prefix("--format=").or_else(|| a.strip_prefix("--pretty=format:")))
+  args.iter().find_map(|a| {
+    a.strip_prefix("--format=").or_else(|| a.strip_prefix("--pretty=format:")).or_else(|| a.strip_prefix("--pretty=tformat:"))
+  })
+}
+
+/// `--pretty=format:` puts a newline between commits; every other way of giving a format ends each with one.
+fn format_separates(args: &[&str]) -> bool {
+  args.iter().any(|a| a.starts_with("--pretty=format:"))
+}
+
+/// The formats Git has names for are not spoken: taken as a format they would be printed as they stand.
+fn format_spoken(args: &[&str]) -> Res<()> {
+  const NAMED: &[&str] = &["oneline", "short", "medium", "full", "fuller", "reference", "email", "mboxrd", "raw"];
+  match args.iter().find_map(|a| a.strip_prefix("--format=")).filter(|format| NAMED.contains(format)) {
+    Some(name) => unsupported(format_args!("log --format={name}")),
+    None => Ok(()),
+  }
 }
 
 fn log(mut repo: Repo, args: &[&str]) -> Res<i32> {
+  format_spoken(args)?;
   let format = if has(args, "--oneline") { Some("%h %s") } else { format_of(args) };
+  let separates = format_separates(args) && !has(args, "--oneline");
   let count = |text: &str| text.parse::<usize>().map_err(|_| Fail { code: 129, message: format!("fatal: '{text}': not an integer") });
   let mut limit = usize::MAX;
   for (i, arg) in args.iter().enumerate() {
@@ -1463,6 +1638,12 @@ fn log(mut repo: Repo, args: &[&str]) -> Res<i32> {
     let branch = repo.branch().unwrap_or_default();
     return fatal(128, format!("fatal: your current branch '{branch}' does not have any commits yet"));
   }
+  if let Some(named) = from
+    && repo.resolve_any(named).is_err()
+    && repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(named))).exists()
+  {
+    return unsupported("log` of paths");
+  }
   let start = repo.resolve(from.unwrap_or("HEAD"))?;
   // Newest first by committer date; of two made at the same second, the one reached first.
   let mut queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<usize>, Id)> = Default::default();
@@ -1482,10 +1663,13 @@ fn log(mut repo: Repo, args: &[&str]) -> Res<i32> {
     if shown == limit {
       break;
     }
-    if shown > 0 && format.is_none() {
+    if shown > 0 && (format.is_none() || separates) {
       println!();
     }
     out(described(&mut repo, &id, format)?.as_bytes());
+    if format.is_some() && !separates {
+      println!();
+    }
     shown += 1;
     for p in Commit::load(&mut repo.store, &id)?.parents {
       push(&mut repo.store, &mut queue, p)?;
@@ -1593,7 +1777,9 @@ fn between(repo: &mut Repo, from: Option<Id>, to: Option<Id>) -> Res<Vec<FileCha
 /// The index against the last commit (`cached`), or the working tree against the index.
 fn on_disk(repo: &mut Repo, cached: bool) -> Res<Vec<FileChange>> {
   let mut changes = Vec::new();
-  for (path, state) in repo.states()? {
+  // What is staged is in the index and needs no look at the files; what is not is among the files Git tracks.
+  let states = if cached { repo.states_at(false, &[])? } else { repo.states_of_tracked()? };
+  for (path, state) in states {
     let (old, new) = if cached {
       if state.staged().is_none() {
         continue;
@@ -1668,8 +1854,10 @@ fn patch(changes: &[FileChange]) -> Vec<u8> {
       say(&mut text, &[b"Binary files ".as_slice(), &left, b" and ", &right, b" differ"].concat());
       continue;
     }
-    say(&mut text, &[b"--- ".as_slice(), &left].concat());
-    say(&mut text, &[b"+++ ".as_slice(), &right].concat());
+    // A name with a space in it is followed by a tab, so that the name's end can be told.
+    let ended = |name: &[u8]| if name.contains(&b' ') && name != b"/dev/null" { [name, b"\t"].concat() } else { name.to_vec() };
+    say(&mut text, &[b"--- ".as_slice(), &ended(&left)].concat());
+    say(&mut text, &[b"+++ ".as_slice(), &ended(&right)].concat());
     text.extend_from_slice(&textdiff::hunks(before, after));
   }
   text
@@ -1853,6 +2041,8 @@ fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
       let (from, to) = (root(&mut repo, a)?, root(&mut repo, b)?);
       between(&mut repo, from, to)?
     }
+    // With conflicts in the tree Git shows both sides against the result, which is not spoken.
+    [] if !repo.unmerged().is_empty() => return unsupported("diff` while a merge has conflicts"),
     [] => on_disk(&mut repo, cached)?,
     _ => return unsupported("diff` with this combination of revisions and paths"),
   };
@@ -1866,6 +2056,17 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
     [spec] => spec,
     _ => return unsupported("show` of more than one thing"),
   };
+  // `<rev>:<path>` is the file as that commit has it.
+  if spec.contains(':') {
+    let id = repo.resolve_any(spec)?;
+    return match repo.store.kind_of(&id)? {
+      Some(Kind::Blob) => {
+        out(&repo.store.get(&id)?.ok_or_else(|| "a file is missing from the store".to_string())?);
+        Ok(0)
+      }
+      _ => unsupported("show` of a directory"),
+    };
+  }
   let named = repo.resolve_any(spec)?;
   if repo.store.kind_of(&named)? == Some(Kind::Tag) {
     // The tag first, as Git writes one, then the commit it names.
@@ -1886,7 +2087,11 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
   }
   let id = crate::git::peel(&mut repo.store, named)?;
   let commit = Commit::load(&mut repo.store, &id)?;
+  format_spoken(args)?;
   out(described(&mut repo, &id, format_of(args))?.as_bytes());
+  if format_of(args).is_some() {
+    println!();
+  }
   // A merge that needed no decisions has nothing of its own to show.
   if commit.parents.len() > 1 {
     return Ok(0);
@@ -1936,16 +2141,53 @@ fn ls_tree(mut repo: Repo, args: &[&str]) -> Res<i32> {
     [spec, path] => (spec, Some(repo.rooted(path))),
     _ => return unsupported("ls-tree` without exactly one revision and at most one path"),
   };
-  let commit = repo.resolve(spec)?;
+  // What is listed is a commit's tree, or the directory `<rev>:<path>` names.
+  let by_path = spec.contains(':');
+  let top = if by_path {
+    let id = repo.resolve_any(spec)?;
+    if repo.store.kind_of(&id)? != Some(Kind::Tree) {
+      return fatal(128, "fatal: not a tree object");
+    }
+    Some(id)
+  } else {
+    let commit = repo.resolve(spec)?;
+    root_of(&mut repo.store, &commit)?
+  };
+  // Run below the top with no path given, Git lists where it was run, with names from there.
+  let here = (only.is_none() && !by_path && !repo.prefix.is_empty()).then(|| repo.prefix.clone());
   let mut entries = Vec::new();
-  if let Some(root) = root_of(&mut repo.store, &commit)? {
-    listing(&mut repo.store, &root, &mut Vec::new(), recursive, &mut entries)?;
+  if let Some(root) = top {
+    match &here {
+      Some(dir) => {
+        if let Some(entry) = crate::manifest::lookup(&mut repo.store, root, dir)?.filter(Entry::is_dir) {
+          listing(&mut repo.store, &entry.id, &mut Vec::new(), recursive, &mut entries)?;
+        }
+      }
+      None => listing(&mut repo.store, &root, &mut Vec::new(), recursive, &mut entries)?,
+    }
   }
-  for (path, entry) in entries.iter().filter(|(p, _)| only.as_ref().is_none_or(|o| o == p)) {
+  // A path names itself, and with `-r` or a `/` after it what is below it.
+  let below = recursive || plain.get(1).is_some_and(|path| path.ends_with('/'));
+  if !recursive
+    && below
+    && let (Some(root), Some(dir)) = (top, &only)
+  {
+    entries.clear();
+    if let Some(entry) = crate::manifest::lookup(&mut repo.store, root, dir)?.filter(Entry::is_dir) {
+      listing(&mut repo.store, &entry.id, &mut dir.clone(), false, &mut entries)?;
+    }
+  }
+  let wanted = |path: &Vec<u8>| match &only {
+    None => true,
+    Some(only) => path == only || (below && path.len() > only.len() && path.starts_with(only) && path[only.len()] == b'/'),
+  };
+  for (path, entry) in entries.iter().filter(|(p, _)| wanted(p)) {
+    // A path that was asked for by name is told from where the command was run, as Git tells it.
+    let path = if only.is_some() && !by_path { repo.shown(path) } else { path.clone() };
     if names {
-      out(&[quoted(path, false).as_slice(), b"\n"].concat());
+      out(&[quoted(&path, false).as_slice(), b"\n"].concat());
     } else {
-      out(&entry_line(&mut repo, path, entry)?);
+      out(&entry_line(&mut repo, &path, entry)?);
     }
   }
   Ok(0)
@@ -1953,7 +2195,11 @@ fn ls_tree(mut repo: Repo, args: &[&str]) -> Res<i32> {
 
 fn cat_file(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let [mode @ ("-t" | "-p" | "-e"), spec] = args else { return unsupported(format_args!("cat-file {}", args.join(" "))) };
-  let missing = || Fail { code: 128, message: format!("fatal: Not a valid object name {spec}") };
+  // Asked only whether it is there, a well-formed id that names nothing is quietly not there.
+  let missing = || match *mode {
+    "-e" if spec.len() == 40 && spec.bytes().all(|b| b.is_ascii_hexdigit()) => Fail { code: 1, message: String::new() },
+    _ => Fail { code: 128, message: format!("fatal: Not a valid object name {spec}") },
+  };
   // A commit by name, a tree as `<commit>^{tree}`, or any object by its full Git id.
   let id = if let Some(commit) = spec.strip_suffix("^{tree}") {
     let commit = repo.resolve(commit)?;
@@ -2022,6 +2268,7 @@ fn branch(mut repo: Repo, args: &[&str]) -> Res<i32> {
       }
     }
     (None, [name]) => {
+      repo.new_ref("heads", name)?;
       let head = repo.resolve("HEAD")?;
       if !repo.store.compare_and_set_ref(&format!("heads/{name}"), None, head)? {
         return fatal(128, format!("fatal: a branch named '{name}' already exists"));
@@ -2061,6 +2308,7 @@ fn tag(mut repo: Repo, args: &[&str]) -> Res<i32> {
       }
     }
     (false, [name, rest @ ..]) if rest.len() <= 1 && !has(args, "-l") && !has(args, "--list") => {
+      repo.new_ref("tags", name)?;
       let mut at = repo.resolve(rest.first().copied().unwrap_or("HEAD"))?;
       if repo.store.read_ref(&format!("tags/{name}")).is_some() {
         return fatal(128, format!("fatal: tag '{name}' already exists"));
@@ -2090,11 +2338,42 @@ fn tag(mut repo: Repo, args: &[&str]) -> Res<i32> {
 /// `git checkout <branch>` and `git switch <branch>`, their `-b`/`-c` to make one first, and `checkout -- <paths>`.
 fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> Res<i32> {
   let plain = positional(command, args);
-  if has(args, "--") {
-    let paths: Vec<Vec<u8>> = plain.iter().map(|a| repo.rooted(a)).collect();
-    return put_back(&mut repo, &plain, &paths);
+  let say = |text: String| {
+    if !quiet(args) {
+      eprintln!("{text}");
+    }
+  };
+  // Files put back as the index has them: after `--`, or, for `checkout`, when what is named is no branch.
+  let paths_meant = has(args, "--")
+    || (command == "checkout" && !plain.is_empty() && value(args, &[create_flag]).is_none() && repo.resolve_any(plain[0]).is_err());
+  if has(args, "--") && args.iter().position(|a| *a == "--").is_some_and(|at| positional(command, &args[..at]).len() == 1) {
+    return unsupported(format_args!("{command} <revision> -- <paths>` (files as another commit has them)"));
   }
+  if paths_meant {
+    let paths: Vec<Vec<u8>> = plain.iter().map(|a| repo.rooted(a)).collect();
+    let before = repo.states()?.iter().filter(|(path, state)| under(&paths, path) && !state.disk_is_index && state.index.is_some()).count();
+    let code = put_back(&mut repo, &plain, &paths)?;
+    say(format!("Updated {before} path{} from the index", if before == 1 { "" } else { "s" }));
+    return Ok(code);
+  }
+  // Files that differ from the commit come along to wherever HEAD goes, and Git names them.
+  let carried = |repo: &mut Repo| -> Res<()> {
+    if quiet(args) {
+      return Ok(());
+    }
+    for (path, state) in repo.states()? {
+      let mark = match (state.staged(), state.unstaged()) {
+        (Some('D'), _) | (_, Some('D')) => 'D',
+        (Some('A'), _) => 'A',
+        (Some('M'), _) | (_, Some('M')) => 'M',
+        _ => continue,
+      };
+      out(&[format!("{mark}\t").as_bytes(), &quoted(&repo.shown(&path), false), b"\n"].concat());
+    }
+    Ok(())
+  };
   if let Some(name) = value(args, &[create_flag]) {
+    repo.new_ref("heads", name)?;
     if repo.branch_tip(name).is_some() {
       return fatal(128, format!("fatal: a branch named '{name}' already exists"));
     }
@@ -2113,30 +2392,60 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
       repo.store.compare_and_set_ref(&format!("heads/{name}"), None, start)?;
     }
     repo.set_branch(name)?;
+    carried(&mut repo)?;
+    say(format!("Switched to a new branch '{name}'"));
     return Ok(0);
   }
   let [name] = plain[..] else { return unsupported(format_args!("{command} {}", args.join(" "))) };
   // Only a branch: a commit would leave HEAD on none.
+  // A branch only the remote has is made here, following it, as Git does.
+  if repo.branch_tip(name).is_none()
+    && let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{name}"))
+  {
+    if let Err(refusal) = workspace::switch(&mut repo.store, &mut repo.ws, theirs) {
+      return fatal(1, format!("error: {refusal}\nAborting"));
+    }
+    repo.store.set_ref(&format!("heads/{name}"), theirs)?;
+    repo.set_branch(name)?;
+    carried(&mut repo)?;
+    if !quiet(args) {
+      println!("branch '{name}' set up to track 'origin/{name}'.");
+    }
+    say(format!("Switched to a new branch '{name}'"));
+    return Ok(0);
+  }
   let Some(tip) = repo.branch_tip(name) else {
     if repo.resolve(name).is_ok() {
       return unsupported(format_args!("{command} {name}` (a commit, not a branch)"));
     }
-    return fatal(1, format!("error: pathspec '{name}' did not match any file(s) known to git"));
+    return match command {
+      "switch" => fatal(128, format!("fatal: invalid reference: {name}")),
+      _ => fatal(1, format!("error: pathspec '{name}' did not match any file(s) known to git")),
+    };
   };
+  let already = repo.branch().as_deref() == Some(name);
   if let Err(refusal) = workspace::switch(&mut repo.store, &mut repo.ws, tip) {
     return fatal(1, format!("error: {refusal}\nAborting"));
   }
   repo.set_branch(name)?;
+  carried(&mut repo)?;
+  say(if already { format!("Already on '{name}'") } else { format!("Switched to branch '{name}'") });
   Ok(0)
 }
 
 /// Git's three-way merge of one file's text, by gitoxide: the merged bytes, and whether every change found its place.
 /// When not, the bytes hold both sides' lines between markers.
 fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8], their_name: &str) -> (Vec<u8>, bool) {
+  merge_text_named(base, ours, theirs, "HEAD", their_name)
+}
+
+/// Git's three-way merge of a text file. `false` when the two sides changed the
+/// same lines: the text then holds both, between Git's markers.
+pub(crate) fn merge_text_named(base: &[u8], ours: &[u8], theirs: &[u8], our_name: &str, their_name: &str) -> (Vec<u8>, bool) {
   use gix_merge::blob::{Resolution, builtin_driver::text};
   let mut merged = Vec::new();
   let mut input = imara_diff::InternedInput::default();
-  let labels = text::Labels { ancestor: None, current: Some("HEAD".into()), other: Some(their_name.into()) };
+  let labels = text::Labels { ancestor: None, current: Some(our_name.into()), other: Some(their_name.into()) };
   let how = text(&mut merged, &mut input, labels, ours, base, theirs, text::Options::default());
   (merged, how == Resolution::Complete)
 }
@@ -2292,7 +2601,9 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     }
     repo.store.flush()?;
     repo.set_staged(&staged)?;
-    std::fs::write(repo.meta("git-merge"), format!("{}\n{}\n", hex(&theirs), message.trim_end())).map_err(|e| e.to_string())?;
+    // The message its commit will carry, should nobody give another: Git notes what conflicted.
+    let noted: String = marked.iter().map(|(path, _)| format!("#\t{}\n", String::from_utf8_lossy(path))).collect();
+    crate::write_whole(&repo.meta("git-merge"), format!("{}\n{}\n\n# Conflicts:\n{noted}", hex(&theirs), message.trim_end()))?;
     repo.set_unmerged(&marked.iter().map(|(path, _)| path.clone()).collect())?;
     println!("Automatic merge failed; fix conflicts and then commit the result.");
     return Ok(1);
@@ -2462,11 +2773,13 @@ mod tests {
   #[test]
   fn every_spoken_command_is_dispatched() {
     // A command in the table that `run` does not know would be refused only after passing the check.
+    // Run where no Git repository is: inside one, Git itself would answer.
+    let nowhere = std::env::temp_dir().to_string_lossy().into_owned();
+    let at = |args: &[&str]| run(&["-C", &nowhere].iter().chain(args).map(|a| a.to_string()).collect::<Vec<_>>());
     for (name, _) in SPOKEN {
-      let code = run(&[name.to_string(), "--no-such-option".to_string()]);
-      assert_eq!(code, UNSUPPORTED, "{name}");
+      assert_eq!(at(&[name, "--no-such-option"]), UNSUPPORTED, "{name}");
     }
-    assert_eq!(run(&["not-a-command".to_string()]), UNSUPPORTED);
+    assert_eq!(at(&["not-a-command"]), UNSUPPORTED);
   }
 
   #[test]

@@ -144,6 +144,12 @@ pub struct Store {
   pub roots: HashMap<Id, Option<Id>>,
   /// Bytes of the segment after its last whole record.
   unread: u64,
+  /// The objects in `pending`: their places move if another process appends first.
+  pending_ids: Vec<Id>,
+  /// Roots worked out while the trees they name are still in `pending`.
+  pending_roots: Vec<u8>,
+  /// Git ids given to objects that are still in `pending`.
+  pending_gits: Vec<u8>,
   pub stats: Stats,
 }
 
@@ -222,6 +228,30 @@ impl GitIds {
     self.back.get(oid).copied().or_else(|| self.find(true, oid).map(|id| id.try_into().expect("thirty-two bytes")))
   }
 
+  /// The objects whose Git id begins with these bytes, and with this half byte after them if given.
+  fn beginning(&self, bytes: &[u8], half: Option<u8>) -> Vec<Id> {
+    let fits = |oid: &[u8]| oid.starts_with(bytes) && half.is_none_or(|half| oid[bytes.len()] >> 4 == half);
+    let mut found: Vec<Id> = self.back.iter().filter(|(oid, _)| fits(&oid[..])).map(|(_, id)| *id).collect();
+    if let Some((_, count)) = &self.sorted {
+      // The first pair at or after the prefix, then every one that still has it.
+      let (mut lo, mut hi) = (0, *count);
+      while lo < hi {
+        let mid = (lo + hi) / 2;
+        if &self.pair(true, mid)[..bytes.len()] < bytes { lo = mid + 1 } else { hi = mid }
+      }
+      found.extend(
+        (lo..*count)
+          .map(|at| self.pair(true, at))
+          .take_while(|pair| pair.starts_with(bytes))
+          .filter(|pair| fits(&pair[..20]))
+          .map(|pair| Id::try_from(&pair[20..]).expect("thirty-two bytes")),
+      );
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+  }
+
   fn all(&self) -> Vec<(Id, GitOid)> {
     let count = self.sorted.as_ref().map_or(0, |(_, count)| *count);
     let sorted = (0..count).map(|at| self.pair(false, at)).map(|p| (p[..32].try_into().unwrap(), p[32..].try_into().unwrap()));
@@ -236,6 +266,35 @@ pub fn object_id(kind: Kind, bytes: &[u8]) -> Id {
   *hasher.finalize().as_bytes()
 }
 
+/// Read the whole records in `bytes`, which begin at `start` in the segment, into `index`.
+/// Returns how many bytes they take. A record cut short by a crash ends the reading.
+fn scan(bytes: &[u8], start: u64, index: &mut HashMap<Id, Slot>, sorted: Option<&Sorted>, stats: &mut Stats) -> usize {
+  let mut at = 0usize;
+  while at + HEADER <= bytes.len() {
+    let h = &bytes[at..at + HEADER];
+    let (raw, stored) = (u32::from_le_bytes(h[34..38].try_into().unwrap()), u32::from_le_bytes(h[38..42].try_into().unwrap()));
+    let flags = h[1];
+    let head = HEADER + if flags & F_DELTA != 0 { BASE } else { 0 };
+    if at + head + stored as usize > bytes.len() {
+      break;
+    }
+    let id: Id = h[2..34].try_into().unwrap();
+    let base: Id = if flags & F_DELTA != 0 { bytes[at + HEADER..at + head].try_into().unwrap() } else { [0; 32] };
+    let base_depth = || index.get(&base).copied().or_else(|| sorted.and_then(|s| s.get(&base))).map_or(0, |b| b.depth);
+    let depth = if flags & F_DELTA != 0 { base_depth() + 1 } else { 0 };
+    index.insert(id, Slot { offset: start + (at + head) as u64, stored, raw, flags, base, depth });
+    stats.add(h[0], flags, raw, head + stored as usize);
+    at += head + stored as usize;
+  }
+  at
+}
+
+/// Where a ref is written before it takes its name: beside it, under a name no ref can have.
+fn half_written(path: &Path) -> PathBuf {
+  let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+  path.with_file_name(format!("{name}~{}", std::process::id()))
+}
+
 fn open_log(path: &Path) -> Result<(File, Vec<u8>)> {
   let mut file =
     File::options().read(true).append(true).create(true).open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
@@ -245,8 +304,21 @@ fn open_log(path: &Path) -> Result<(File, Vec<u8>)> {
 }
 
 impl Store {
-  pub fn open(dir: &Path) -> Result<Store> {
+  /// The store in `dir`, made if there is none. Only for a command whose
+  /// purpose is to start one: an import, a new repository.
+  pub fn create(dir: &Path) -> Result<Store> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("objects.seg");
+    File::options().append(true).create(true).open(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    Store::open(dir)
+  }
+
+  /// The store in `dir`, which has to be one already. Nothing is created:
+  /// a command pointed at the wrong directory says so and leaves no trace.
+  pub fn open(dir: &Path) -> Result<Store> {
+    if dir.as_os_str().is_empty() || !dir.join("objects.seg").is_file() {
+      return Err(format!("{} is not a store", dir.display()));
+    }
     let path = dir.join("objects.seg");
     let segment =
       File::options().read(true).append(true).create(true).open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
@@ -260,24 +332,7 @@ impl Store {
     let mut bytes = vec![0u8; (len - covered) as usize];
     segment.read_exact_at(&mut bytes, covered).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut index: HashMap<Id, Slot> = HashMap::new();
-    let mut at = 0usize;
-    // A record cut short by a crash is ignored, and overwritten by the next append.
-    while at + HEADER <= bytes.len() {
-      let h = &bytes[at..at + HEADER];
-      let (raw, stored) = (u32::from_le_bytes(h[34..38].try_into().unwrap()), u32::from_le_bytes(h[38..42].try_into().unwrap()));
-      let flags = h[1];
-      let head = HEADER + if flags & F_DELTA != 0 { BASE } else { 0 };
-      if at + head + stored as usize > bytes.len() {
-        break;
-      }
-      let id: Id = h[2..34].try_into().unwrap();
-      let base: Id = if flags & F_DELTA != 0 { bytes[at + HEADER..at + head].try_into().unwrap() } else { [0; 32] };
-      let base_depth = || index.get(&base).copied().or_else(|| sorted.as_ref().and_then(|s| s.get(&base))).map_or(0, |b| b.depth);
-      let depth = if flags & F_DELTA != 0 { base_depth() + 1 } else { 0 };
-      index.insert(id, Slot { offset: covered + (at + head) as u64, stored, raw, flags, base, depth });
-      stats.add(h[0], flags, raw, head + stored as usize);
-      at += head + stored as usize;
-    }
+    let at = scan(&bytes, covered, &mut index, sorted.as_ref(), &mut stats);
     // Bytes after the last whole record are left where they are. They may be
     // a record cut short by a crash, or the sign of damage further up; only a
     // command that has to write cuts them off, and `check` reports them.
@@ -312,6 +367,9 @@ impl Store {
       roots_log,
       roots,
       unread,
+      pending_ids: Vec::new(),
+      pending_roots: Vec::new(),
+      pending_gits: Vec::new(),
       stats,
     })
   }
@@ -464,22 +522,79 @@ impl Store {
     self.git_ids().of_git(oid)
   }
 
+  /// The objects whose Git id, in hex, begins with `prefix`.
+  pub fn of_git_beginning(&mut self, prefix: &str) -> Vec<Id> {
+    let whole = &prefix[..prefix.len() & !1];
+    let Some(bytes) = crate::unhex(whole) else { return Vec::new() };
+    let half = prefix[whole.len()..].chars().next().and_then(|c| c.to_digit(16)).map(|d| d as u8);
+    if prefix.len() > whole.len() && half.is_none() {
+      return Vec::new();
+    }
+    self.git_ids().beginning(&bytes, half)
+  }
+
   /// Every object that has a Git id.
   pub fn with_git_ids(&mut self) -> Vec<(Id, GitOid)> {
     self.git_ids().all()
   }
 
-  pub fn flush(&mut self) -> Result<()> {
-    if !self.pending.is_empty() {
-      // New records go after the last whole one, so what follows it has to go first.
-      if std::mem::take(&mut self.unread) > 0 {
-        self.segment.set_len(self.flushed).map_err(|e| format!("cannot cut the segment's torn end: {e}"))?;
-      }
-      self.segment.write_all(&self.pending).map_err(|e| format!("cannot write the segment: {e}"))?;
-      self.flushed += self.pending.len() as u64;
-      self.pending.clear();
+  /// Take in what other processes appended to the segment since this one
+  /// last looked. Workspaces share a store, and each of them appends.
+  fn catch_up(&mut self) -> Result<()> {
+    let len = self.segment.metadata().map_err(|e| e.to_string())?.len();
+    if len <= self.flushed {
+      return Ok(());
     }
+    let mut bytes = vec![0u8; (len - self.flushed) as usize];
+    self.segment.read_exact_at(&mut bytes, self.flushed).map_err(|e| format!("cannot read the segment: {e}"))?;
+    // What is waiting here to be written comes after those records, wherever it was thought to go.
+    let waiting: Vec<(Id, Slot)> = self.pending_ids.iter().filter_map(|id| Some((*id, *self.index.get(id)?))).collect();
+    let taken = scan(&bytes, self.flushed, &mut self.index, self.sorted.as_ref(), &mut self.stats) as u64;
+    for (id, mut slot) in waiting {
+      slot.offset += taken;
+      self.index.insert(id, slot);
+    }
+    self.flushed += taken;
+    self.unread = len - self.flushed;
     Ok(())
+  }
+
+  /// Append what is waiting. One process at a time, each after whatever the
+  /// others wrote: the segment is held for the length of the write.
+  pub fn flush(&mut self) -> Result<()> {
+    if self.pending.is_empty() && self.pending_roots.is_empty() && self.pending_gits.is_empty() {
+      return Ok(());
+    }
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(self.segment.as_raw_fd(), libc::LOCK_EX) } != 0 {
+      return Err(format!("cannot hold the segment: {}", std::io::Error::last_os_error()));
+    }
+    let result = (|| {
+      self.catch_up()?;
+      if !self.pending.is_empty() {
+        // New records go after the last whole one, so what follows it has to go first.
+        // Nobody else is writing: what is there is what a killed process left.
+        if std::mem::take(&mut self.unread) > 0 {
+          self.segment.set_len(self.flushed).map_err(|e| format!("cannot cut the segment's torn end: {e}"))?;
+        }
+        self.segment.write_all(&self.pending).map_err(|e| format!("cannot write the segment: {e}"))?;
+        self.flushed += self.pending.len() as u64;
+        self.pending.clear();
+        self.pending_ids.clear();
+      }
+      // The objects are written: now what names them may be.
+      if !self.pending_gits.is_empty() {
+        self.git_log.write_all(&self.pending_gits).map_err(|e| format!("cannot write the git map: {e}"))?;
+        self.pending_gits.clear();
+      }
+      if !self.pending_roots.is_empty() {
+        self.roots_log.write_all(&self.pending_roots).map_err(|e| format!("cannot write the roots map: {e}"))?;
+        self.pending_roots.clear();
+      }
+      Ok(())
+    })();
+    unsafe { libc::flock(self.segment.as_raw_fd(), libc::LOCK_UN) };
+    result
   }
 
   fn remember(&mut self, id: Id, bytes: std::sync::Arc<Vec<u8>>) {
@@ -538,6 +653,7 @@ impl Store {
     }
     self.pending.extend_from_slice(&stored);
     self.index.insert(id, Slot { offset, stored: stored.len() as u32, raw: bytes.len() as u32, flags, base: base_id, depth });
+    self.pending_ids.push(id);
     self.stats.add(kind as u8, flags, bytes.len() as u32, head + stored.len());
     if kind == Kind::Blob {
       self.remember(id, std::sync::Arc::new(bytes.to_vec()));
@@ -564,7 +680,15 @@ impl Store {
     if let Some(hit) = self.cache.get(id) {
       return Ok(Some(hit.clone()));
     }
-    let Some(slot) = self.slot(id) else { return Ok(None) };
+    let slot = match self.slot(id) {
+      Some(slot) => slot,
+      // Another process may have written it since this one opened the store.
+      None => {
+        self.catch_up()?;
+        let Some(slot) = self.slot(id) else { return Ok(None) };
+        slot
+      }
+    };
     let stored = self.stored_bytes(&slot)?;
     let bytes = if slot.flags & F_RAW != 0 {
       stored
@@ -596,7 +720,14 @@ impl Store {
     record.push(kind as u8);
     record.extend_from_slice(&id);
     record.extend_from_slice(&oid);
-    self.git_log.write_all(&record).map_err(|e| format!("cannot write the git map: {e}"))
+    // Not before the object it names is in the segment: a process killed in between
+    // would leave a Git id that leads to nothing.
+    if self.pending.is_empty() {
+      self.git_log.write_all(&record).map_err(|e| format!("cannot write the git map: {e}"))
+    } else {
+      self.pending_gits.extend_from_slice(&record);
+      Ok(())
+    }
   }
 
   pub fn set_root(&mut self, commit: Id, root: Option<Id>) -> Result<()> {
@@ -607,7 +738,13 @@ impl Store {
     record.extend_from_slice(&commit);
     record.push(root.is_some() as u8);
     record.extend_from_slice(&root.unwrap_or([0; 32]));
-    self.roots_log.write_all(&record).map_err(|e| format!("cannot write the roots map: {e}"))
+    // Not before the tree it names is in the segment: another process reads this file.
+    if self.pending.is_empty() {
+      self.roots_log.write_all(&record).map_err(|e| format!("cannot write the roots map: {e}"))
+    } else {
+      self.pending_roots.extend_from_slice(&record);
+      Ok(())
+    }
   }
 
   /// A named pointer to a commit. Moving it is the one write that has to be
@@ -618,7 +755,7 @@ impl Store {
       return Ok(false);
     }
     std::fs::create_dir_all(path.parent().expect("under refs")).map_err(|e| e.to_string())?;
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let temp = half_written(&path);
     std::fs::write(&temp, crate::hex(&new)).map_err(|e| e.to_string())?;
     std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
     Ok(true)
@@ -628,7 +765,7 @@ impl Store {
   pub fn set_ref(&self, name: &str, id: Id) -> Result<()> {
     let path = self.dir.join("refs").join(name);
     std::fs::create_dir_all(path.parent().expect("under refs")).map_err(|e| e.to_string())?;
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let temp = half_written(&path);
     std::fs::write(&temp, crate::hex(&id)).and_then(|_| std::fs::rename(&temp, &path)).map_err(|e| e.to_string())
   }
 
@@ -639,14 +776,26 @@ impl Store {
 
   /// The refs under a prefix (`heads`, `tags`, `remotes/origin`), by name.
   pub fn refs_under(&self, prefix: &str) -> Vec<(String, Id)> {
-    let mut found: Vec<(String, Id)> = std::fs::read_dir(self.dir.join("refs").join(prefix))
-      .into_iter()
-      .flatten()
-      .flatten()
-      .filter_map(|e| e.file_name().into_string().ok())
-      .filter(|name| !name.contains(".tmp"))
-      .filter_map(|name| Some((name.clone(), self.read_ref(&format!("{prefix}/{name}"))?)))
-      .collect();
+    // A name may have `/` in it: `feature/x` is a file in a directory.
+    fn below(dir: &Path, name: &str, found: &mut Vec<(String, Id)>) {
+      for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(part) = entry.file_name().into_string() else { continue };
+        // `~` is in no ref's name: a file with one is a ref half written.
+        if part.contains('~') {
+          continue;
+        }
+        let name = if name.is_empty() { part.clone() } else { format!("{name}/{part}") };
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+          below(&entry.path(), &name, found);
+        } else if let Some(id) =
+          std::fs::read_to_string(entry.path()).ok().and_then(|text| crate::unhex(text.trim())).and_then(|b| Id::try_from(b).ok())
+        {
+          found.push((name, id));
+        }
+      }
+    }
+    let mut found = Vec::new();
+    below(&self.dir.join("refs").join(prefix), "", &mut found);
     found.sort();
     found
   }
@@ -749,7 +898,7 @@ mod tests {
     }
     let mut ids = Vec::new();
     {
-      let mut store = Store::open(&dir).unwrap();
+      let mut store = Store::create(&dir).unwrap();
       let mut previous = None;
       for v in &versions {
         let id = store.put(Kind::Blob, v, previous).unwrap();
@@ -761,7 +910,7 @@ mod tests {
       assert!(store.stats.deltas < versions.len() - 2 && store.stats.deltas > versions.len() / 2);
       assert!(store.index.values().all(|s| s.depth <= MAX_CHAIN));
     }
-    let mut store = Store::open(&dir).unwrap();
+    let mut store = Store::create(&dir).unwrap();
     for (id, v) in ids.iter().zip(&versions) {
       assert_eq!(store.get(id).unwrap().unwrap().as_slice(), v.as_slice());
     }
@@ -771,7 +920,7 @@ mod tests {
     assert!(store.index.is_empty());
     let late = store.put(Kind::Blob, &[versions.last().unwrap().as_slice(), b"one more line\n"].concat(), ids.last().copied()).unwrap();
     drop(store);
-    let mut store = Store::open(&dir).unwrap();
+    let mut store = Store::create(&dir).unwrap();
     assert_eq!(store.index.len(), 1, "only the object written after the checkpoint is scanned for");
     assert_eq!((store.stats.objects, store.stats.raw_bytes > before.raw_bytes), (before.objects + 1, true));
     for (id, v) in ids.iter().zip(&versions) {
@@ -784,7 +933,7 @@ mod tests {
     let segment = dir.join("objects.seg");
     let cut = std::fs::metadata(&segment).unwrap().len() / 2;
     std::fs::File::options().write(true).open(&segment).unwrap().set_len(cut).unwrap();
-    let mut store = Store::open(&dir).unwrap();
+    let mut store = Store::create(&dir).unwrap();
     assert!(store.sorted.is_none() && store.stats.objects < before.objects);
     assert_eq!(store.get(&ids[0]).unwrap().unwrap().as_slice(), versions[0].as_slice());
     assert!(store.get(&[7; 32]).unwrap().is_none());
@@ -799,12 +948,48 @@ mod tests {
   #[test]
   fn a_ref_moves_only_from_the_value_the_writer_saw() {
     let dir = temp("refs");
-    let store = Store::open(&dir).unwrap();
+    let store = Store::create(&dir).unwrap();
     assert!(store.compare_and_set_ref("main", None, [1; 32]).unwrap());
     assert!(!store.compare_and_set_ref("main", None, [2; 32]).unwrap());
     assert!(!store.compare_and_set_ref("main", Some([9; 32]), [2; 32]).unwrap());
     assert!(store.compare_and_set_ref("main", Some([1; 32]), [2; 32]).unwrap());
     assert_eq!(store.read_ref("main"), Some([2; 32]));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn two_writers_on_one_store_do_not_write_over_each_other() {
+    let dir = std::env::temp_dir().join(format!("newvcs-store-two-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut a, mut b) = (Store::create(&dir).unwrap(), Store::create(&dir).unwrap());
+    let text = |who: &str, n: usize| format!("{who} wrote object {n}\n").repeat(40 + n).into_bytes();
+    let mut ids = Vec::new();
+    // Each buffers, then they flush in turn, several times over: neither knows of the other's records.
+    for round in 0..5 {
+      for n in 0..20 {
+        ids.push((a.put(Kind::Blob, &text("a", round * 20 + n), None).unwrap(), text("a", round * 20 + n)));
+        ids.push((b.put(Kind::Blob, &text("b", round * 20 + n), None).unwrap(), text("b", round * 20 + n)));
+      }
+      let root = a.put(Kind::Tree, &text("tree", round), None).unwrap();
+      a.set_root([round as u8; 32], Some(root)).unwrap();
+      a.flush().unwrap();
+      b.flush().unwrap();
+      // What the other wrote is found, without opening the store again.
+      for (id, bytes) in &ids {
+        assert_eq!(a.get(id).unwrap().as_deref(), Some(bytes));
+        assert_eq!(b.get(id).unwrap().as_deref(), Some(bytes));
+      }
+    }
+    drop((a, b));
+    let mut fresh = Store::open(&dir).unwrap();
+    for (id, bytes) in &ids {
+      assert_eq!(fresh.get(id).unwrap().as_deref(), Some(bytes));
+    }
+    // A root is written down only once the tree it names is.
+    for (commit, root) in fresh.roots.clone() {
+      assert!(root.is_none_or(|root| fresh.contains(&root)), "the root of {commit:?} names a tree the store lacks");
+    }
+    assert_eq!(fresh.check().unwrap().1, Vec::<String>::new());
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

@@ -25,9 +25,52 @@ pub fn git(repo: &Path) -> Command {
   let mut c = Command::new(std::env::var_os("NV_REAL_GIT").unwrap_or_else(|| "git".into()));
   // A partial clone would otherwise fetch what it lacks, one object at a time.
   c.env("GIT_NO_LAZY_FETCH", "1").arg("-C").arg(repo);
-  // A repository nv shares a directory with has hooks that stop everyone else.
-  c.env(crate::colocated::WRITING, "1");
   c
+}
+
+/// A value of Git's configuration for the repository in `root`: its own
+/// `.git/config`, then the user's. Read from the files; no process is
+/// started. Includes are not followed.
+pub fn config_value(root: &Path, section: &str, key: &str) -> Option<String> {
+  let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+  let global = match std::env::var_os("GIT_CONFIG_GLOBAL") {
+    Some(file) => vec![std::path::PathBuf::from(file)],
+    None => {
+      let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
+      home.iter().map(|h| h.join(".gitconfig")).chain(xdg.map(|x| x.join("git").join("config"))).collect()
+    }
+  };
+  std::iter::once(root.join(".git").join("config")).chain(global).find_map(|file| {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut inside = false;
+    let mut found = None;
+    for line in text.lines().map(str::trim) {
+      if let Some(header) = line.strip_prefix('[') {
+        inside = header.trim_end_matches(']').trim().eq_ignore_ascii_case(section);
+      } else if inside
+        && let Some((name, value)) = line.split_once('=')
+        && name.trim().eq_ignore_ascii_case(key)
+      {
+        found = Some(value.trim().trim_matches('"').to_string());
+      }
+    }
+    found
+  })
+}
+
+/// The file of patterns Git ignores in every repository of this user's.
+pub fn global_excludes(root: &Path) -> Option<std::path::PathBuf> {
+  let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+  match config_value(root, "core", "excludesfile") {
+    Some(path) => Some(match (path.strip_prefix("~/"), &home) {
+      (Some(rest), Some(home)) => home.join(rest),
+      _ => path.into(),
+    }),
+    None => {
+      let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".config")))?;
+      Some(xdg.join("git").join("ignore"))
+    }
+  }
 }
 
 pub fn git_hash(kind: &str, bytes: &[u8]) -> GitOid {
@@ -123,6 +166,19 @@ pub struct Imported {
 /// Import the history reachable from `rev`, oldest first, checking as it
 /// goes that each commit maps back to the id Git gave it.
 pub fn import(store: &mut Store, repo: &Path, rev: &str, limit: Option<usize>) -> Result<Imported> {
+  import_beyond(store, repo, rev, limit, &[])
+}
+
+/// `import`, of the commits `rev` has that the commits `have` do not: for a
+/// store that is known to hold those already. Git is then asked about the
+/// new commits only, however long the history behind them.
+pub fn import_beyond(store: &mut Store, repo: &Path, rev: &str, limit: Option<usize>, have: &[String]) -> Result<Imported> {
+  import_tips(store, repo, &[rev], limit, have)
+}
+
+/// `import_beyond`, of everything behind several commits at once: one question to Git for all
+/// of them, where a repository's hundreds of tags would otherwise each ask for the whole history.
+pub fn import_tips(store: &mut Store, repo: &Path, revs: &[&str], limit: Option<usize>, have: &[String]) -> Result<Imported> {
   let mut log = git(repo);
   log.args([
     "log",
@@ -136,7 +192,8 @@ pub fn import(store: &mut Store, repo: &Path, rev: &str, limit: Option<usize>) -
     "-z",
     "--format=C %H",
   ]);
-  log.arg(rev);
+  log.args(revs);
+  log.args(have.iter().map(|oid| format!("^{oid}")));
   let out = log.output().map_err(|e| format!("cannot run git: {e}"))?;
   if !out.status.success() {
     return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -241,7 +298,12 @@ pub fn import(store: &mut Store, repo: &Path, rev: &str, limit: Option<usize>) -
       done.mismatches.push(format!("{hash}: commit object differs"));
     }
   }
-  store.checkpoint()?;
+  // A history's worth of new objects is worth a new index of them at once; a few commits' worth is not.
+  if done.commits + done.blobs >= 4096 {
+    store.checkpoint()?;
+  } else {
+    store.flush()?;
+  }
   Ok(done)
 }
 
@@ -349,12 +411,24 @@ pub fn import_refs(store: &mut Store, repo: &Path) -> Result<Refs> {
   let current = run(&["symbolic-ref", "-q", "--short", "HEAD"])?;
   refs.current = Some(current.trim().to_string()).filter(|c| !c.is_empty());
   let listed = run(&["for-each-ref", "--format=%(refname) %(objectname) %(*objectname)", "refs/heads", "refs/tags"])?;
+  // The commits the refs name (through an annotated tag, the commit it names), all asked for at once.
+  let named = |line: &str| -> Option<String> {
+    let mut fields = line.split(' ').skip(1);
+    let object = fields.next()?;
+    Some(fields.next().filter(|peeled| !peeled.is_empty()).unwrap_or(object).to_string())
+  };
+  let mut tips: Vec<String> = listed.lines().filter_map(named).collect();
+  tips.sort();
+  tips.dedup();
+  tips.retain(|tip| oid(tip).is_ok_and(|tip| store.of_git(&tip).is_none()));
+  if !tips.is_empty() {
+    import_tips(store, repo, &tips.iter().map(String::as_str).collect::<Vec<_>>(), None, &[])?;
+  }
   for line in listed.lines() {
     let mut fields = line.split(' ');
     let (Some(name), Some(object)) = (fields.next(), fields.next()) else { continue };
     // The commit an annotated tag names, if this is one.
     let commit = fields.next().filter(|peeled| !peeled.is_empty()).unwrap_or(object);
-    import(store, repo, commit, None)?;
     let Some(mut id) = store.of_git(&oid(commit)?) else { continue };
     if commit != object {
       // An annotated tag is an object of its own, kept as Git has it.

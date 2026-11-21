@@ -26,6 +26,8 @@ imara-diff = { package = "gix-imara-diff", version = "0.3" }
 bstr = "1"
 # The operating system's file events, for `nv watch`.
 notify = "8"
+# File names as the file system and Git each spell them (NFC and NFD).
+unicode-normalization = "0.1"
 # Git's loose objects are zlib streams.
 flate2 = "1"
 # Plain HTTP only: the server is local so far.

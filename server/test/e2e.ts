@@ -8,13 +8,17 @@ import assert from "node:assert/strict";
 import { decode, encode, hex, idOf, unhex, type Commit } from "../src/commit.ts";
 
 const server = process.env.NV_SERVER ?? "http://localhost:8799";
-const repo = `e2e-${Date.now()}`;
+const repo = `t/e2e-${Date.now()}`;
 const text = (s: string) => new TextEncoder().encode(s);
 /// A push is frames, each a length and bytes: the commit, then the contents it names.
-function frame(bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(4 + bytes.length);
-  new DataView(out.buffer).setUint32(0, bytes.length, true);
-  out.set(bytes, 4);
+function frame(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, part) => n + 4 + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    new DataView(out.buffer).setUint32(at, part.length, true);
+    out.set(part, at + 4);
+    at += 4 + part.length;
+  }
   return out;
 }
 
@@ -35,6 +39,57 @@ async function push(name: string, ref: string, bytes: Uint8Array): Promise<Pushe
   return (await response.json()) as Pushed;
 }
 const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
+
+// ---------------------------------------------------------------- a push of several commits
+{
+  const name = `${repo}-chain`;
+  const chain = async (ref: string, commits: Uint8Array[]): Promise<Pushed & { commits?: string[] }> => {
+    const response = await fetch(`${server}/${name}/push/${ref}?commits=${commits.length}`, { method: "POST", body: frame(...commits) });
+    return (await response.json()) as Pushed & { commits?: string[] };
+  };
+  const idHex = (bytes: Uint8Array) => hex(idOf(bytes));
+  const root = await push(name, "main", commit(null, ["README.md", "shared.txt"], "root"));
+  // Ann changes the shared file. Bob, who has not seen that, made two commits: the second changes it too.
+  const ann = await push(name, "main", commit(root.commit, ["shared.txt"], "ann"));
+  const bob1 = commit(root.commit, ["b.txt"], "bob 1");
+  const bob2 = commit(idHex(bob1), ["shared.txt"], "bob 2");
+  const refused = await chain("main", [bob1, bob2]);
+  // Neither lands: the first alone would have been fine, but a push is whole.
+  assert.deepEqual([refused.status, refused.paths], ["conflict", ["shared.txt"]]);
+  assert.deepEqual(await get(`${name}/refs/main`), { tip: ann.commit, seq: 2 });
+  // Sent again it is refused again, and kept aside once.
+  await chain("main", [bob1, bob2]);
+  assert.equal(((await get(`${name}/divergent/main`)) as unknown[]).length, 1);
+
+  // Two commits that touch nothing the ref took meanwhile both land, the second on the first as moved.
+  const cat1 = commit(root.commit, ["c1.txt"], "cat 1");
+  const cat2 = commit(idHex(cat1), ["c2.txt", "c1.txt"], "cat 2");
+  const moved = await chain("main", [cat1, cat2]);
+  assert.deepEqual([moved.status, moved.seq, moved.commits?.length], ["rebased", 4, 2]);
+  const second = decode(new Uint8Array(await (await fetch(`${server}/${name}/commits/${moved.commit}`)).arrayBuffer()));
+  assert.equal(hex(second.parents[0]!), moved.commits![0]);
+  const firstMoved = decode(new Uint8Array(await (await fetch(`${server}/${name}/commits/${moved.commits![0]}`)).arrayBuffer()));
+  assert.equal(hex(firstMoved.parents[0]!), ann.commit);
+
+  // The writer never heard back and sends it again: the same answer, and nothing lands twice.
+  const again = await chain("main", [cat1, cat2]);
+  assert.deepEqual([again.status, again.commit, again.seq, again.commits], [moved.status, moved.commit, moved.seq, moved.commits]);
+  assert.deepEqual(await get(`${name}/refs/main`), { tip: moved.commit, seq: 4 });
+  assert.equal(((await get(`${name}/divergent/main`)) as unknown[]).length, 1);
+  // The same for one taken as it was.
+  const dan = commit(moved.commit, ["d.txt"], "dan");
+  const taken = await push(name, "main", dan);
+  assert.deepEqual([(await push(name, "main", dan)).commit, ((await get(`${name}/refs/main`)) as { seq: number }).seq], [taken.commit, 5]);
+
+  // A ref started by several commits holds all of them, and where they started from.
+  const s1 = commit(root.commit, ["s1.txt"], "start 1");
+  const s2 = commit(idHex(s1), ["s2.txt"], "start 2");
+  const started = await chain("fresh", [s1, s2]);
+  assert.deepEqual([started.status, started.seq], ["updated", 2]);
+  assert.deepEqual(((await get(`${name}/log/fresh?after=-1`)) as { id: string }[]).map((entry) => entry.id), [root.commit, idHex(s1), idHex(s2)]);
+  // Commits that are not a chain are not a push.
+  assert.equal((await fetch(`${server}/${name}/push/main?commits=2`, { method: "POST", body: frame(s2, s1) })).status, 400);
+}
 
 // ---------------------------------------------------------------- outcomes
 {
