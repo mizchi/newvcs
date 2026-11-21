@@ -51,6 +51,10 @@ pub fn expected(root: &Path) -> bool {
 pub fn status(root: &Path) -> String {
   let pid = std::fs::read_to_string(root.join(".nv").join("watch.pid")).unwrap_or_default();
   match (alive(root), expected(root)) {
+    (true, _) if elsewhere(root) => format!(
+      "watched by process {}, which was started where the workspace used to be: writes here are going unreported until a hook or a command with --recorded starts it again",
+      pid.trim()
+    ),
     (true, _) => format!("watched by process {}", pid.trim()),
     (false, true) => {
       "the watcher is not running: writes are going unreported until `nv watch <dir> --start`, a hook or a command with --recorded starts it again"
@@ -95,6 +99,20 @@ pub fn start(root: &Path) -> Result<String> {
 pub fn stop(root: &Path) -> Result<String> {
   let meta = root.join(".nv");
   let _ = std::fs::remove_file(meta.join("watch.expected"));
+  halt(root);
+  Ok(status(root))
+}
+
+/// Whether the watcher that is alive was started on another path than the workspace is at now:
+/// the directory was moved, and what the watcher hears of is the place it left.
+fn elsewhere(root: &Path) -> bool {
+  let now = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+  std::fs::read(root.join(".nv").join("watch.root")).is_ok_and(|was| was != now.as_os_str().as_bytes())
+}
+
+/// Stop the watcher that is alive, if any, and wait for it to be gone.
+fn halt(root: &Path) {
+  let meta = root.join(".nv");
   if alive(root)
     && let Some(pid) = std::fs::read_to_string(meta.join("watch.pid")).ok().and_then(|text| text.trim().parse::<i32>().ok())
   {
@@ -106,13 +124,17 @@ pub fn stop(root: &Path) -> Result<String> {
     }
   }
   let _ = std::fs::remove_file(meta.join("watch.pid"));
-  Ok(status(root))
 }
 
 /// Start the watcher again if the workspace is meant to have one and it is
 /// gone. What was written meanwhile is found by the look at every file a
 /// watcher takes as it starts.
 pub fn ensure(root: &Path) {
+  // A watcher started where the workspace used to be is told of writes there, not here.
+  if alive(root) && elsewhere(root) {
+    halt(root);
+    let _ = std::fs::write(root.join(".nv").join("watch.expected"), b"");
+  }
   if expected(root) && !alive(root) {
     match start(root) {
       Ok(_) => eprintln!("nv: the watcher was not running; it was started again and has looked at every file"),
@@ -126,15 +148,18 @@ pub fn ensure(root: &Path) {
 /// writes could run in the moment between a write and its being reported.
 /// A watcher that should be running and is not is started first. Returns at
 /// once when nothing is watching and nothing is meant to.
-pub fn settle(root: &Path) {
+///
+/// False when a watcher is there and did not say it has caught up: what is recorded may then
+/// lack a write, and the caller looks at every file instead of trusting it.
+pub fn settle(root: &Path) -> bool {
   ensure(root);
   let meta = root.join(".nv");
   if !alive(root) {
-    return;
+    return true;
   }
   let question = meta.join(format!("asked-{}", std::process::id()));
   if std::fs::write(&question, b"").is_err() {
-    return;
+    return false;
   }
   let asked = Instant::now();
   while question.exists() && asked.elapsed() < Duration::from_secs(2) {
@@ -142,8 +167,10 @@ pub fn settle(root: &Path) {
   }
   if question.exists() {
     let _ = std::fs::remove_file(&question);
-    eprintln!("nv: the watcher did not answer; going on with what has been reported so far");
+    eprintln!("nv: the watcher has not caught up with what was written; looking at every file instead of trusting what was reported");
+    return false;
   }
+  true
 }
 
 pub fn watch(root: &Path, author: &str) -> Result<()> {
@@ -165,6 +192,7 @@ pub fn watch(root: &Path, author: &str) -> Result<()> {
     let mut store = Store::open(&ws.store)?;
     workspace::snapshot(&mut store, &mut ws, author, Look::Everywhere)?;
   }
+  std::fs::write(root.join(".nv").join("watch.root"), root.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
   let pid_file = root.join(".nv").join("watch.pid");
   std::fs::write(&pid_file, std::process::id().to_string()).map_err(|e| format!("cannot write {}: {e}", pid_file.display()))?;
   let say = |line: String| {
@@ -176,7 +204,13 @@ pub fn watch(root: &Path, author: &str) -> Result<()> {
 
   let mut paths: BTreeSet<Vec<u8>> = BTreeSet::new();
   let mut asked: Vec<std::path::PathBuf> = Vec::new();
+  // Set when the system says it dropped events, or gave an error in place of one: which files
+  // were written is then not known, and the next snapshot looks at all of them.
+  let missed = std::cell::Cell::new(false);
   let take = |paths: &mut BTreeSet<Vec<u8>>, asked: &mut Vec<std::path::PathBuf>, event: notify::Result<notify::Event>| {
+    if event.as_ref().map_or(true, |event| event.need_rescan()) {
+      missed.set(true);
+    }
     for path in event.map(|e| e.paths).unwrap_or_default() {
       // A file someone made to ask whether every write before it has been recorded.
       if path.parent() == Some(&root.join(".nv")) && path.file_name().is_some_and(|name| name.as_bytes().starts_with(b"asked-")) {
@@ -192,29 +226,46 @@ pub fn watch(root: &Path, author: &str) -> Result<()> {
     }
   };
   loop {
-    let Ok(first) = events.recv() else { return Ok(()) };
-    take(&mut paths, &mut asked, first);
+    // With a question waiting, the next event is waited for only as long as a burst may pause.
+    let mut quiet = false;
+    if asked.is_empty() {
+      let Ok(first) = events.recv() else { return Ok(()) };
+      take(&mut paths, &mut asked, first);
+    }
     let started = Instant::now();
     while started.elapsed() < AT_MOST {
       match events.recv_timeout(QUIET) {
         Ok(event) => take(&mut paths, &mut asked, event),
-        Err(RecvTimeoutError::Timeout) => break,
+        Err(RecvTimeoutError::Timeout) => {
+          quiet = true;
+          break;
+        }
         Err(RecvTimeoutError::Disconnected) => return Ok(()),
       }
     }
-    if !paths.is_empty() {
+    // A workspace that is gone has nothing left to watch.
+    if !root.join(".nv").join("workspace").is_file() {
+      return Ok(());
+    }
+    if !paths.is_empty() || missed.get() {
       // Someone else may be at the workspace: a hook, a commit, a restore.
       let _lock = workspace::lock(&root)?;
       let mut ws = Workspace::open(&root)?;
-      let reported = workspace::record_events(&ws, &std::mem::take(&mut paths))?;
       let mut store = Store::open(&ws.store)?;
-      if let Some(id) = workspace::snapshot(&mut store, &mut ws, author, Look::Recorded)? {
+      workspace::unfold(&mut store, &mut ws)?;
+      let reported = workspace::record_events(&ws, &std::mem::take(&mut paths))?;
+      let look = if missed.replace(false) { Look::Everywhere } else { Look::Recorded };
+      if let Some(id) = workspace::snapshot(&mut store, &mut ws, author, look)? {
         say(format!("{} from {reported} paths", hex(&id)));
       }
     }
-    // Events come in the order things happened: every write before these questions is recorded now.
-    for question in asked.drain(..) {
-      let _ = std::fs::remove_file(question);
+    // A question is answered when the events have stopped coming, not when a burst was cut to
+    // record what there was of it: events of writes made before the question may still be on
+    // their way. Whoever asked waits, and looks for itself if that takes too long.
+    if quiet {
+      for question in asked.drain(..) {
+        let _ = std::fs::remove_file(question);
+      }
     }
   }
 }

@@ -64,6 +64,12 @@ fn meta(root: &Path, name: &str) -> PathBuf {
 }
 
 /// Whether a Git repository has its directory here.
+/// Whether what Git is configured to do with files applies here: Git shares the directory, or
+/// the workspace is one `nv git` answers for, where the user's own configuration is Git's to them.
+pub fn as_git(root: &Path) -> bool {
+  shared(root) || root.join(".nv").join("git-head").exists()
+}
+
 pub fn shared(root: &Path) -> bool {
   root.join(".git").is_dir()
 }
@@ -164,6 +170,7 @@ fn busy(root: &Path) -> Option<&'static str> {
     ("rebase-apply", "a rebase"),
     ("CHERRY_PICK_HEAD", "a cherry-pick"),
     ("REVERT_HEAD", "a revert"),
+    ("BISECT_LOG", "a bisect"),
   ]
   .into_iter()
   .find(|(file, _)| dir.join(file).exists())
@@ -178,6 +185,9 @@ fn mirror(store: &mut Store, ws: &Workspace, was: Option<Id>) -> Result<()> {
   if let Some(what) = busy(&ws.root) {
     return Err(format!("Git is in the middle of {what}: finish or abort it with Git, and Git will be brought along then"));
   }
+  // Git's history holds every version of every file; what came from a server came with the
+  // latest only. The rest is fetched before Git is written to.
+  crate::remote::fetch_for_export(store, ws)?;
   // `HEAD` is the branch Git is on, or HEAD itself when it is on none.
   let (oid, _) = crate::git::export(store, &head, &ws.root, "HEAD")?;
   match was.filter(|was| *was != head) {
@@ -235,6 +245,8 @@ fn move_to(store: &mut Store, ws: &mut Workspace, target: Option<Id>) -> Result<
 /// Nothing is changed: the next command of nv's that needs to catches up.
 pub fn check(root: &Path) -> Result<(i32, String)> {
   let ws = Workspace::open(root)?;
+  // The directory given may be inside the workspace: it is the workspace's top that Git has or has not.
+  let root = ws.root.as_path();
   if !shared(root) {
     return Ok((0, "no Git repository here: nothing to be out of step with".into()));
   }
@@ -277,6 +289,7 @@ fn take_in(store: &mut Store, root: &Path, oid: &str) -> Result<Id> {
 /// was. Nothing either side committed is dropped. Every command of nv's
 /// that builds on where the workspace stands does this first.
 pub fn follow(store: &mut Store, ws: &mut Workspace) -> Result<Option<String>> {
+  repair(&ws.root)?;
   let Some(state) = drift(ws) else { return Ok(None) };
   let root = ws.root.clone();
   let (branch, _) = git_head(&root);
@@ -299,6 +312,16 @@ pub fn follow(store: &mut Store, ws: &mut Workspace) -> Result<Option<String>> {
         crate::git::export(store, &mine, &root, &name)?;
         kept = Some(name);
       }
+      // What nv had recorded and not published is, from here on, a difference between the files
+      // and Git's commit like any other. A command that trusts reported writes has to be told
+      // of those paths again, or it would never look at them.
+      if ws.head != ws.base {
+        let root_of = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+        let (from, to) = (root_of(store, ws.base)?, root_of(store, ws.head)?);
+        for (path, _) in crate::manifest::diff(store, from, to)? {
+          let _ = ws.record(&path);
+        }
+      }
       // Git wrote the files as it moved, so only what nv believes has to change.
       move_to(store, ws, id)?;
       store.flush()?;
@@ -315,6 +338,8 @@ pub fn follow(store: &mut Store, ws: &mut Workspace) -> Result<Option<String>> {
 /// `follow`, as a command: the exit code says whether they are in step now.
 pub fn reconcile(root: &Path) -> Result<(i32, String)> {
   let mut ws = Workspace::open(root)?;
+  let top = ws.root.clone();
+  let root = top.as_path();
   if !shared(root) {
     return Err("there is no Git repository in this directory".into());
   }
@@ -344,6 +369,26 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   if ws.head == ws.base {
     return Ok(None);
   }
+  // A file nv has recorded and that is no longer there, its going not looked at (nobody
+  // reported it): Git cannot add what is not there. Its path is looked at now.
+  {
+    let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+    let (from, to) = (tree(store, ws.base)?, tree(store, ws.head)?);
+    let gone: Vec<Vec<u8>> = crate::manifest::diff(store, from, to)?
+      .into_iter()
+      .filter(|(path, entry)| {
+        entry.is_some_and(|e| !e.is_dir()) && std::fs::symlink_metadata(ws.root.join(workspace::to_path(path))).is_err()
+      })
+      .map(|(path, _)| path)
+      .collect();
+    if !gone.is_empty() {
+      ws.note(&gone)?;
+      workspace::snapshot(store, ws, author, Look::Recorded)?;
+      if ws.head == ws.base {
+        return Ok(None);
+      }
+    }
+  }
   let root = |store: &mut Store, id: Option<Id>| match id {
     Some(id) => root_of(store, &id),
     None => Ok(None),
@@ -358,9 +403,40 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   }
   let dir = ws.root.clone();
   let listed = |paths: &[&Vec<u8>]| -> Vec<u8> { paths.iter().flat_map(|path| git_name(&dir, path).into_iter().chain([0])).collect() };
-  let with_paths = |args: &[&str], paths: &[u8]| -> Result<std::process::Output> {
+  let said = |out: &std::process::Output| {
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_string()
+  };
+
+  // The commit is built in an index of nv's own, a copy of Git's: Git's index is not touched until
+  // a commit has come of this, and then only to be brought up to it. A process killed at any point,
+  // and the Git it started going on without it, leave the user's staging exactly the user's.
+  // A commit an earlier publishing started, and did not live to see made, is waited for: one at a time.
+  drop(step_lock(&dir, true));
+  repair(&dir)?;
+  let index = dir.join(".git").join("index");
+  // By its whole path: Git is started inside the directory, and would read a relative one from there.
+  // Under a name of this command's own: a Git that an earlier, killed publishing started may still
+  // be writing the index that one built.
+  let nv_dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?.join(".nv");
+  for left in std::fs::read_dir(&nv_dir).into_iter().flatten().flatten() {
+    if left.file_name().to_string_lossy().starts_with("git-index-publishing") {
+      let _ = std::fs::remove_file(left.path());
+    }
+  }
+  let own = nv_dir.join(format!("git-index-publishing.{}", std::process::id()));
+  let fail = |what: &str, e: std::io::Error| format!("cannot {what} {}: {e}", own.display());
+  match std::fs::copy(&index, &own) {
+    Ok(_) => {}
+    // No index yet: a repository nothing was ever added in.
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+      let _ = std::fs::remove_file(&own);
+    }
+    Err(e) => return Err(fail("write", e)),
+  }
+  let with_own = |args: &[&str], paths: &[u8]| -> Result<std::process::Output> {
     let mut child = git(&dir)
       .env("GIT_LITERAL_PATHSPECS", "1")
+      .env("GIT_INDEX_FILE", &own)
       .args(args)
       .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
       .stdin(std::process::Stdio::piped())
@@ -371,53 +447,130 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
     child.stdin.take().expect("piped").write_all(paths).map_err(|e| e.to_string())?;
     child.wait_with_output().map_err(|e| e.to_string())
   };
-  let said = |out: &std::process::Output| {
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_string()
-  };
-
-  // Git's index as it is now, to put back should no commit come of this.
-  let (index, kept) = (dir.join(".git").join("index"), meta(&dir, "git-index-before"));
-  let had_index = std::fs::copy(&index, &kept).is_ok();
-  let put_back = || {
-    if had_index && !dir.join(".git").join("index.lock").exists() {
-      let _ = std::fs::rename(&kept, &index);
-    }
-  };
   // Whether the user has anything staged of their own. If not, the commit is the plain one, of the
   // whole index: a hook that changes a file and adds it again then leaves the index as the commit.
   let only_ours = git(&dir).args(["diff", "--cached", "--quiet"]).status().is_ok_and(|status| status.success());
+  // A file the user has staged in part is two decisions in one file: which lines go in is theirs
+  // to say, and committing the whole file, or only what they staged, would each unsay one of them.
+  if !only_ours {
+    let names = |args: &[&str]| -> Result<std::collections::HashSet<Vec<u8>>> {
+      let out = git(&dir).args(args).output().map_err(|e| format!("cannot run git: {e}"))?;
+      Ok(out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec).collect())
+    };
+    let (staged, unstaged) = (names(&["diff", "--cached", "--name-only", "-z"])?, names(&["diff", "--name-only", "-z"])?);
+    let partly: Vec<String> = changed
+      .iter()
+      .map(|(path, _)| git_name(&dir, path))
+      .filter(|path| staged.contains(path) && unstaged.contains(path))
+      .map(|path| String::from_utf8_lossy(&path).into_owned())
+      .collect();
+    if !partly.is_empty() {
+      return Err(format!(
+        "these are staged in part in Git's index, and the rest of each is not: {}\nCommit them with Git, or stage or unstage each as a whole, and `nv commit` again. Nothing was touched.",
+        partly.join(", ")
+      ));
+    }
+  }
 
-  // A path that is gone from the disk and that Git's index does not have either (the user removed
-  // it with Git already) is nothing to add.
-  let gone: Vec<&Vec<u8>> = changed.iter().filter(|(_, entry)| entry.is_none()).map(|(path, _)| path).collect();
+  // What Git's index has of the paths that changed. A path gone from the disk that the index does
+  // not have either (the user removed it with Git already) is nothing to add.
   let mut in_index = std::collections::HashSet::new();
-  if !gone.is_empty() {
-    let known = with_paths(&["ls-files", "-z"], &listed(&gone))?;
+  // `ls-files` reads no list of paths from a file: they are given as arguments, some at a time.
+  for some in changed.chunks(256) {
+    let names: Vec<std::ffi::OsString> =
+      some.iter().map(|(path, _)| <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(git_name(&dir, path))).collect();
+    let known = git(&dir)
+      .env("GIT_LITERAL_PATHSPECS", "1")
+      .args(["ls-files", "-z", "--"])
+      .args(&names)
+      .output()
+      .map_err(|e| format!("cannot run git: {e}"))?;
+    if !known.status.success() {
+      return Err(format!("Git would not say what its index has:\n{}", said(&known)));
+    }
     in_index.extend(known.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec));
+  }
+  // A file Git does not track and its rules leave out is not committed, though nv has it recorded:
+  // the user took it out of Git and wrote the rule since.
+  let unknown: Vec<Vec<u8>> = changed
+    .iter()
+    .filter(|(_, entry)| entry.is_some())
+    .map(|(path, _)| git_name(&dir, path))
+    .filter(|path| !in_index.contains(path))
+    .collect();
+  let mut left_out = std::collections::HashSet::new();
+  if !unknown.is_empty() {
+    let mut child = git(&dir)
+      .args(["check-ignore", "-z", "--stdin"])
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .map_err(|e| format!("cannot run git: {e}"))?;
+    let listing: Vec<u8> = unknown.iter().flat_map(|path| path.iter().copied().chain([0])).collect();
+    child.stdin.take().expect("piped").write_all(&listing).map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    left_out.extend(out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec));
+  }
+  let changed: Vec<&(Vec<u8>, Option<crate::manifest::Entry>)> =
+    changed.iter().filter(|(path, _)| !left_out.contains(&git_name(&dir, path))).collect();
+  if changed.is_empty() {
+    return Ok(None);
   }
   let to_add: Vec<&Vec<u8>> =
     changed.iter().filter(|(path, entry)| entry.is_some() || in_index.contains(&git_name(&dir, path))).map(|(path, _)| path).collect();
-  // Staged first and committed after. Git's partial commit works on a copy of the index and
-  // brings the real one up to date last; a process killed in between would leave the index
-  // behind the commit. With the content staged already, the two agree whenever that happens.
+  let all: Vec<&Vec<u8>> = changed.iter().map(|(path, _)| path).collect();
+  let (_, before) = git_head(&dir);
+  let before_text = before.clone().unwrap_or_else(|| "-".to_string());
+  // What is about to be committed, on what, and whether all of the index is nv's to bring up to
+  // the commit: should nobody live to do that, the next command does, from this.
+  let mut note = format!("{before_text} {} {}\n", if only_ours { "all" } else { "some" }, hex(message.trim().as_bytes())).into_bytes();
+  note.extend(
+    std::fs::read(meta(&dir, "git-publishing"))
+      .ok()
+      .filter(|was| was.starts_with(before_text.as_bytes()))
+      .and_then(|was| was.splitn(2, |&b| b == b'\n').nth(1).map(<[u8]>::to_vec))
+      .unwrap_or_default(),
+  );
+  note.extend(listed(&all));
+  crate::write_whole(&meta(&dir, "git-publishing"), note)?;
   if !to_add.is_empty() {
-    let added = with_paths(&["add", "-A", "--ignore-errors"], &listed(&to_add))?;
+    let added = with_own(&["add", "-A", "--ignore-errors"], &listed(&to_add))?;
     // A path Git ignores is not an error here: it is simply not committed.
     if !added.status.success() && !said(&added).contains("ignored by one of your .gitignore files") {
-      put_back();
+      let _ = std::fs::remove_file(meta(&dir, "git-publishing"));
+      let _ = std::fs::remove_file(&own);
       return Err(format!("Git would not add the changes, and its index is as it was:\n{}", said(&added)));
     }
   }
-  let (_, before) = git_head(&dir);
-  let committed = if only_ours {
-    git(&dir).args(["commit", "-q", "-m", message]).output().map_err(|e| format!("cannot run git: {e}"))?
-  } else {
-    let all: Vec<&Vec<u8>> = changed.iter().map(|(path, _)| path).collect();
-    with_paths(&["commit", "-q", "-m", message, "--only"], &listed(&all))?
+  // The commit, and Git's index brought up to it, are made by a process of their own, in a session
+  // of its own: whoever kills this command (a tool's time limit) does not leave a commit made and
+  // an index that has not heard of it.
+  let committed = {
+    use std::os::unix::process::CommandExt;
+    let mut step = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    step
+      .arg("publish-step")
+      .arg(std::fs::canonicalize(&dir).map_err(|e| e.to_string())?)
+      .arg(&own)
+      .arg(if only_ours { "all" } else { "some" })
+      .arg(&before_text)
+      .arg(message)
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::piped());
+    // SAFETY: `setsid` is safe to call between fork and exec.
+    unsafe { step.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+    let mut child = step.spawn().map_err(|e| format!("cannot start the commit: {e}"))?;
+    child.stdin.take().expect("piped").write_all(&listed(&all)).map_err(|e| e.to_string())?;
+    child.wait_with_output().map_err(|e| e.to_string())?
   };
   let (branch, after) = git_head(&dir);
   if after == before {
-    put_back();
+    // No commit came, and the step that could have made one has ended: nothing is half done, and
+    // a note left here would be read, after a commit of the user's own, as nv's to finish.
+    let _ = std::fs::remove_file(meta(&dir, "git-publishing"));
+    let _ = std::fs::remove_file(&own);
     // Git found nothing in those paths to commit, or one of its hooks said no.
     if committed.status.success()
       || said(&committed).contains("nothing to commit")
@@ -427,7 +580,7 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
     }
     return Err(format!("Git did not make the commit. Nothing recorded was lost, and Git's index is as it was:\n{}", said(&committed)));
   }
-  let _ = std::fs::remove_file(&kept);
+  repair(&dir)?;
   let oid = after.ok_or("Git has no commit after committing")?;
   let id = take_in(store, &dir, &oid)?;
   move_to(store, ws, Some(id))?;
@@ -435,6 +588,123 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   write_point(&dir, &Point { git: Some(oid.clone()), branch, nv: Some(id) })?;
   ws.log("commit", &id)?;
   Ok(Some(oid))
+}
+
+/// The lock the committing step of a publishing holds while it lives.
+fn step_lock(root: &Path, wait: bool) -> Option<std::fs::File> {
+  use std::os::fd::AsRawFd;
+  let file = std::fs::File::options().create(true).append(true).open(meta(root, "publishing.lock")).ok()?;
+  if wait {
+    // A publishing still making its commit is waited for, as long as a lock is.
+    return crate::limits::lock(&file, "an earlier publishing's commit").ok().map(|()| file);
+  }
+  // SAFETY: the descriptor is open for as long as `file` is.
+  (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(file)
+}
+
+/// The step of publishing that must not be left half done: Git's commit, from the index nv built
+/// for it, and then Git's own index brought up to that commit. Run as a process of its own; the
+/// paths committed come on its input when only some of the index is nv's.
+pub fn publish_step(args: &[String]) -> i32 {
+  let [dir, own, how, before, message] = args else { return 2 };
+  let (dir, own) = (Path::new(dir), Path::new(own));
+  // Held for as long as this step lives: the next publishing waits for it.
+  let _held = step_lock(dir, true);
+  let mut commit = git(dir);
+  // A hook of this commit that runs nv on this workspace is told so, instead of waiting for ever
+  // for the lock this publishing holds.
+  commit.env("GIT_INDEX_FILE", own).env("NV_PUBLISHING", dir).args(["commit", "-q", "-m", message]);
+  if how != "all" {
+    commit.env("GIT_LITERAL_PATHSPECS", "1").args(["--only", "--pathspec-from-file=-", "--pathspec-file-nul"]);
+  } else {
+    commit.stdin(std::process::Stdio::null());
+  }
+  // Git's hooks are the user's programs: one that does not return is stopped, with Git, after a while.
+  let code = match crate::limits::run(&mut commit, crate::limits::git_commit(), "Git's commit, hooks included") {
+    Ok(status) => status.code().unwrap_or(2),
+    Err(why) => {
+      eprintln!("{why}");
+      2
+    }
+  };
+  let (_, after) = git_head(dir);
+  if after.as_deref().unwrap_or("-") != before {
+    // All of the index was nv's to commit: the one the commit was made from is the index now.
+    if how == "all" && own.exists() && std::fs::rename(own, dir.join(".git").join("index")).is_ok() {
+      let _ = std::fs::remove_file(meta(dir, "git-publishing"));
+    } else {
+      // This step made the commit (HEAD moved while it ran, from the commit it was told of): it is
+      // nv's, whatever a hook did to its message.
+      let _ = bring_index_up(dir, true);
+      let _ = std::fs::remove_file(own);
+    }
+  }
+  code
+}
+
+/// Bring Git's index up to a commit that nv published and did not live to bring it up to: for the
+/// paths that were being committed, the index gets what the commit has. Nothing to do when no
+/// publishing was cut short, or when no commit came of the one that was.
+fn repair(root: &Path) -> Result<()> {
+  bring_index_up(root, false)
+}
+
+/// `repair`; with `ours`, the caller knows the commit Git is on to be the one nv's publishing made.
+fn bring_index_up(root: &Path, ours: bool) -> Result<()> {
+  let note = meta(root, "git-publishing");
+  let Ok(bytes) = std::fs::read(&note) else { return Ok(()) };
+  let mut parts = bytes.splitn(2, |&b| b == b'\n');
+  let first = parts.next().map(|line| String::from_utf8_lossy(line).into_owned()).unwrap_or_default();
+  let mut words = first.split(' ');
+  let (before, how, said) = (words.next().unwrap_or_default(), words.next().unwrap_or("some"), words.next().unwrap_or_default());
+  // When all of the index was nv's to commit, all of it is brought up to the commit: a hook may
+  // have added paths of its own to what was committed.
+  let paths: &[u8] = if how == "all" { b"" } else { parts.next().unwrap_or_default() };
+  let whole = how == "all";
+  let (_, now) = git_head(root);
+  // Whether a committing step is still alive: only one of those can still make the commit.
+  let idle = step_lock(root, false).is_some();
+  // Git's HEAD has not moved: no commit was made. While a step lives the note stays, for the
+  // commit that may still come; with none alive there is nothing left to come.
+  if now.as_deref().unwrap_or("-") == before {
+    if idle {
+      let _ = std::fs::remove_file(&note);
+    }
+    return Ok(());
+  }
+  // Git's HEAD moved, and not by a commit made on where it was: the user moved it (a reset, a
+  // switch). Nothing of nv's is half done, and the index is the user's.
+  let parent = git(root).args(["rev-parse", "--verify", "-q", "HEAD^"]).output().map_err(|e| format!("cannot run git: {e}"))?;
+  // Otherwise nv's commit is known by its message: as nv gave it, or with what a hook added after it.
+  let message = git(root).args(["log", "-1", "--format=%B"]).output().map_err(|e| format!("cannot run git: {e}"))?;
+  let given = unhex(said).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+  let ours =
+    ours || said.is_empty() || given.is_some_and(|given| String::from_utf8_lossy(&message.stdout).trim().starts_with(given.as_str()));
+  if !ours || (String::from_utf8_lossy(&parent.stdout).trim() != before && !(before == "-" && !parent.status.success())) {
+    if idle {
+      let _ = std::fs::remove_file(&note);
+    }
+    return Ok(());
+  }
+  if root.join(".git").join("index.lock").exists() {
+    return Ok(());
+  }
+  if whole {
+    let _ = git(root).args(["reset", "-q"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+  } else if !paths.is_empty() {
+    let mut child = git(root)
+      .env("GIT_LITERAL_PATHSPECS", "1")
+      .args(["reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"])
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .map_err(|e| format!("cannot run git: {e}"))?;
+    child.stdin.take().expect("piped").write_all(paths).map_err(|e| e.to_string())?;
+    child.wait().map_err(|e| e.to_string())?;
+  }
+  let _ = std::fs::remove_file(note);
+  Ok(())
 }
 
 /// A path as Git names it. On macOS Git composes the characters of a name
@@ -463,6 +733,22 @@ pub fn published(store: &mut Store, ws: &Workspace) -> Result<()> {
   Ok(())
 }
 
+/// The paths Git has in its index and keeps out of the working tree on purpose (a sparse
+/// checkout, `skip-worktree`): absent from the disk, and not removed. `None` where Git is
+/// not asked to keep anything out, which is nearly everywhere, and then no process is started.
+pub fn kept_out(root: &Path) -> Option<std::collections::HashSet<Vec<u8>>> {
+  if !shared(root) {
+    return None;
+  }
+  let sparse = root.join(".git").join("info").join("sparse-checkout").is_file()
+    || crate::git::config_value(root, "core", "sparsecheckout").is_some_and(|value| value == "true");
+  if !sparse {
+    return None;
+  }
+  let out = git(root).args(["ls-files", "-t", "-z"]).output().ok()?;
+  Some(out.stdout.split(|&b| b == 0).filter_map(|line| line.strip_prefix(b"S ")).map(<[u8]>::to_vec).collect())
+}
+
 const EXCLUDED: &str = ".nv/";
 
 /// Make an nv workspace of a Git repository's directory, in place: the
@@ -472,10 +758,32 @@ pub fn adopt(root: &Path) -> Result<String> {
   if !shared(root) {
     return Err(format!("{} is not the top of a Git repository", root.display()));
   }
-  if meta(root, "workspace").exists() {
+  // An adoption that was cut short is finished here; one that was finished is not done twice.
+  if meta(root, "workspace").exists() && read_point(root).is_some() {
     return Err("this directory is an nv workspace already: `nv check .` says how it stands with Git".into());
   }
-  let mut ws = workspace::init(root)?;
+  // First of all, Git is told not to see nv's directory: whatever happens next, `git add -A` must not take it.
+  let exclude = root.join(".git").join("info").join("exclude");
+  let listed = std::fs::read_to_string(&exclude).unwrap_or_default();
+  // How the file was found, so that taking nv out again can leave it exactly so.
+  let mut found = None;
+  if !listed.lines().any(|line| line.trim() == EXCLUDED) {
+    let info = exclude.parent().expect("in .git");
+    found = Some(match (info.is_dir(), exclude.exists()) {
+      (false, _) => "no directory".to_string(),
+      (true, false) => "no file".to_string(),
+      (true, true) => format!("{} bytes", listed.len()),
+    });
+    std::fs::create_dir_all(info).map_err(|e| e.to_string())?;
+    let sep = if listed.is_empty() || listed.ends_with('\n') { "" } else { "\n" };
+    crate::write_whole(&exclude, format!("{listed}{sep}{EXCLUDED}\n"))?;
+  } else if !meta(root, "workspace").exists() {
+    found = Some("the line was there".to_string());
+  }
+  let mut ws = if meta(root, "workspace").exists() { Workspace::open(root)? } else { workspace::init(root)? };
+  if let Some(found) = found {
+    crate::write_whole(&meta(root, "git-exclude-before"), found)?;
+  }
   let mut store = Store::open(&ws.store)?;
   let (branch, oid) = git_head(root);
   // The commit Git is on, and what is behind it. The rest is taken in when Git goes there.
@@ -487,14 +795,6 @@ pub fn adopt(root: &Path) -> Result<String> {
   ws.start = head;
   ws.save()?;
   store.flush()?;
-  // Git should not see nv's directory as something to add.
-  let exclude = root.join(".git").join("info").join("exclude");
-  let listed = std::fs::read_to_string(&exclude).unwrap_or_default();
-  if !listed.lines().any(|line| line.trim() == EXCLUDED) {
-    std::fs::create_dir_all(exclude.parent().expect("in .git")).map_err(|e| e.to_string())?;
-    let sep = if listed.is_empty() || listed.ends_with('\n') { "" } else { "\n" };
-    crate::write_whole(&exclude, format!("{listed}{sep}{EXCLUDED}\n"))?;
-  }
   write_point(root, &Point { git: oid, branch: branch.clone(), nv: head })?;
   // One look at every file, so that the next is as quick as any.
   let (differences, looked) = workspace::status(&ws, Look::Everywhere)?;
@@ -515,8 +815,27 @@ pub fn unadopt(root: &Path) -> Result<String> {
   let _ = crate::watch::stop(root);
   let exclude = root.join(".git").join("info").join("exclude");
   if let Ok(listed) = std::fs::read_to_string(&exclude) {
-    let kept: String = listed.lines().filter(|line| line.trim() != EXCLUDED).map(|line| format!("{line}\n")).collect();
-    crate::write_whole(&exclude, kept)?;
+    let found = std::fs::read_to_string(meta(root, "git-exclude-before")).unwrap_or_default();
+    let ours = format!("{EXCLUDED}\n");
+    // As it was found, to the byte, when nothing but nv's line was added since.
+    let before = found
+      .strip_suffix(" bytes")
+      .and_then(|n| n.parse::<usize>().ok())
+      .filter(|n| listed.get(*n..).is_some_and(|added| added == ours || added.strip_prefix('\n') == Some(ours.as_str())));
+    match (found.as_str(), before) {
+      ("the line was there", _) => {}
+      (_, Some(length)) => crate::write_whole(&exclude, &listed[..length])?,
+      ("no file" | "no directory", _) if listed == ours => {
+        let _ = std::fs::remove_file(&exclude);
+        if found == "no directory" {
+          let _ = std::fs::remove_dir(exclude.parent().expect("in .git"));
+        }
+      }
+      _ => {
+        let kept: String = listed.lines().filter(|line| line.trim() != EXCLUDED).map(|line| format!("{line}\n")).collect();
+        crate::write_whole(&exclude, kept)?;
+      }
+    }
   }
   std::fs::remove_dir_all(root.join(".nv")).map_err(|e| format!("cannot remove {}: {e}", root.join(".nv").display()))?;
   Ok("nv is out of this directory: the files and the Git repository are as they were, and what nv had recorded is gone".into())

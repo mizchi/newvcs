@@ -80,7 +80,7 @@ pub struct Eols {
 /// What `core.autocrlf` of the Git repository in `root`, if there is one, makes of a file with no rule.
 fn configured(root: &Path) -> How {
   static KNOWN: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, How>>> = std::sync::OnceLock::new();
-  if !crate::colocated::shared(root) {
+  if !crate::colocated::as_git(root) {
     return How::AsIs;
   }
   let mut known = KNOWN.get_or_init(Default::default).lock().expect("not poisoned");

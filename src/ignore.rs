@@ -17,6 +17,20 @@ use crate::workspace::to_path;
 pub struct Ignores {
   root: PathBuf,
   search: gix_ignore::Search,
+  /// As Git matches them where it shares the directory (`core.ignorecase`), or, with no Git, as
+  /// the file system tells names apart: on one that does not, `Secret.env` is the file `secret.env`.
+  case: Case,
+}
+
+/// How names are matched against rules in this workspace.
+fn case_of(root: &Path) -> Case {
+  let folds = if crate::colocated::shared(root) {
+    crate::git::config_value(root, "core", "ignorecase").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+  } else {
+    // The workspace's own directory, asked for in capitals.
+    root.join(crate::workspace::META.to_ascii_uppercase()).join("workspace").is_file()
+  };
+  if folds { Case::Fold } else { Case::Sensitive }
 }
 
 impl Ignores {
@@ -24,7 +38,7 @@ impl Ignores {
     let mut search = gix_ignore::Search::default();
     // Beside a Git repository, what Git leaves out is left out here: the user's file for
     // every repository, then this clone's own. A `.gitignore` in the tree outranks both.
-    if crate::colocated::shared(root) {
+    if crate::colocated::as_git(root) {
       let files = crate::git::global_excludes(root).into_iter().chain([root.join(".git").join("info").join("exclude")]);
       for file in files {
         if let Ok(bytes) = std::fs::read(&file) {
@@ -35,7 +49,7 @@ impl Ignores {
     if let Ok(bytes) = std::fs::read(root.join(crate::workspace::META).join("exclude")) {
       let _ = search.add_patterns_buffer(&bytes, root.join(".nv/exclude"), None, Ignore::default());
     }
-    Ignores { root: root.to_path_buf(), search }
+    Ignores { root: root.to_path_buf(), search, case: case_of(root) }
   }
 
   /// Take in the `.gitignore` of a directory being entered. Whether there
@@ -53,10 +67,7 @@ impl Ignores {
   /// Whether the rules taken in so far ignore this path. The last rule that
   /// matches decides, and a `!` rule decides against.
   pub fn ignored(&self, path: &[u8], is_dir: bool) -> bool {
-    self
-      .search
-      .pattern_matching_relative_path(path.as_bstr(), Some(is_dir), Case::Sensitive)
-      .is_some_and(|found| !found.pattern.is_negative())
+    self.search.pattern_matching_relative_path(path.as_bstr(), Some(is_dir), self.case).is_some_and(|found| !found.pattern.is_negative())
   }
 }
 
@@ -97,7 +108,8 @@ impl Checker {
 pub fn is_ignored(root: &Path, path: &[u8]) -> bool {
   let mut ignores = Ignores::new(root);
   ignores.enter(b"");
-  let is_dir = root.join(to_path(path)).is_dir();
+  // A link to a directory is a link: a rule for directories does not speak of it.
+  let is_dir = std::fs::symlink_metadata(root.join(to_path(path))).is_ok_and(|meta| meta.is_dir());
   for (at, _) in path.iter().enumerate().filter(|(_, b)| **b == b'/') {
     if ignores.ignored(&path[..at], true) {
       return true;

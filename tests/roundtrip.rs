@@ -1,5 +1,7 @@
 //! End to end against a real Git repository built in a temporary directory.
 
+mod common;
+
 use newvcs::store::Store;
 use newvcs::workspace::{self, Look, Workspace};
 use newvcs::{git, hex};
@@ -7,18 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn sh(dir: &Path, script: &str) -> String {
-  let out = Command::new("sh")
-    .arg("-ec")
-    .arg(script)
-    .current_dir(dir)
-    .env("GIT_AUTHOR_NAME", "a")
-    .env("GIT_AUTHOR_EMAIL", "a@example.com")
-    .env("GIT_COMMITTER_NAME", "c")
-    .env("GIT_COMMITTER_EMAIL", "c@example.com")
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_SYSTEM", "/dev/null")
-    .output()
-    .unwrap();
+  let out = common::bounded(
+    Command::new("sh")
+      .arg("-ec")
+      .arg(script)
+      .current_dir(dir)
+      .env("GIT_AUTHOR_NAME", "a")
+      .env("GIT_AUTHOR_EMAIL", "a@example.com")
+      .env("GIT_COMMITTER_NAME", "c")
+      .env("GIT_COMMITTER_EMAIL", "c@example.com")
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null"),
+  );
   assert!(out.status.success(), "{script}\n{}", String::from_utf8_lossy(&out.stderr));
   String::from_utf8(out.stdout).unwrap()
 }

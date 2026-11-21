@@ -7,31 +7,40 @@
 // - repositories: the same writers spread over more repositories, each with
 //   its own Durable Object.
 
-import { encode, idOf, unhex, type Commit } from "../src/commit.ts";
+import { blobIdOf, encode, unhex, type Commit } from "../src/commit.ts";
 
 const server = process.env.NV_SERVER ?? "http://localhost:8799";
 const run = `t/bench-${Date.now()}`;
 const text = (s: string) => new TextEncoder().encode(s);
 /// A push is frames, each a length and bytes: the commit, then the contents it names.
-function frame(bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(4 + bytes.length);
-  new DataView(out.buffer).setUint32(0, bytes.length, true);
-  out.set(bytes, 4);
+function frame(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, part) => n + 4 + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    new DataView(out.buffer).setUint32(at, part.length, true);
+    out.set(part, at + 4);
+    at += 4 + part.length;
+  }
   return out;
 }
 let serial = 0;
+/// The contents each commit names: a commit is not taken without them.
+const contents = new WeakMap<Uint8Array, Uint8Array[]>();
 
 function commit(parent: string | null, paths: string[]): Uint8Array {
+  const files = paths.map((path) => text(`${path}#${serial++}`));
   const c: Commit = {
     parents: parent ? [unhex(parent)] : [],
     rest: text("author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nbench\n"),
-    changes: paths.map((path) => ({ path: text(path), entry: { mode: 0o100644, id: idOf(text(`${path}#${serial++}`)) } })),
+    changes: paths.map((path, i) => ({ path: text(path), entry: { mode: 0o100644, id: blobIdOf(files[i]!) } })),
   };
-  return encode(c);
+  const bytes = encode(c);
+  contents.set(bytes, files);
+  return bytes;
 }
 
 async function push(repo: string, bytes: Uint8Array): Promise<{ status: string; commit: string }> {
-  return (await (await fetch(`${server}/${repo}/push/main`, { method: "POST", body: frame(bytes) })).json()) as { status: string; commit: string };
+  return (await (await fetch(`${server}/${repo}/push/main`, { method: "POST", body: frame(bytes, ...(contents.get(bytes) ?? [])) })).json()) as { status: string; commit: string };
 }
 
 const median = (xs: number[]) => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;

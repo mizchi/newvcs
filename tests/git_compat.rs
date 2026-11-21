@@ -2,6 +2,8 @@
 //! The cases, the list of them and the list of commands that must be refused
 //! are plain files; `tools/git-compat.sh` is the runner and prints the table.
 
+mod common;
+
 use std::process::Command;
 
 #[test]
@@ -34,7 +36,8 @@ fn fsck_finds_an_object_that_is_not_what_its_name_says() {
   let git = |args: &[&str]| {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nv"));
     command.arg("git").args(args).current_dir(&dir).env("GIT_AUTHOR_NAME", "a").env("GIT_AUTHOR_EMAIL", "a@example.com");
-    command.env("GIT_COMMITTER_NAME", "c").env("GIT_COMMITTER_EMAIL", "c@example.com").output().unwrap()
+    command.env("GIT_COMMITTER_NAME", "c").env("GIT_COMMITTER_EMAIL", "c@example.com");
+    common::bounded(&mut command)
   };
   assert!(git(&["init", "-q", "-b", "main"]).status.success());
   let text: String = (0..400u32).map(|i| format!("line {i} of a file\n")).collect();

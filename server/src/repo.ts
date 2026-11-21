@@ -24,7 +24,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { decode, encode, hex, idOf } from "./commit.ts";
-import { MODE_DIR } from "./tree.ts";
+import { MODE_DIR, MODE_GITLINK } from "./tree.ts";
 
 export type Step = { seq: number; id: string; bytes: Uint8Array };
 /// Where a file's content is in the bucket: at `at` in the pack `pack`, or
@@ -49,6 +49,7 @@ export class Repo extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS divergent (ref TEXT NOT NULL, id BLOB NOT NULL, onto BLOB NOT NULL, paths TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS landed (ref TEXT NOT NULL, sent BLOB NOT NULL, landed BLOB NOT NULL, moved INTEGER NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS placed (id BLOB PRIMARY KEY, pack BLOB, at INTEGER NOT NULL, length INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS trees (id BLOB PRIMARY KEY) WITHOUT ROWID;
     `);
   }
 
@@ -105,7 +106,15 @@ export class Repo extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => {
       // The contents are in the bucket already. Whatever becomes of the commits, the repository has them.
       this.place(contents);
-      if (this.where(dirs).length !== dirs.length) throw new Error("the commit sets a directory this repository was not handed");
+      if (this.where(dirs).length !== dirs.length || this.trees(dirs).size !== new Set(dirs.map(hex)).size) {
+        throw new Error("the commit sets a directory this repository was not handed");
+      }
+      // Nor may a ref name contents nobody sent: whoever synced next could not, and nobody after them.
+      const files = commits.flatMap((commit) => commit.changes.flatMap((c) => (c.entry && c.entry.mode !== MODE_DIR && c.entry.mode !== MODE_GITLINK ? [c.entry.id] : [])));
+      const given = new Set(this.where(files).map((c) => hex(c.id)));
+      if (files.some((id) => !given.has(hex(id)))) throw new Error("the commit names contents this repository was not sent");
+      // A file is a file: a directory handed over is not a file's content.
+      if (this.trees(files).size > 0) throw new Error("the commit gives a file the id of a directory");
       const at = sql.exec<{ tip: ArrayBuffer; seq: number }>("SELECT tip, seq FROM refs WHERE name = ?", ref).toArray()[0];
       const tip = at ? new Uint8Array(at.tip) : null;
       const since = () => (after === null ? [] : this.steps(ref, after));
@@ -174,6 +183,18 @@ export class Repo extends DurableObject<Env> {
     for (const c of contents) {
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO placed (id, pack, at, length) VALUES (?, ?, ?, ?)", c.id, c.pack, c.at, c.length);
     }
+  }
+
+  /// Note that these objects are directories: handed over as trees, and read as trees.
+  markTrees(ids: Uint8Array[]): void {
+    for (const id of ids) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO trees (id) VALUES (?)", id);
+  }
+
+  /// Of these ids, the ones this repository was handed as directories.
+  trees(ids: Uint8Array[]): Set<string> {
+    const found = new Set<string>();
+    for (const id of ids) if (this.ctx.storage.sql.exec("SELECT 1 FROM trees WHERE id = ?", id).toArray().length > 0) found.add(hex(id));
+    return found;
   }
 
   /// Where each of these contents is, for those this repository has.

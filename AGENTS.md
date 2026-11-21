@@ -36,20 +36,21 @@ the README or undone. "Tree" means the files of one commit.
 | --- | --- | --- | --- |
 | `snapshot --recorded` | paths reported | tree size | 1.9 ms at 100,000 files |
 | The hook after a tool wrote a file | that file | tree size | 4.8 ms on oxc, process start included |
-| `restore`, `mark`, `since` with `--recorded` | paths that differ or were reported | tree size | 4–5 ms on oxc |
+| `restore`, `mark`, `since` with `--recorded` | paths that differ or were reported, and for a restore the bytes it writes | tree size | 5–6 ms on oxc |
 | The watcher | writes made | tree size, time spent idle | no CPU when idle; a write is a snapshot 40 ms later |
 | `commit` (publishing snapshots), no Git beside it | paths changed | tree size, history | 59 ms for 52 snapshots |
-| `commit` beside a Git repository | paths changed, and what `git add` and `git commit` of them cost | history | 74 ms on oxc with `--recorded`; Git's own commit is 30 ms |
+| `commit` beside a Git repository | paths changed, and what `git add` and `git commit` of them cost | history | 126 ms on oxc with `--recorded` (six Git commands, of which the commit is 35 ms); Git's own commit is 42 ms |
 | Following a move Git made on its own | commits and paths new to nv | history | 15 ms after one raw commit on oxc |
 | `git commit`, the index file (no Git beside it) | paths staged | tree size | 7.1 ms on oxc; an untouched index is an empty file |
 | `git add <path>` (no Git beside it) | what is at that path | tree size | 8.1 ms on oxc; Git takes 11 ms |
 | Git's id of an object | nothing | how many objects have one | 4.7 ms for `rev-parse HEAD` on oxc |
 | Checkout of a directory | files under it | tree size | 12.5 ms of 100,000 files |
-| Checkout of a tree seen before, `fork` | one directory clone | file count, to first order | 263 ms / 200 ms on oxc |
+| Checkout of a tree seen before | one directory clone | file count, to first order | 231 ms on oxc |
+| `fork` | one directory clone, and one look over the parent | bytes of the files | 277 ms on oxc |
 | Opening the store | nothing | store size | 5 ms on a 206 MB segment |
 | `status`, a snapshot with nothing reported | files walked | rules, attributes, store size | 40 ms on oxc on eight threads; Git takes 58 ms |
-| `--tracked`, `git diff`, `git commit -a` | files the index knows | untracked files, directories | 15–19 ms on oxc; Git takes 17–30 ms |
-| Server push | paths in the push | how far behind the pusher is, how many commits the push has | 3–5 ms |
+| `--tracked`, `git diff`, `git commit -a` | files the index knows, and one look at each of their directories | untracked files | 16–20 ms on oxc; Git takes 17–30 ms |
+| Server push | paths in the push | how far behind the pusher is, how many commits the push has | 4–6 ms with one content; 74 ms for 1,000 paths and their contents |
 | Writes to the bucket for a push | 1, and 1 for each large file | how many files the push has | 200 files: 1 write |
 | Linking a directory of another repository | nothing stored but one change | files and bytes of the directory | 464 bytes for 14,716 files, 119 MB |
 | Pushing a linked directory | its tree objects, and the files the server cannot find | bytes of files the repository it came from has | 833 ms for oxc, 1 content sent |
@@ -101,7 +102,32 @@ tracked asks about what is tracked.
   `--recorded` waits for a running watcher to have reported every write
   made before it, starts one that should be running and is not (which
   looks at every file once), and looks itself at any file it is about to
-  overwrite.
+  overwrite. A watcher that does not say it has caught up is not
+  believed: the command walks. Events the system dropped are a walk too.
+- **What comes from outside is checked where it comes in, all of it.** A
+  commit and a tree are each decoded in one place on each side, and there
+  every path and every entry name is held to what a tree may have: no
+  `..`, no absolute path, nothing a file system takes for `.git` or `.nv`,
+  nothing twice. A tree is checked as strictly as a commit: a directory
+  set whole is written where its names say. A server is not trusted to
+  have checked, nor a client. An object read from the store is hashed
+  before it is used. The server keeps what kind of object each id it was
+  handed is, and takes only one line of commits for a ref.
+- **nv removes only what it can give back.** A file it tracks is recorded
+  before it is written over. A file it does not track, or may not read,
+  is never removed or written over to make way: the command refuses and
+  names it, before it writes anything.
+- **What a workspace published is its own, wherever it is found.** On the
+  ref after a push it is not a change of someone else's to merge with;
+  the workspace's later edits stand on it. And a workspace stands on what
+  it last saw of the ref: moved elsewhere, it asks where it stands before
+  it compares anything.
+- **A watcher says it has caught up only when nothing more is coming.**
+  Cutting a long burst short to record what there is of it is not that.
+- **A copy on disk that is cloned without being read is checked some
+  other way.** A single file's is hashed first; a whole tree's by
+  `nv verify`. An index that travels with a copy is brought up to date
+  before the copy is made.
 - **Going back loses nothing.** `restore` records what is on disk before it
   overwrites a file, and the state left behind keeps its id.
 - **A workspace owns its files and shares the store.** Workspaces never
@@ -122,13 +148,49 @@ tracked asks about what is tracked.
   made it and whether it may be made are the only rules.
 - **nv keeps out of what Git is in the middle of, and leaves the user's
   staging the user's.** No publishing during a merge or rebase that
-  stopped. If no commit comes of publishing, Git's index is as it was
-  found, byte for byte.
+  stopped. The commit is built in an index of nv's own; Git's index is
+  touched only when a commit exists, and then by a process that outlives
+  the command that started it. If no commit comes of publishing, Git's
+  index was never changed.
+- **Nothing is written, removed or read beyond a link.** A path of the
+  tree is a path inside the workspace: a link standing where one of its
+  directories should be makes way, or the command refuses; a tracked file
+  beyond one is a file that is gone; a link at a file's own path is
+  removed, never followed.
+- **What was committed and what was not stay apart.** Catching up with a
+  ref merges this workspace's commits with the ref's, as committed, and
+  then puts what the files have become since on top, as changes still
+  uncommitted. Nothing uncommitted is merged into a commit.
+- **A command that changes files finds what is in its way before it
+  writes the first of them.** An untracked file under the name (to the
+  file system) of one to be written, a file where a directory has to be,
+  a directory that cannot be listed: named, and nothing touched.
+- **A reported path answers for what it held.** A directory reported as
+  one path when it became a file takes its files with it. A change to the
+  rules of what is left out is a reason to look at everything.
+- **Looking does not make nv forget.** A command that sets snapshots
+  aside to show them as Git would notes where they were, and nv's own
+  commands take them up again unchanged; one that follows a move of Git's
+  hands the paths they held back to the list of reported writes.
+- **A note of something half done does not outlive the doing.** What is
+  written down so that a killed command can be finished is removed when
+  the command ends without it, and is specific enough (which commit, with
+  which message) not to be taken for somebody else's work.
 - **Going back never undoes someone else's work unsaid.** Undoing a sync
   is `before-sync`, which also takes back what the workspace believes of
   the ref. A state from before the last sync is not somewhere `restore`
   goes: its files on top of the new commits would be a revert nobody asked
   for.
+- **Whether a file changed is the file system's word, all of it.** Size,
+  the time it was written, and the time the file system says it last
+  changed in any way. Two of the three can be put back after an edit; a
+  file is taken as unchanged only when all three are as the index has
+  them. A cheaper test that can be fooled is a way to lose an edit. An
+  index is about the files of the directory it was written in: in a copy
+  it says only that nothing changed before the copy was made.
+- **Nothing moves while a file is unsettled.** A sync that left a file
+  with both versions is followed by an edit and a commit, or by its
+  undoing; not by another sync or a push.
 - **A name is the file the file system says it is.** Where the file system
   does not tell two spellings apart (case, composed or decomposed
   characters), neither does nv, and neither does Git there. Removals are
@@ -142,6 +204,13 @@ tracked asks about what is tracked.
   beside it, where it answers itself). Exit 125 and "not supported", with
   the repository as it was. Never an approximation, and never a message
   dressed as one of Git's.
+- **Nothing waits without end.** A lock, a server, a Git hook, a command
+  as a whole: each wait has a limit (`src/limits.rs`), and reaching it is
+  an error that says what was waited for. A command that cannot have the
+  workspace's lock does not go ahead without it. A new wait goes through
+  `limits`, and a test starts no command it cannot stop: the tests run
+  their commands through `tests/common`, which stops one after five
+  minutes.
 - **A command given wrongly does nothing.** An option it does not take, an
   argument too many, a store that is not one: an error that says which,
   and no file created.
@@ -197,7 +266,7 @@ because the borrowed code is known to be good.
 - A new option goes into `SPOKEN` in `src/gitcli.rs` together with a case
   that fails first. Capture what Git prints before writing the code.
 - A difference someone finds becomes a line of a case before it is fixed.
-  Cases 22 and 23 are a reviewer's findings.
+  Cases 22 to 31 are reviewers' findings.
 
 ## How it is checked by someone else
 
@@ -207,8 +276,14 @@ and asked to find where it is slower than Git, where it is less safe, and
 where it is wrong. They are told that a reproduction of a failure is worth
 more than a confirmation. The first round found a lost update on the
 server, a store corrupted by two workspaces, a workspace emptied by a
-kill, and a hook that left Git half reset; none of the tests had. What
-they find is fixed with a test that fails first, and they are asked again.
+kill, and a hook that left Git half reset; none of the tests had. The
+fourth found a server that would hand a workspace a path outside itself.
+What they find is fixed with a test that fails first, and they are asked
+again. One of them is always given the server's address and nothing else,
+and told to send it what the client never would. From the seventh round
+on, the others write random testers with an oracle of their own (a model,
+or real Git in a twin directory) rather than scenarios: scenarios find
+what the reviewer thought of, and what is left is what nobody thought of.
 
 ## Working rules
 

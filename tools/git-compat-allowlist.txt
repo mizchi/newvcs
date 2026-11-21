@@ -24,3 +24,10 @@
 22-everyday-odds.sh
 23-smaller-odds.sh
 24-from-below-and-by-path.sh
+25-a-third-round.sh
+26-a-fourth-round.sh
+27-a-fifth-round.sh
+28-a-sixth-round.sh
+29-a-seventh-round.sh
+30-an-eighth-round.sh
+31-a-ninth-round.sh

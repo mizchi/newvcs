@@ -533,6 +533,12 @@ impl Store {
     self.git_ids().beginning(&bytes, half)
   }
 
+  /// How many objects have a Git id: about as many as the Git repository they came from holds.
+  pub fn git_count(&mut self) -> usize {
+    let ids = self.git_ids();
+    ids.sorted.as_ref().map_or(0, |(_, count)| *count) + ids.of.len()
+  }
+
   /// Every object that has a Git id.
   pub fn with_git_ids(&mut self) -> Vec<(Id, GitOid)> {
     self.git_ids().all()
@@ -566,9 +572,7 @@ impl Store {
       return Ok(());
     }
     use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(self.segment.as_raw_fd(), libc::LOCK_EX) } != 0 {
-      return Err(format!("cannot hold the segment: {}", std::io::Error::last_os_error()));
-    }
+    crate::limits::lock(&self.segment, &format!("the store {}", self.dir.display()))?;
     let result = (|| {
       self.catch_up()?;
       if !self.pending.is_empty() {
@@ -609,6 +613,10 @@ impl Store {
   /// Store an object and return its id. `base` names an object this one is
   /// probably similar to: the version of the file or directory it replaces.
   pub fn put(&mut self, kind: Kind, bytes: &[u8], base: Option<Id>) -> Result<Id> {
+    // A record says how long its object is in four bytes. Longer, it would be written and never read back.
+    if bytes.len() > u32::MAX as usize {
+      return Err(format!("an object of {} bytes is more than the store holds in one (4 GiB less one byte)", bytes.len()));
+    }
     let id = object_id(kind, bytes);
     if self.contains(&id) {
       return Ok(id);
@@ -668,7 +676,11 @@ impl Store {
     let mut out = vec![0u8; slot.stored as usize];
     if slot.offset >= self.flushed {
       let at = (slot.offset - self.flushed) as usize;
-      out.copy_from_slice(&self.pending[at..at + slot.stored as usize]);
+      // An index that says an object is beyond the end of the segment is damaged.
+      let Some(bytes) = at.checked_add(slot.stored as usize).and_then(|end| self.pending.get(at..end)) else {
+        return Err("the store's index names bytes the segment does not have".to_string());
+      };
+      out.copy_from_slice(bytes);
     } else {
       self.segment.read_exact_at(&mut out, slot.offset).map_err(|e| format!("cannot read the segment: {e}"))?;
     }
@@ -700,6 +712,12 @@ impl Store {
     } else {
       zstd::bulk::decompress(&stored, slot.raw as usize).map_err(|e| format!("cannot decompress an object: {e}"))?
     };
+    // What is handed out is what was asked for, or nothing: bytes the disk gave back changed
+    // would otherwise be written into a workspace and published as if they were the file.
+    let kind = self.kind_of(id)?.ok_or_else(|| format!("{} is damaged in the store: it does not say what it is", crate::hex(id)))?;
+    if object_id(kind, &bytes) != *id {
+      return Err(format!("{} is damaged in the store: its bytes are no longer the ones it was named for", crate::hex(id)));
+    }
     let bytes = std::sync::Arc::new(bytes);
     if slot.raw as usize <= 8 << 20 {
       self.remember(*id, bytes.clone());
@@ -830,6 +848,26 @@ impl Store {
       // Reading everything must not mean holding everything.
       self.cache.clear();
       self.cache_bytes = 0;
+    }
+    // What names an object has to name one that is there: a Git id, a ref.
+    for (id, oid) in self.with_git_ids() {
+      if !self.contains(&id) {
+        wrong.push(format!("{}: has the Git id {} and is not in the store", crate::hex(&id), crate::hex(&oid)));
+      }
+    }
+    let mut dirs = vec![self.dir.join("refs")];
+    while let Some(dir) = dirs.pop() {
+      for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+          dirs.push(path);
+        } else if let Some(id) =
+          std::fs::read_to_string(&path).ok().and_then(|text| crate::unhex(text.trim())).and_then(|b| Id::try_from(b).ok())
+          && !self.contains(&id)
+        {
+          wrong.push(format!("{}: the ref {} names it and it is not in the store", crate::hex(&id), path.display()));
+        }
+      }
     }
     Ok((ids.len(), wrong))
   }

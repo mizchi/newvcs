@@ -17,6 +17,9 @@ pub fn lines(bytes: &[u8]) -> Vec<&[u8]> {
   bytes.split_inclusive(|&b| b == b'\n').collect()
 }
 
+/// How many lines the two middles may have together for the search written here to be used.
+const LONG: usize = 2000;
+
 /// Which lines of `a` are removed and which of `b` are added to turn one into the other.
 pub fn changed(a: &[&[u8]], b: &[&[u8]]) -> (Vec<bool>, Vec<bool>) {
   let (n, m) = (a.len(), b.len());
@@ -25,6 +28,29 @@ pub fn changed(a: &[&[u8]], b: &[&[u8]]) -> (Vec<bool>, Vec<bool>) {
   let head = a.iter().zip(b).take_while(|(x, y)| x == y).count();
   let tail = a[head..].iter().rev().zip(b[head..].iter().rev()).take_while(|(x, y)| x == y).count();
   let (a_mid, b_mid) = (&a[head..n - tail], &b[head..m - tail]);
+  // Nothing in the middle of one side: all of the other's middle is the difference. A file that
+  // is new, or gone, or only grew, is settled here without asking how its lines compare.
+  if a_mid.is_empty() || b_mid.is_empty() {
+    removed[head..n - tail].fill(true);
+    added[head..m - tail].fill(true);
+    return (removed, added);
+  }
+  // The search below remembers every step it took, which for two long texts with little in
+  // common is more memory than there is. Past a size, gitoxide's diff does it in linear space.
+  if a_mid.len() + b_mid.len() > LONG {
+    let mut input = imara_diff::InternedInput::default();
+    input.update_before(a_mid.iter().copied());
+    input.update_after(b_mid.iter().copied());
+    let mut diff = imara_diff::Diff::compute(imara_diff::Algorithm::Myers, &input);
+    diff.postprocess_lines(&input);
+    for at in 0..a_mid.len() {
+      removed[head + at] = diff.is_removed(at as u32);
+    }
+    for at in 0..b_mid.len() {
+      added[head + at] = diff.is_added(at as u32);
+    }
+    return (removed, added);
+  }
   let (an, bn) = (a_mid.len() as isize, b_mid.len() as isize);
   let max = (an + bn) as usize;
   // The furthest point reached on each diagonal, kept per number of edits so the path can be walked back.
@@ -306,5 +332,18 @@ mod tests {
     assert_eq!(text(hunks(a.as_bytes(), near.as_bytes())).matches("@@ -").count(), 1);
     let apart = a.replace("line 3\n", "LINE 3\n").replace("line 11\n", "LINE 11\n");
     assert_eq!(text(hunks(a.as_bytes(), apart.as_bytes())).matches("@@ -").count(), 2);
+  }
+
+  #[test]
+  fn a_long_text_is_compared_without_remembering_every_step() {
+    // New, and gone: every line, and no search.
+    let long: Vec<u8> = (0..200_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+    assert_eq!(counts(b"", &long), (0, 200_000));
+    assert_eq!(counts(&long, b""), (200_000, 0));
+    // Two long texts that share every other line.
+    let other: Vec<u8> =
+      (0..60_000).flat_map(|i| if i % 2 == 0 { format!("line {i}\n") } else { format!("other {i}\n") }.into_bytes()).collect();
+    let first: Vec<u8> = (0..60_000).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+    assert_eq!(counts(&first, &other), (30_000, 30_000));
   }
 }

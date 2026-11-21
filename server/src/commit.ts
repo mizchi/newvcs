@@ -61,11 +61,57 @@ export function decode(bytes: Uint8Array): Commit {
   for (let n = u32(); n > 0; n--) {
     const path = take(u32());
     const entry = take(1)[0] === 0 ? null : { mode: u32(), id: take(32) };
+    if (!pathOk(path)) throw new Error("a commit names a path no tree may have");
+    if (entry && !MODES.includes(entry.mode)) throw new Error("a commit gives a path a mode no file has");
     changes.push({ path, entry });
   }
   if (at !== bytes.length) throw new Error("bytes after the end of a commit object");
+  // A ref is one line of commits: a commit on more than one, or on one the ref never had, would
+  // leave its history unreadable to whoever synced it.
+  if (parents.length > 1) throw new Error("a commit with more than one parent is a merge, and a ref holds one line of commits");
+  if (new Set(changes.map((c) => hex(c.path))).size !== changes.length) throw new Error("a commit says two things of one path");
   return { parents, rest, changes };
 }
+
+/// A file, one that can be run, a link, a directory, another repository's commit.
+export const MODES = [0o100644, 0o100755, 0o100664, 0o120000, 0o40000, 0o160000];
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/// Whether a path may be in a tree (`manifest::path_ok` on the other side), and is text:
+/// every client that syncs writes the paths a commit names, and the server keeps them as text.
+export function pathOk(path: Uint8Array): boolean {
+  if (path.length === 0 || path.length > 4096 || path.includes(0)) return false;
+  let text: string;
+  try {
+    text = utf8.decode(path);
+  } catch {
+    return false;
+  }
+  return text.split("/").every(partOk);
+}
+
+/// One name, an entry of a directory (`manifest::name_ok` on the other side): not empty, not `.`
+/// or `..`, and not a name some file system takes for `.git` or `.nv` — in any case, with the
+/// characters HFS+ ignores, with the dots and spaces NTFS drops, as NTFS's short name, or in
+/// letters that are those once Unicode compatibility folding is done.
+function partOk(part: string): boolean {
+  if (part === "" || part === "." || part === ".." || part.includes("/") || part.includes("\0") || new TextEncoder().encode(part).length > 255) return false;
+  const folded = part.replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g, "").normalize("NFKC").toLowerCase().replace(/[. ]+$/, "");
+  return folded !== ".git" && folded !== ".nv" && !/^(git|nv)~\d+$/.test(folded);
+}
+
+/// Whether a name may be an entry of a tree, and is text.
+export function nameOk(name: Uint8Array): boolean {
+  if (name.length === 0 || name.includes(0)) return false;
+  try {
+    return partOk(utf8.decode(name));
+  } catch {
+    return false;
+  }
+}
+
+/// A ref's name: parts of letters, digits and `-_.`, with `/` between them.
+export const refOk = (name: string) => name.length <= 255 && name.split("/").every((part) => /^[A-Za-z0-9_.-]+$/.test(part) && part !== "." && part !== "..");
 
 const KIND_BLOB = 1;
 

@@ -1,6 +1,8 @@
 //! One namespace of repositories in one store, and a directory of one
 //! repository standing in another by its id.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -14,7 +16,7 @@ fn sh(dir: &Path, script: &str) -> Output {
   {
     c.env(format!("GIT_{key}"), value);
   }
-  c.output().unwrap()
+  common::bounded(&mut c)
 }
 
 fn ok(dir: &Path, script: &str) -> String {

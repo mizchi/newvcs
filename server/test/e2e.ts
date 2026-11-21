@@ -5,7 +5,7 @@
 // top of its own last commit, as an agent in its own workspace would.
 
 import assert from "node:assert/strict";
-import { decode, encode, hex, idOf, unhex, type Commit } from "../src/commit.ts";
+import { blobIdOf, decode, encode, hex, idOf, unhex, type Commit } from "../src/commit.ts";
 
 const server = process.env.NV_SERVER ?? "http://localhost:8799";
 const repo = `t/e2e-${Date.now()}`;
@@ -23,19 +23,24 @@ function frame(...parts: Uint8Array[]): Uint8Array {
 }
 
 let serial = 0;
+/// The contents each commit names: a commit is not taken without them.
+const contents = new WeakMap<Uint8Array, Uint8Array[]>();
 function commit(parent: string | null, paths: string[], message: string): Uint8Array {
+  // What a file holds does not matter to the server, only that it was sent: a fresh content per change.
+  const files = paths.map((path) => text(`${path}#${serial++}`));
   const c: Commit = {
     parents: parent ? [unhex(parent)] : [],
     rest: text(`author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\n${message}\n`),
-    // The content does not matter to the server; a fresh id per change stands in for it.
-    changes: paths.map((path) => ({ path: text(path), entry: { mode: 0o100644, id: idOf(text(`${path}#${serial++}`)) } })),
+    changes: paths.map((path, i) => ({ path: text(path), entry: { mode: 0o100644, id: blobIdOf(files[i]!) } })),
   };
-  return encode(c);
+  const bytes = encode(c);
+  contents.set(bytes, files);
+  return bytes;
 }
 
 type Pushed = { status: string; commit: string; seq?: number; behind?: number; tip?: string; paths?: string[] };
 async function push(name: string, ref: string, bytes: Uint8Array): Promise<Pushed> {
-  const response = await fetch(`${server}/${name}/push/${ref}`, { method: "POST", body: frame(bytes) });
+  const response = await fetch(`${server}/${name}/push/${ref}`, { method: "POST", body: frame(bytes, ...(contents.get(bytes) ?? [])) });
   return (await response.json()) as Pushed;
 }
 const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
@@ -44,7 +49,7 @@ const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
 {
   const name = `${repo}-chain`;
   const chain = async (ref: string, commits: Uint8Array[]): Promise<Pushed & { commits?: string[] }> => {
-    const response = await fetch(`${server}/${name}/push/${ref}?commits=${commits.length}`, { method: "POST", body: frame(...commits) });
+    const response = await fetch(`${server}/${name}/push/${ref}?commits=${commits.length}`, { method: "POST", body: frame(...commits, ...commits.flatMap((c) => contents.get(c) ?? [])) });
     return (await response.json()) as Pushed & { commits?: string[] };
   };
   const idHex = (bytes: Uint8Array) => hex(idOf(bytes));

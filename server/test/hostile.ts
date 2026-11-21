@@ -1,0 +1,159 @@
+// What a writer who means harm can send, against a running server
+// (`pnpm dev`, then `NV_SERVER=http://localhost:PORT node test/hostile.ts`).
+//
+// A commit is bytes from a client, and every client that syncs writes the
+// paths it names. So a commit that names a path no tree may have, or
+// contents the repository was never given, is refused here, before it is
+// anyone's history; and an upload that is not what it says it is cannot
+// touch what is already stored.
+
+import assert from "node:assert/strict";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { blobHasher, blobIdOf, encode, hex, type Commit } from "../src/commit.ts";
+
+const server = process.env.NV_SERVER ?? "http://localhost:8799";
+const stamp = Date.now();
+const repo = `t/hostile-${stamp}`;
+const text = (s: string) => new TextEncoder().encode(s);
+const u32 = (n: number) => new Uint8Array(new Uint32Array([n]).buffer);
+const frame = (...parts: Uint8Array[]) => {
+  const all = parts.flatMap((p) => [u32(p.length), p]);
+  const out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  all.reduce((at, p) => (out.set(p, at), at + p.length), 0);
+  return out;
+};
+const rest = text("author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n");
+const commit = (parent: string | null, changes: Commit["changes"]) => encode({ parents: parent ? [Uint8Array.from(parent.match(/../g)!.map((b) => parseInt(b, 16)))] : [], rest, changes });
+const push = (ref: string, ...parts: Uint8Array[]) => fetch(`${server}/${repo}/push/${ref}`, { method: "POST", body: frame(...parts) });
+const tip = async () => ((await (await fetch(`${server}/${repo}/refs/main`)).json()) as { tip: string; seq: number });
+
+const good = text("good\n");
+const started = (await (await push("main", commit(null, [{ path: text("a.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }]), good)).json()) as { status: string };
+assert.equal(started.status, "updated");
+const before = await tip();
+
+// ---------------------------------------------------------------- paths no tree may have
+const bytes = (...b: number[]) => Uint8Array.from(b);
+const paths: [string, Uint8Array][] = [
+  ["empty", text("")],
+  ["a directory, not a file", text("d/")],
+  ["above the workspace", text("../escape.txt")],
+  ["above, by way of a directory", text("src/../../escape.txt")],
+  ["a dot", text("./a.txt")],
+  ["two slashes", text("a//b")],
+  ["from the root", text("/etc/hosts")],
+  ["Git's own directory", text(".git/hooks/pre-commit")],
+  ["Git's own directory, in capitals", text("sub/.GIT/config")],
+  ["nv's own directory", text(".nv/workspace")],
+  ["a NUL", bytes(0x61, 0, 0x62)],
+  ["not text", bytes(0x61, 0xff, 0x62)],
+  ["a name of 300 bytes", text("x".repeat(300))],
+  ["a path of 5,000 bytes", text(Array.from({ length: 100 }, () => "x".repeat(49)).join("/"))],
+];
+for (const [what, path] of paths) {
+  const refused = await push("main", commit(before.tip, [{ path, entry: { mode: 0o100644, id: blobIdOf(good) } }]), good);
+  assert.equal(refused.status, 400, `a path that is ${what} was taken`);
+}
+// A mode no file has, and one path named twice.
+assert.equal((await push("main", commit(before.tip, [{ path: text("m.txt"), entry: { mode: 0, id: blobIdOf(good) } }]), good)).status, 400);
+assert.equal((await push("main", commit(before.tip, [{ path: text("m.txt"), entry: { mode: 0o100777, id: blobIdOf(good) } }]), good)).status, 400);
+const twice = [{ path: text("t.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }, { path: text("t.txt"), entry: null }];
+assert.equal((await push("main", commit(before.tip, twice), good)).status, 400);
+// A ref's name is a name.
+for (const ref of ["odd ref", "x\u2603", "semi;colon"]) {
+  const refused = await fetch(`${server}/${repo}/push/${encodeURIComponent(ref)}`, { method: "POST", body: frame(commit(null, [{ path: text("a.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }]), good) });
+  assert.equal(refused.status, 400, `a ref named ${JSON.stringify(ref)} was taken`);
+}
+
+// ---------------------------------------------------------------- contents never given
+const never = text("nobody sent these bytes\n");
+const naming = await push("main", commit(before.tip, [{ path: text("new.txt"), entry: { mode: 0o100644, id: blobIdOf(never) } }]));
+assert.equal(naming.status, 400, "a commit that names contents the repository does not have was taken");
+// Nothing of all that moved the ref, and a writer who means well is not in anyone's way.
+assert.deepEqual(await tip(), before);
+const fine = text("fine\n");
+const after = (await (await push("main", commit(before.tip, [{ path: text("b.txt"), entry: { mode: 0o100755, id: blobIdOf(fine) } }]), fine)).json()) as { status: string };
+assert.equal(after.status, "updated");
+
+// ---------------------------------------------------------------- an upload that is not what it says
+const large = new Uint8Array(1_500_000);
+for (let i = 0; i < large.length; i += 997) large[i] = (i / 997) % 251;
+const hasher = blobHasher();
+hasher.update(large);
+const id = hex(hasher.digest());
+assert.equal((await fetch(`${server}/${repo}/objects/${id}`, { method: "PUT", body: large })).status, 204);
+// From another repository, under the same name, bytes that are not those bytes.
+const other = `t/hostile-other-${stamp}`;
+const wrong = await fetch(`${server}/${other}/objects/${id}`, { method: "PUT", body: text("garbage") });
+assert.equal(wrong.status, 400);
+const still = await fetch(`${server}/${repo}/objects/${id}`);
+assert.equal(still.status, 200, "what was stored is still there");
+assert.deepEqual(new Uint8Array(await still.arrayBuffer()), large);
+// And the other repository was not given it by trying.
+assert.equal((await fetch(`${server}/${other}/objects/${id}`)).status, 404);
+// The right bytes, sent again by someone else, are taken, and stored once.
+assert.equal((await fetch(`${server}/${other}/objects/${id}`, { method: "PUT", body: large })).status, 204);
+assert.deepEqual(new Uint8Array(await (await fetch(`${server}/${other}/objects/${id}`)).arrayBuffer()), large);
+// ---------------------------------------------------------------- directories set whole
+// A tree, as nv writes one: mode, name length, name, id; names in order.
+const tree = (...entries: [number, Uint8Array, Uint8Array][]) =>
+  Uint8Array.from(entries.flatMap(([mode, name, id]) => [...u32(mode), ...u32(name.length), ...name, ...id]));
+const treeId = (bytes: Uint8Array) => {
+  const hasher = blake3.create();
+  hasher.update(Uint8Array.of(2));
+  hasher.update(bytes);
+  return hasher.digest();
+};
+const adopt = (...trees: Uint8Array[]) => fetch(`${server}/${repo}/adopt/trees`, { method: "POST", body: frame(...trees) });
+const payload = text("planted\n");
+// Names that a checkout would write outside the workspace, or into Git's directory or nv's own.
+const names: [string, Uint8Array][] = [
+  ["above the workspace", text("../../outside/pwned")],
+  ["Git's hooks, from above", text("../.git/hooks/pre-commit")],
+  ["a path, not a name", text("a/b")],
+  ["two dots", text("..")],
+  ["empty", text("")],
+  ["Git's directory", text(".git")],
+  ["Git's directory, with a dot NTFS drops", text(".git.")],
+  ["Git's directory, with a character HFS+ ignores", text(".g\u200cit")],
+  ["Git's directory, as NTFS's short name", text("GIT~1")],
+  ["Git's directory, in full-width letters", text(".\uff47it")],
+  ["nv's directory", text(".NV")],
+];
+for (const [what, name] of names) {
+  const bad = tree([0o100755, name, blobIdOf(payload)]);
+  assert.equal((await adopt(bad)).status, 400, `a tree naming an entry that is ${what} was taken`);
+  const refused = await push("main", commit(before.tip, [{ path: text("d"), entry: { mode: 0o40000, id: treeId(bad) } }]), payload);
+  assert.equal(refused.status, 400, `a commit setting a directory named ${what} was taken`);
+}
+// Two entries of one name, entries out of order, and modes no file has.
+assert.equal((await adopt(tree([0o100644, text("same"), blobIdOf(payload)], [0o40000, text("same"), blobIdOf(payload)]))).status, 400);
+assert.equal((await adopt(tree([0o100644, text("b"), blobIdOf(payload)], [0o100644, text("a"), blobIdOf(payload)]))).status, 400);
+assert.equal((await adopt(tree([0, text("m"), blobIdOf(payload)]))).status, 400);
+assert.equal((await adopt(tree([0o104755, text("m"), blobIdOf(payload)]))).status, 400);
+assert.deepEqual(await tip(), (await tip()));
+// A directory's id given to a file, and a file's to a directory: refused, and the ref can still be synced.
+const ok = tree([0o100644, text("in.txt"), blobIdOf(good)]);
+assert.equal((await adopt(ok)).status, 200);
+const now = await tip();
+assert.equal((await push("main", commit(now.tip, [{ path: text("f.txt"), entry: { mode: 0o100644, id: treeId(ok) } }]))).status, 400);
+assert.equal((await push("main", commit(now.tip, [{ path: text("g"), entry: { mode: 0o40000, id: blobIdOf(payload) } }]), payload)).status, 400);
+assert.deepEqual(await tip(), now);
+const honest = (await (await push("main", commit(now.tip, [{ path: text("d"), entry: { mode: 0o40000, id: treeId(ok) } }]))).json()) as { status: string };
+assert.equal(honest.status, "updated");
+const fetched = await fetch(`${server}/${repo}/fetch/trees`, { method: "POST", body: hex(treeId(ok)) + "\n" });
+assert.equal(fetched.status, 200);
+assert.equal((await fetch(`${server}/${repo}/fetch/trees`, { method: "POST", body: hex(blobIdOf(payload)) + "\n" })).status, 404, "a file is not handed out as a directory");
+
+// ---------------------------------------------------------------- history a ref cannot hold
+const head = await tip();
+const merge = encode({ parents: [Uint8Array.from(head.tip.match(/../g)!.map((b) => parseInt(b, 16))), new Uint8Array(32).fill(0xab)], rest, changes: [] });
+assert.equal((await push("main", merge)).status, 400, "a merge with a parent nobody has was taken");
+assert.deepEqual(await tip(), head);
+
+// ---------------------------------------------------------------- addresses
+assert.equal((await fetch(`${server}/t%zz/x/refs/main`)).status, 400, "a broken escape");
+assert.equal((await fetch(`${server}/t%2Fa/b/refs/main`)).status, 400, "a slash in an owner");
+for (const bad of ["abc", "-5", "1e300", "1.5"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);
+assert.equal((await fetch(`${server}/${repo}/since/main?after=0`)).status, 200);
+console.log("ok");

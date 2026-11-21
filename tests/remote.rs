@@ -5,6 +5,8 @@
 //!
 //! Without `NV_SERVER` the test says so and passes.
 
+mod common;
+
 use newvcs::remote::{self, Synced};
 use newvcs::store::Store;
 use newvcs::workspace::{self, Look, Workspace};
@@ -15,20 +17,20 @@ use std::process::Command;
 const AUTHOR: &str = "t <t@example.com>";
 
 fn sh(dir: &Path, script: &str) -> String {
-  let out = Command::new("sh")
-    .arg("-ec")
-    .arg(script)
-    .current_dir(dir)
-    .env("GIT_AUTHOR_NAME", "a")
-    .env("GIT_AUTHOR_EMAIL", "a@example.com")
-    .env("GIT_COMMITTER_NAME", "c")
-    .env("GIT_COMMITTER_EMAIL", "c@example.com")
-    .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
-    .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_SYSTEM", "/dev/null")
-    .output()
-    .unwrap();
+  let out = common::bounded(
+    Command::new("sh")
+      .arg("-ec")
+      .arg(script)
+      .current_dir(dir)
+      .env("GIT_AUTHOR_NAME", "a")
+      .env("GIT_AUTHOR_EMAIL", "a@example.com")
+      .env("GIT_COMMITTER_NAME", "c")
+      .env("GIT_COMMITTER_EMAIL", "c@example.com")
+      .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+      .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null"),
+  );
   assert!(out.status.success(), "{script}\n{}", String::from_utf8_lossy(&out.stderr));
   String::from_utf8(out.stdout).unwrap()
 }
@@ -428,10 +430,25 @@ fn the_same_lines_changed_on_both_sides_are_left_for_a_person_with_both_versions
   assert_eq!((synced.merged, synced.conflicts.clone()), (0, vec!["shared.txt".to_string()]), "{synced:?}");
   let text = bob.read("shared.txt").unwrap();
   assert!(text.contains("<<<<<<< yours\nbob's ten\n=======\nann's ten\n>>>>>>> theirs\n"), "{text}");
+  // While it is unsettled nothing moves: a second sync would forget that the file holds both
+  // versions, and the next commit and push would publish them. Someone else pushing meanwhile changes nothing.
+  cat.sync().unwrap();
+  cat.write("unrelated.txt", "cat\n");
+  cat.commit("cat, meanwhile");
+  cat.push().unwrap();
+  for refused in [bob.sync().map(|_| ()), bob.push().map(|_| ())] {
+    assert!(refused.unwrap_err().contains("still hold both versions"), "a sync or a push went ahead over an unsettled file");
+  }
+  assert!(bob.read("unrelated.txt").is_none());
+  // One marker left behind is still a file not settled.
+  let half: String = text.lines().filter(|l| !l.starts_with("<<<<<<<") && !l.starts_with("=======")).map(|l| format!("{l}\n")).collect();
+  bob.write("shared.txt", &half);
+  assert_eq!(workspace::unsettled(&bob.ws), vec!["shared.txt".to_string()]);
+  bob.write("shared.txt", &text);
   // Until someone settles it, it is known as unsettled, and a commit by the command is refused.
   assert_eq!(workspace::unsettled(&bob.ws), vec!["shared.txt".to_string()]);
   let nv = env!("CARGO_BIN_EXE_nv");
-  let refused = Command::new(nv).args(["commit", bob.dir.to_str().unwrap(), "too soon"]).output().unwrap();
+  let refused = common::bounded(Command::new(nv).args(["commit", bob.dir.to_str().unwrap(), "too soon"]));
   assert!(!refused.status.success() && String::from_utf8_lossy(&refused.stderr).contains("shared.txt"));
   // Bob's other file is still his commit. He settles the file, commits and pushes.
   assert_eq!(bob.read("other.txt").as_deref(), Some("other\n"));
@@ -506,7 +523,7 @@ fn a_push_or_sync_killed_at_any_moment_is_finished_by_the_next() {
   let (dir_one, dir_two) = (one.dir.clone(), two.dir.clone());
   drop((one, two));
   let run = |script: &str| {
-    let out = Command::new("sh").arg("-c").arg(script).env("NV", nv).env("ONE", &dir_one).env("TWO", &dir_two).output().unwrap();
+    let out = common::bounded(Command::new("sh").arg("-c").arg(script).env("NV", nv).env("ONE", &dir_one).env("TWO", &dir_two));
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
   };
   // The ref moves under the first workspace each round, so each of its pushes has to catch up; and each is
@@ -528,4 +545,484 @@ fn a_push_or_sync_killed_at_any_moment_is_finished_by_the_next() {
   assert_eq!(listing, "83\n83\nsame\n", "both have forty files of each writer, the three they began with, and the same shared file");
   let (fine, said) = run("$NV status $ONE 2>/dev/null; $NV status $TWO 2>/dev/null");
   assert!(fine && said.is_empty(), "nothing is left as a difference: {said}");
+}
+
+#[test]
+fn a_merge_keeps_what_each_side_did_to_a_files_mode() {
+  let Some((root, url)) = shared_file("mode") else { return };
+  let (mut ann, mut bob, mut cat) =
+    (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url), Peer::new(&root, "cat", &[], &url));
+  ann.write("a.txt", "one\nstart\n");
+  ann.commit("start");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  // Ann makes the file one to run; Bob, who has not seen that, changes a line of it.
+  sh(&ann.dir, "chmod +x shared.txt");
+  ann.commit("ann: executable");
+  ann.push().unwrap();
+  replace_line(&bob, "shared.txt", 15, "bob's line");
+  bob.commit("bob: a line");
+  assert!(bob.push().is_err());
+  assert_eq!(bob.sync().unwrap().merged, 1);
+  bob.push().unwrap();
+  for peer in [&mut ann, &mut cat] {
+    peer.sync().unwrap();
+    assert_eq!(sh(&peer.dir, "test -x shared.txt && grep -c \"bob's line\" shared.txt").trim(), "1", "both the mode and the line");
+  }
+  // Where the text has to be settled by a person, the mode does not: it is on the file already.
+  sh(&ann.dir, "chmod -x shared.txt");
+  replace_line(&ann, "shared.txt", 8, "ann's eight");
+  ann.commit("ann: not executable, and a line");
+  ann.push().unwrap();
+  replace_line(&bob, "shared.txt", 8, "bob's eight");
+  bob.commit("bob: the same line");
+  assert!(bob.push().is_err());
+  assert_eq!(bob.sync().unwrap().conflicts, vec!["shared.txt".to_string()]);
+  assert_eq!(sh(&bob.dir, "test -x shared.txt && echo runs || echo plain").trim(), "plain");
+  let settled: String = bob
+    .read("shared.txt")
+    .unwrap()
+    .lines()
+    .filter(|l| !l.starts_with("<<<<<<<") && !l.starts_with("=======") && !l.starts_with(">>>>>>>") && *l != "ann's eight")
+    .map(|l| format!("{l}\n"))
+    .collect();
+  bob.write("shared.txt", &settled);
+  bob.commit("settled");
+  bob.push().unwrap();
+  cat.sync().unwrap();
+  assert_eq!(sh(&cat.dir, "test -x shared.txt && echo runs || echo plain; grep -c \"bob's eight\" shared.txt").trim(), "plain\n1");
+  sh(&cat.dir, "chmod +x shared.txt");
+  cat.commit("cat: executable again");
+  cat.push().unwrap();
+  for peer in [&mut ann, &mut bob] {
+    peer.sync().unwrap();
+  }
+  // The other way about: the one who syncs changed the mode, the other the text.
+  sh(&cat.dir, "chmod -x shared.txt");
+  cat.commit("cat: not executable");
+  replace_line(&ann, "shared.txt", 3, "ann's line");
+  ann.commit("ann: a line");
+  ann.push().unwrap();
+  assert!(cat.push().is_err());
+  cat.sync().unwrap();
+  cat.push().unwrap();
+  bob.sync().unwrap();
+  assert_eq!(sh(&bob.dir, "test -x shared.txt || grep -c \"ann's line\" shared.txt").trim(), "1");
+}
+
+/// The messages of the ref's commits as a fresh workspace finds them, newest first.
+fn history(peer: &mut Peer) -> Vec<String> {
+  let mut out = Vec::new();
+  let mut at = peer.ws.pushed;
+  while let Some(id) = at {
+    let commit = newvcs::commit::Commit::load(&mut peer.store, &id).unwrap();
+    out.push(String::from_utf8_lossy(&commit.rest).lines().last().unwrap_or_default().to_string());
+    at = commit.parents.first().copied();
+  }
+  out
+}
+
+#[test]
+fn a_push_leaves_what_was_edited_after_the_commit_as_it_is() {
+  let Some((root, url)) = shared_file("after-commit") else { return };
+  let mut ann = Peer::new(&root, "ann", &[], &url);
+  ann.write("seed.txt", "s\n");
+  ann.commit("start");
+  ann.push().unwrap();
+  // Committed, then edited again, then pushed: the edit is not a conflict with one's own commit.
+  ann.write("f.txt", "v1\n");
+  ann.commit("c1");
+  ann.write("f.txt", "v2\n");
+  let pushed = ann.push().unwrap();
+  assert!(pushed.synced.conflicts.is_empty(), "{pushed:?}");
+  assert_eq!(ann.read("f.txt").as_deref(), Some("v2\n"));
+  assert_eq!(workspace::status(&ann.ws, Look::Everywhere).unwrap().0.len(), 0, "the edit is recorded, on top of the commit");
+  assert_ne!(ann.ws.head, ann.ws.base);
+  // Committed, then removed, then pushed: the file stays removed, and nothing is pushed twice.
+  ann.commit("c1 again as v2");
+  ann.push().unwrap();
+  ann.write("g.txt", "g\n");
+  ann.commit("c2");
+  std::fs::remove_file(ann.dir.join("g.txt")).unwrap();
+  ann.push().unwrap();
+  assert_eq!(ann.read("g.txt"), None);
+  let again = ann.push().unwrap();
+  assert_eq!((again.updated, again.rebased), (0, 0), "{again:?}");
+  // The same with bytes that are not text: the push is not reported refused when it landed.
+  ann.commit("g removed");
+  ann.push().unwrap();
+  std::fs::write(ann.dir.join("x.bin"), [0u8, 1, 2, 3]).unwrap();
+  ann.commit("bin");
+  std::fs::write(ann.dir.join("x.bin"), [0u8, 9, 9, 9]).unwrap();
+  ann.push().unwrap();
+  assert_eq!(std::fs::read(ann.dir.join("x.bin")).unwrap(), [0u8, 9, 9, 9]);
+  ann.commit("bin 2");
+  ann.push().unwrap();
+  let mut fresh = Peer::new(&root, "fresh", &[], &url);
+  fresh.sync().unwrap();
+  assert_eq!(std::fs::read(fresh.dir.join("x.bin")).unwrap(), [0u8, 9, 9, 9]);
+  assert_eq!(fresh.read("f.txt").as_deref(), Some("v2\n"));
+  assert_eq!(fresh.read("g.txt"), None);
+  assert_eq!(history(&mut fresh)[..7], ["bin 2", "bin", "g removed", "c2", "c1 again as v2", "c1", "start"]);
+}
+
+#[test]
+fn a_workspace_moved_back_does_not_undo_what_others_pushed() {
+  let Some((root, url)) = shared_file("moved-back") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  ann.write("one.txt", "one\n");
+  ann.commit("a: one");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  let at_one = bob.ws.head.unwrap();
+  ann.write("two.txt", "two\n");
+  ann.commit("a: two");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  // Bob goes back a commit, as `git reset --hard HEAD~1` does.
+  workspace::switch(&mut bob.store, &mut bob.ws, at_one).unwrap();
+  assert_eq!(bob.read("two.txt"), None);
+  ann.write("three.txt", "three\n");
+  ann.commit("a: three");
+  ann.push().unwrap();
+  // Catching up brings back what the ref has; Bob's own commit then goes on top, and removes nothing.
+  bob.sync().unwrap();
+  assert_eq!(bob.read("two.txt").as_deref(), Some("two\n"));
+  bob.write("mine.txt", "mine\n");
+  bob.commit("b: mine");
+  bob.push().unwrap();
+  ann.sync().unwrap();
+  assert_eq!((ann.read("two.txt").as_deref(), ann.read("mine.txt").as_deref()), (Some("two\n"), Some("mine\n")));
+  assert_eq!(history(&mut ann)[..4], ["b: mine", "a: three", "a: two", "a: one"]);
+}
+
+#[test]
+fn work_that_cannot_go_on_top_is_set_aside_and_the_workspace_goes_on() {
+  let Some((root, url)) = shared_file("set-aside") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  ann.write("f.txt", "1\n2\n3\n");
+  ann.commit("add f");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  // Bob removes the file and Ann changes it: not something to merge as text.
+  std::fs::remove_file(bob.dir.join("f.txt")).unwrap();
+  bob.write("other.txt", "bob\n");
+  bob.commit("b");
+  ann.write("f.txt", "1\n2\n3\n4\n");
+  ann.commit("a");
+  ann.push().unwrap();
+  assert!(bob.push().is_err());
+  let refused = bob.sync().unwrap_err();
+  assert!(refused.contains("nv restore <dir> pushed"), "{refused}");
+  // Setting the work aside is the way out the message names, and it works.
+  let aside = workspace::set_aside(&mut bob.store, &mut bob.ws, AUTHOR, Look::Everywhere).unwrap();
+  let kept = aside.kept.expect("the work is kept under an id");
+  assert_eq!((bob.read("f.txt").as_deref(), bob.read("other.txt")), (Some("1\n2\n3\n"), None));
+  bob.sync().unwrap();
+  assert_eq!(bob.read("f.txt").as_deref(), Some("1\n2\n3\n4\n"));
+  // What was set aside can still be read.
+  let listed = workspace::since(&mut bob.store, &bob.ws, kept, Look::Everywhere).unwrap();
+  assert!(listed.iter().any(|(path, _)| path == b"other.txt"), "{listed:?}");
+  bob.write("other.txt", "bob\n");
+  bob.commit("b again");
+  bob.push().unwrap();
+}
+
+#[test]
+fn a_change_of_mind_after_a_commit_survives_the_commit_moving() {
+  let Some((root, url)) = shared_file("change-of-mind") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  ann.write("p1", "base1\n");
+  ann.write("gone", "g\n");
+  ann.commit("base");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  bob.write("bx", "x\n");
+  bob.commit("bx");
+  bob.push().unwrap();
+  // Committed, then put back as it was and not committed; a file added and then removed again.
+  ann.write("p1", "n\n");
+  ann.write("added", "a\n");
+  std::fs::remove_file(ann.dir.join("gone")).unwrap();
+  ann.commit("n");
+  ann.write("p1", "base1\n");
+  std::fs::remove_file(ann.dir.join("added")).unwrap();
+  ann.write("gone", "g\n");
+  ann.sync().unwrap();
+  // The files are as Ann left them, and nv knows they differ from the commit.
+  assert_eq!((ann.read("p1").as_deref(), ann.read("added"), ann.read("gone").as_deref()), (Some("base1\n"), None, Some("g\n")));
+  let base = ann.ws.base.unwrap();
+  let pending: Vec<String> = workspace::since(&mut ann.store, &ann.ws, base, Look::Everywhere)
+    .unwrap()
+    .into_iter()
+    .map(|(path, what)| format!("{what} {}", String::from_utf8_lossy(&path)))
+    .collect();
+  assert_eq!(pending, ["D added", "A gone", "M p1"]);
+  ann.push().unwrap();
+  ann.commit("back");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  assert_eq!((bob.read("p1").as_deref(), bob.read("added"), bob.read("gone").as_deref()), (Some("base1\n"), None, Some("g\n")));
+}
+
+#[test]
+fn a_branch_goes_where_a_sync_or_a_push_takes_its_workspace() {
+  let Some((root, url)) = shared_file("branch-along") else { return };
+  let mut bob = Peer::new(&root, "bob", &[], &url);
+  bob.write("start", "s\n");
+  bob.commit("start");
+  bob.push().unwrap();
+  let nv = env!("CARGO_BIN_EXE_nv");
+  let g = root.join("g");
+  let run = |script: &str| sh(&root, &format!("NV={nv}; cd g 2>/dev/null || true; {script}"));
+  sh(&root, &format!("{nv} git clone -q repo g && {nv} remote g {url} main && {nv} sync g >/dev/null"));
+  run(
+    "$NV git switch -q -c other && $NV git switch -q main && echo 1 > g1 && $NV git add -A && $NV git commit -qm g1 && $NV push . >/dev/null",
+  );
+  bob.sync().unwrap();
+  bob.write("bB.txt", "b\n");
+  bob.commit("bB");
+  bob.push().unwrap();
+  // This push is put on a newer tip: the commit gets another id, and the branch has to follow it.
+  run("echo 2 > g2 && $NV git add -A && $NV git commit -qm g2 && $NV push . >/dev/null");
+  run("echo 3 > g3 && $NV git add -A && $NV git commit -qm g3 && echo 4 > g4 && $NV git add -A && $NV git commit -qm g4");
+  assert_eq!(run("$NV git rev-parse main; $NV git rev-parse HEAD").lines().collect::<std::collections::HashSet<_>>().len(), 1);
+  run("$NV git switch -q other && $NV git switch -q main");
+  assert_eq!(run("$NV git log --format=%s | head -3 | tr '\\n' ' '; ls g3 g4 bB.txt | tr '\\n' ' '"), "g4 g3 g2 bB.txt g3 g4 ");
+  // `nv git add`, another edit, then `nv commit`: the index is not left saying the file is gone.
+  run("echo 7 > f7 && $NV git add f7 && echo 7b > f7 && $NV commit . c1 >/dev/null");
+  assert_eq!(run("$NV git status --short; echo 8 > f8; $NV git add -A; $NV git status --short"), "A  f8\n");
+  run("$NV git commit -qm c2 && $NV push . >/dev/null");
+  bob.sync().unwrap();
+  assert_eq!((bob.read("f7").as_deref(), bob.read("f8").as_deref()), (Some("7b\n"), Some("8\n")));
+  assert!(g.join("f7").exists());
+}
+
+fn committed(peer: &mut Peer, path: &str) -> Option<String> {
+  let root = newvcs::commit::root_of(&mut peer.store, &peer.ws.base.unwrap()).unwrap()?;
+  let entry = newvcs::manifest::lookup(&mut peer.store, root, path.as_bytes()).unwrap()?;
+  Some(String::from_utf8_lossy(&peer.store.get(&entry.id).unwrap().unwrap()).into_owned())
+}
+
+fn pending(peer: &mut Peer) -> Vec<String> {
+  let base = peer.ws.base.unwrap();
+  workspace::since(&mut peer.store, &peer.ws, base, Look::Everywhere)
+    .unwrap()
+    .into_iter()
+    .map(|(path, what)| format!("{what} {}", String::from_utf8_lossy(&path)))
+    .collect()
+}
+
+#[test]
+fn a_sync_merges_what_was_committed_and_keeps_what_was_not_apart() {
+  let Some((root, url)) = shared_file("two-layers") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  ann.write("start", "s\n");
+  ann.commit("start");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  // Bob changes a line near the bottom of the shared file and pushes.
+  replace_line(&bob, "shared.txt", 19, "line 19 bob");
+  bob.commit("b 19");
+  bob.push().unwrap();
+  // Ann commits a change near the top, then changes her mind without committing; and edits further down, uncommitted.
+  replace_line(&ann, "shared.txt", 2, "line 2 ann");
+  ann.commit("a commits line 2");
+  replace_line(&ann, "shared.txt", 2, "line 2");
+  replace_line(&ann, "shared.txt", 10, "line 10 not committed");
+  let synced = ann.sync().unwrap();
+  assert!(synced.conflicts.is_empty(), "{synced:?}");
+  // The commit holds what was committed, merged with Bob's; the files hold Ann's later edits on top, as pending changes.
+  let in_commit = committed(&mut ann, "shared.txt").unwrap();
+  assert!(in_commit.contains("line 2 ann\n") && in_commit.contains("line 19 bob\n") && !in_commit.contains("not committed"), "{in_commit}");
+  let on_disk = ann.read("shared.txt").unwrap();
+  assert!(on_disk.contains("line 2\n") && on_disk.contains("line 10 not committed\n") && on_disk.contains("line 19 bob\n"), "{on_disk}");
+  assert_eq!(pending(&mut ann), ["M shared.txt"]);
+  // Pushed, the ref has the commit and not the uncommitted edits.
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  let bobs = bob.read("shared.txt").unwrap();
+  assert!(bobs.contains("line 2 ann\n") && !bobs.contains("not committed"), "{bobs}");
+  assert_eq!(pending(&mut ann), ["M shared.txt"]);
+
+  // Both made the file executable; Ann also committed an edit and then took it back, uncommitted.
+  let exec = |peer: &Peer| {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(peer.dir.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+  };
+  ann.commit("a: the rest");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  exec(&bob);
+  bob.commit("b +x");
+  bob.push().unwrap();
+  exec(&ann);
+  let before = ann.read("a.txt").unwrap();
+  ann.write("a.txt", &format!("{before}ann\n"));
+  ann.commit("a: +x and a line");
+  ann.write("a.txt", &before);
+  ann.sync().unwrap();
+  assert_eq!(ann.read("a.txt").unwrap(), before);
+  assert_eq!(pending(&mut ann), ["M a.txt"], "the files differ from the commit, and nv knows");
+
+  // Bob removes a file Ann has committed an edit to and then removed without committing: not something to merge.
+  ann.commit("a: line taken back");
+  ann.push().unwrap();
+  bob.sync().unwrap();
+  std::fs::remove_file(bob.dir.join("start")).unwrap();
+  bob.commit("b removes start");
+  bob.push().unwrap();
+  ann.write("start", "s\nedited\n");
+  ann.commit("a edits start");
+  std::fs::remove_file(ann.dir.join("start")).unwrap();
+  let refused = ann.sync().unwrap_err();
+  assert!(refused.contains("cannot be merged as text") && refused.contains("start"), "{refused}");
+  assert_eq!(ann.read("start"), None, "nothing was touched");
+}
+
+#[test]
+fn what_a_seventh_reviewer_found_in_pushing_stays_fixed() {
+  let Some((root, url)) = shared_file("seventh") else { return };
+  let (mut ann, mut bob) = (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url));
+  // A workspace that looked for the ref before there was one has somewhere to set its work aside to.
+  assert_eq!(bob.sync().unwrap(), Synced::default());
+  ann.write("a.txt", "one\nann\n");
+  ann.commit("a1");
+  ann.push().unwrap();
+  std::fs::remove_file(bob.dir.join("a.txt")).unwrap();
+  bob.commit("b removes");
+  assert!(bob.sync().is_err());
+  workspace::set_aside(&mut bob.store, &mut bob.ws, AUTHOR, Look::Everywhere).unwrap();
+  bob.sync().unwrap();
+  assert_eq!(bob.read("a.txt").as_deref(), Some("one\nann\n"));
+  // A push that landed says so, though catching up afterwards cannot be done.
+  ann.write("shared.txt", "all new\n");
+  ann.commit("a rewrites shared");
+  ann.push().unwrap();
+  bob.write("b.txt", "b\n");
+  bob.commit("b adds b.txt");
+  std::fs::remove_file(bob.dir.join("shared.txt")).unwrap();
+  let said = bob.push().unwrap_err();
+  assert!(said.contains("the push landed"), "{said}");
+  ann.sync().unwrap();
+  assert_eq!(ann.read("b.txt").as_deref(), Some("b\n"));
+  bob.write("shared.txt", "all new\n");
+  // Sent again, the push gets the answer it got: the commit is on the ref once.
+  bob.push().unwrap();
+  bob.push().unwrap();
+  assert_eq!(history(&mut bob).iter().filter(|said| *said == "b adds b.txt").count(), 1);
+  // Undoing a catching-up is not offered once the workspace has committed since.
+  ann.write("c.txt", "c\n");
+  ann.commit("a adds c");
+  ann.push().unwrap();
+  bob.write("mine.txt", "m\n");
+  bob.sync().unwrap();
+  bob.commit("made after the sync");
+  let refused = workspace::restore_before_sync(&mut bob.store, &mut bob.ws, AUTHOR, Look::Everywhere).unwrap_err();
+  assert!(refused.contains("since it last caught up"), "{refused}");
+  assert_eq!(bob.read("mine.txt").as_deref(), Some("m\n"));
+}
+
+#[test]
+fn a_git_repository_follows_a_sync_and_a_merge_is_not_pushed() {
+  let Some((root, url)) = shared_file("adopted-sync") else { return };
+  let mut ann = Peer::new(&root, "ann", &[], &url);
+  ann.write("start", "s\n");
+  ann.commit("start");
+  ann.push().unwrap();
+  let nv = env!("CARGO_BIN_EXE_nv");
+  // A Git repository with nv beside it, on the same ref.
+  sh(
+    &root,
+    &format!(
+      "git clone -q repo c && cd c && git config user.name c && git config user.email c@example.com && {nv} adopt . >/dev/null && {nv} remote . {url} main && {nv} sync . >/dev/null"
+    ),
+  );
+  // Two commits to one file arrive at once: Git's history needs both versions of it.
+  ann.write("a.txt", "a1\n");
+  ann.commit("a1");
+  ann.push().unwrap();
+  ann.write("a.txt", "a2\n");
+  ann.commit("a2");
+  ann.push().unwrap();
+  assert_eq!(
+    sh(
+      &root,
+      &format!(
+        "cd c && {nv} sync . >/dev/null 2>&1; {nv} check . | tail -1; git log --format=%s | head -2 | tr '\\n' ' '; git status --porcelain; cat a.txt"
+      )
+    ),
+    "in step\na2 a1 a2\n"
+  );
+  // A merge of two local lines of commits is not something a ref can hold: refused, nothing sent.
+  sh(&root, &format!("{nv} git clone -q repo g && {nv} remote g {url} main && {nv} sync g >/dev/null"));
+  let run = |script: &str| sh(&root, &format!("NV={nv}; cd g; {script}"));
+  run(
+    "$NV git switch -q -c feat && echo f > bf.txt && $NV git add bf.txt && $NV git commit -qm bf && $NV git switch -q main && echo m > bm.txt && $NV git add bm.txt && $NV git commit -qm bm && $NV git merge -q -m mrg feat",
+  );
+  assert!(run("$NV push . 2>&1 || true").contains("is a merge"));
+  ann.sync().unwrap();
+  assert_eq!(ann.read("bf.txt"), None);
+}
+
+#[test]
+fn what_an_eighth_reviewer_found_in_syncing_stays_fixed() {
+  let Some((root, url)) = shared_file("eighth") else { return };
+  let (mut ann, mut bob, mut cat) =
+    (Peer::new(&root, "ann", &[], &url), Peer::new(&root, "bob", &[], &url), Peer::new(&root, "cat", &[], &url));
+  // Ann looked for the ref before there was one; Bob starts it; Ann's work cannot go on top and is set aside.
+  assert_eq!(ann.sync().unwrap(), Synced::default());
+  bob.write("shared.txt", "other\n");
+  bob.commit("b");
+  bob.push().unwrap();
+  std::fs::remove_file(ann.dir.join("shared.txt")).unwrap();
+  ann.commit("a removes shared");
+  assert!(ann.push().is_err() && ann.sync().is_err());
+  let pushed = workspace::state_named(&mut ann.store, &ann.ws, "pushed").expect("somewhere to set the work aside to");
+  assert_eq!(Some(pushed), ann.ws.start);
+  workspace::set_aside(&mut ann.store, &mut ann.ws, AUTHOR, Look::Everywhere).unwrap();
+  ann.sync().unwrap();
+  assert_eq!(ann.read("shared.txt").as_deref(), Some("other\n"));
+  cat.sync().unwrap();
+
+  // A push that landed while catching up could not be done: the next commit stands on it, with no conflict against oneself.
+  cat.write("other.txt", "c0\n");
+  cat.commit("c: adds other.txt");
+  cat.push().unwrap();
+  ann.sync().unwrap();
+  bob.sync().unwrap();
+  cat.write("other.txt", "cat\n");
+  cat.commit("c: other.txt");
+  cat.push().unwrap();
+  bob.write("shared.txt", "other\nv1\n");
+  bob.commit("b1: v1");
+  // Not committed, and not something to merge with the edit the ref has taken.
+  std::fs::remove_file(bob.dir.join("other.txt")).unwrap();
+  let said = bob.push().unwrap_err();
+  assert!(said.contains("the push landed"), "{said}");
+  // The removal is given up, and work goes on.
+  let base = bob.ws.base.unwrap();
+  workspace::restore_to(&mut bob.store, &mut bob.ws, base, AUTHOR, Look::Everywhere).unwrap();
+  bob.write("shared.txt", "other\nv2\n");
+  bob.commit("b2: v2");
+  let synced = bob.push().or_else(|_| bob.sync().map(|synced| remote::Pushed { synced, ..Default::default() })).unwrap();
+  assert!(synced.synced.conflicts.is_empty(), "{synced:?}");
+  bob.push().unwrap();
+  ann.sync().unwrap();
+  assert_eq!((ann.read("shared.txt").as_deref(), ann.read("other.txt").as_deref()), (Some("other\nv2\n"), Some("cat\n")));
+  assert_eq!(history(&mut ann)[..3], ["b2: v2", "b1: v1", "c: other.txt"]);
+
+  // A commit that makes the very change the ref already has is not kept as a commit of nothing.
+  cat.sync().unwrap();
+  cat.write("shared.txt", "other\nsame\n");
+  cat.write("more.txt", "m\n");
+  cat.commit("c: same, and more");
+  cat.push().unwrap();
+  ann.write("shared.txt", "other\nsame\n");
+  ann.commit("a: the same edit");
+  let synced = ann.sync().unwrap();
+  assert_eq!(synced.superseded, 1, "{synced:?}");
+  assert_eq!(ann.ws.base, ann.ws.pushed);
+  let again = ann.push().unwrap();
+  assert_eq!((again.updated, again.rebased), (0, 0), "{again:?}");
 }

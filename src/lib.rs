@@ -18,6 +18,7 @@ pub mod git;
 pub mod gitcli;
 pub mod ignore;
 pub mod index;
+pub mod limits;
 pub mod links;
 pub mod manifest;
 pub mod remote;

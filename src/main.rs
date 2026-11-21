@@ -18,7 +18,9 @@ nv: an experiment in keeping Git's object ids without Git's storage
   nv snapshot <dir> [--recorded | --tracked]
         Record what is on disk as a commit nobody else sees. With --recorded,
         look only at the paths given to `nv record`; with --tracked, only at
-        the files already known, as `git commit -a` does (new files are not found)
+        the files already known, as `git commit -a` does (new files are not found).
+        Either way it is this command's look that is narrowed: `nv commit`
+        publishes everything recorded so far, by whichever command recorded it
   nv record <dir> <path>...
         Say that these paths were written (for a tool that knows its writes)
   nv commit <dir> <message> [--recorded | --tracked]
@@ -34,8 +36,10 @@ nv: an experiment in keeping Git's object ids without Git's storage
   nv restore <dir> <state> [--recorded]
         Make the files what they were at a recorded state: a name given with
         `nv mark`, `base` (the last commit), `~N` (N recorded states ago), the
-        start of an id, or `before-sync` (which undoes the last `nv sync`, files
-        and all). What is on disk is recorded first, so nothing is lost by going
+        start of an id, `before-sync` (which undoes the last `nv sync`, files
+        and all), or `pushed` (the ref as last seen: commits made here and not
+        pushed are set aside, under an id it prints). What is on disk is
+        recorded first, so nothing is lost by going
   nv mark <dir> <name> [--recorded]
         Record what is on disk and name that state, e.g. `green`. A name
         given before moves to the new state
@@ -118,16 +122,19 @@ fn claude_hook() -> Option<()> {
   let root = from.ancestors().find(|dir| dir.join(".nv").join("workspace").is_file())?.to_path_buf();
   // A workspace that is meant to be watched and is not gets its watcher back here: this runs on every tool call.
   newvcs::watch::ensure(&root);
+  // The write is noted before anything is waited for: the note is an append, and a snapshot that
+  // cannot be taken now (another command holds the workspace past the limit) is taken by the next.
+  if let Some(relative) = written.as_ref().and_then(|path| path.strip_prefix(&root).ok()) {
+    Workspace::open(&root).ok()?.record(relative.as_os_str().as_encoded_bytes()).ok()?;
+  }
   let _lock = workspace::lock(&root).ok()?;
   let mut ws = Workspace::open(&root).ok()?;
   let mut store = Store::open(&ws.store).ok()?;
+  workspace::unfold(&mut store, &mut ws).ok()?;
   // Where Git moved on its own, that first: what is recorded is recorded on where the files are.
   let _ = newvcs::colocated::follow(&mut store, &mut ws);
   let look = match written.as_ref().and_then(|path| path.strip_prefix(&root).ok()) {
-    Some(relative) => {
-      ws.record(relative.as_os_str().as_encoded_bytes()).ok()?;
-      Look::Recorded
-    }
+    Some(_) => Look::Recorded,
     None => Look::Everywhere,
   };
   workspace::snapshot(&mut store, &mut ws, AUTHOR, look).ok()?;
@@ -139,6 +146,8 @@ fn claude_hook() -> Option<()> {
 fn opened(dir: &str) -> Result<(Workspace, Store)> {
   let mut ws = Workspace::open(Path::new(dir))?;
   let mut store = Store::open(&ws.store)?;
+  // Snapshots a look in Git's terms set aside are this workspace's again.
+  workspace::unfold(&mut store, &mut ws)?;
   if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
     eprintln!("nv: {done}");
   }
@@ -149,33 +158,35 @@ fn opened(dir: &str) -> Result<(Workspace, Store)> {
 /// environment first, then the workspace's own `user.name` and `user.email`,
 /// then the user's Git configuration; the time now, in the zone this
 /// machine is in, unless the environment gives one.
-fn signature(ws: &Workspace, role: &str) -> String {
+fn signature(ws: &Workspace, role: &str) -> Result<String> {
   let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
   let own =
     |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
   let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
   let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| git::config_value(&ws.root, "user", "name"));
   let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| git::config_value(&ws.root, "user", "email"));
-  let who = match (name, email) {
-    (Some(name), Some(email)) => format!("{name} <{email}>"),
-    _ => AUTHOR.to_string(),
+  // A commit is published under somebody's name. Git refuses to make one up, and so does this.
+  let (Some(name), Some(email)) = (name, email) else {
+    return Err(format!(
+      "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
+    ));
   };
-  let given = from_env("DATE").filter(|date| {
-    let mut parts = date.trim_start_matches('@').split(' ');
-    parts.next().is_some_and(|s| s.parse::<i64>().is_ok()) && parts.next().is_some_and(|zone| zone.len() == 5)
-  });
-  let when = given.map(|date| date.trim_start_matches('@').to_string()).unwrap_or_else(|| {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
-    let east = unsafe {
-      let mut tm: libc::tm = std::mem::zeroed();
-      let at: libc::time_t = now as libc::time_t;
-      libc::localtime_r(&at, &mut tm);
-      tm.tm_gmtoff
-    };
-    format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
-  });
-  format!("{who} {when}")
+  let when = match from_env("DATE") {
+    Some(date) => git::stamp(&date)
+      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
+    None => {
+      let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
+      let east = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let at: libc::time_t = now as libc::time_t;
+        libc::localtime_r(&at, &mut tm);
+        tm.tm_gmtoff
+      };
+      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
+    }
+  };
+  Ok(format!("{name} <{email}> {when}"))
 }
 
 /// A path for a line of output: as it is, or, where it holds a newline, a quote or bytes
@@ -245,6 +256,19 @@ fn run(args: &[String]) -> Result<()> {
     }
     "verify" => {
       let mut store = Store::open(Path::new(arg(1)?))?;
+      // First that every object is what its name says and that the segment ends where a record does.
+      let (objects, damaged) = store.check()?;
+      if !damaged.is_empty() {
+        return Err(format!("{} of {objects} objects are damaged, or the store is cut short:\n{}", damaged.len(), damaged.join("\n")));
+      }
+      // Then the ready copies a checkout clones without reading.
+      let copies = workspace::check_copies(&mut store)?;
+      if !copies.is_empty() {
+        return Err(format!(
+          "{}\nThe store itself is whole; a workspace made from one of these copies may hold the same bytes.",
+          copies.join("\n")
+        ));
+      }
       let (checked, wrong) = git::verify(&mut store)?;
       println!("{checked} commits recomputed from the store in {:.0} ms, {} with a different git id", ms(started), wrong.len());
       if !wrong.is_empty() {
@@ -336,10 +360,16 @@ fn run(args: &[String]) -> Result<()> {
         }
         return Ok(());
       }
-      let rest =
-        format!("author {}\ncommitter {}\n\n{}\n", signature(&ws, "AUTHOR"), signature(&ws, "COMMITTER"), arg(2)?.trim_end()).into_bytes();
+      // The committer is the author unless the environment or the configuration names another, as with Git.
+      let author = signature(&ws, "AUTHOR")?;
+      let committer = signature(&ws, "COMMITTER")?;
+      let rest = format!("author {author}\ncommitter {committer}\n\n{}\n", arg(2)?.trim_end()).into_bytes();
+      let based = ws.base;
       match workspace::commit_saying(&mut store, &mut ws, AUTHOR, rest, look(3))? {
         Some(id) => {
+          workspace::take_branch_along(&mut store, &ws, based)?;
+          // Everything recorded is in the commit: what `nv git add` had set apart for one is spent.
+          let _ = std::fs::remove_file(ws.root.join(".nv").join("git-staged"));
           newvcs::colocated::published(&mut store, &ws)?;
           println!("{} in {:.0} ms", hex(&id), ms(started));
         }
@@ -351,6 +381,19 @@ fn run(args: &[String]) -> Result<()> {
       let target = workspace::state_named(&mut store, &ws, arg(2)?)?;
       let done = match arg(2)? {
         "before-sync" => workspace::restore_before_sync(&mut store, &mut ws, AUTHOR, look(3))?,
+        "pushed" => {
+          let done = workspace::set_aside(&mut store, &mut ws, AUTHOR, look(3))?;
+          if let Some(id) = done.kept {
+            println!(
+              "what this workspace had and the ref does not is set aside as {}: `nv since <dir> {}` lists it, `nv checkout {} {} <another-dir>` writes its files out",
+              hex(&id),
+              &hex(&id)[..12],
+              ws.store.display(),
+              hex(&id)
+            );
+          }
+          done
+        }
         _ => workspace::restore_to(&mut store, &mut ws, target, AUTHOR, look(3))?,
       };
       let kept = done.kept.map(|id| format!("; what was on disk is kept as {}", hex(&id))).unwrap_or_default();
@@ -400,7 +443,12 @@ fn run(args: &[String]) -> Result<()> {
       if named != Some(3) {
         return Err(format!("`{url}` is not a repository on a server: http://host/<owner>/<repo>"));
       }
-      Workspace::open(Path::new(arg(1)?))?.set_remote(url, arg(3)?)?;
+      let name = arg(3)?;
+      let parts_ok = name.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
+      if !parts_ok || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b)) {
+        return Err(format!("`{name}` is not a name for a ref: letters, digits, `-`, `_`, `.` and `/`"));
+      }
+      Workspace::open(Path::new(arg(1)?))?.set_remote(url, name)?;
     }
     "push" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -417,6 +465,9 @@ fn run(args: &[String]) -> Result<()> {
         describe(&done.synced),
         ms(started)
       );
+      if !done.synced.conflicts.is_empty() {
+        std::process::exit(1);
+      }
     }
     "sync" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -441,7 +492,9 @@ fn run(args: &[String]) -> Result<()> {
       if fetched > 0 {
         println!("fetched {fetched} file contents the history needs and this store did not have");
       }
-      let (oid, written) = git::export(&mut store, &base, Path::new(arg(2)?), arg(3)?)?;
+      // A name by itself is a branch's, as it is to `git push`.
+      let name = if arg(3)?.starts_with("refs/") { arg(3)?.to_string() } else { format!("refs/heads/{}", arg(3)?) };
+      let (oid, written) = git::export(&mut store, &base, Path::new(arg(2)?), &name)?;
       println!("{} at {} ({written} git objects written) in {:.0} ms", arg(3)?, hex(&oid), ms(started));
     }
     "adopt" if args.get(2).is_some_and(|a| a == "--undo") => println!("{}", newvcs::colocated::unadopt(Path::new(arg(1)?))?),
@@ -507,6 +560,24 @@ fn describe(s: &remote::Synced) -> String {
     text.push_str(&format!(
       "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers. Edit them, then `nv commit` and `nv push`.",
       s.conflicts.join(", ")
+    ));
+  }
+  if s.cancelled > 0 {
+    text.push_str(&format!(
+      "\n{} commits made here and not yet pushed undid each other: there was nothing of them to put on the ref, and they are not on it",
+      s.cancelled
+    ));
+  }
+  if s.superseded > 0 {
+    text.push_str(&format!(
+      "\n{} commits made here and not yet pushed are dropped: the ref already has the changes they made, under commits of its own",
+      s.superseded
+    ));
+  }
+  if s.folded > 1 {
+    text.push_str(&format!(
+      "\n{} commits made here and not yet pushed are now one commit on top of the ref's, under the message of the last",
+      s.folded
     ));
   }
   if s.before.is_some() {
@@ -619,6 +690,9 @@ fn shaped(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
     let wanted = if count < *least { "too few arguments" } else { "too many arguments" };
     return Err(format!("nv {command}: {wanted}\n{}", usage_of(command)));
   }
+  if given.iter().filter(|option| *option == "--recorded" || *option == "--tracked").count() > 1 {
+    return Err(format!("nv {command}: --recorded and --tracked are two ways of looking; give one\n{}", usage_of(command)));
+  }
   plain.extend(given);
   Ok(Some(plain))
 }
@@ -628,9 +702,33 @@ fn main() -> ExitCode {
   // SAFETY: called once, before any thread or output exists.
   unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
   let args: Vec<String> = std::env::args().skip(1).collect();
+  // Every command has a limit to how long it runs. A watcher is no command but a process that
+  // stays; the step that makes a commit beside Git has its own limit, on Git.
+  let stays = args.first().is_some_and(|a| a == "watch") && args.len() == 2;
+  if !stays && args.first().is_none_or(|a| a != "publish-step") {
+    newvcs::limits::watch_the_clock(&args.iter().take(2).cloned().collect::<Vec<_>>().join(" "));
+  }
   // `nv git …` answers as Git would, exit code and all.
   if args.first().is_some_and(|a| a == "git") {
     return ExitCode::from(newvcs::gitcli::run(&args[1..]) as u8);
+  }
+  // Not a command for a person: the part of publishing beside Git that runs as its own process.
+  if args.first().is_some_and(|a| a == "publish-step") {
+    return ExitCode::from(newvcs::colocated::publish_step(&args[1..]) as u8);
+  }
+  // Started by a hook of a commit nv is publishing, on the workspace it is publishing: that
+  // publishing holds the workspace, and waiting for it would be waiting for oneself.
+  if let Some(publishing) = std::env::var_os("NV_PUBLISHING")
+    && let Some(top) = args
+      .get(1)
+      .and_then(|dir| workspace::top_of(Path::new(dir)))
+      .or_else(|| args.first().filter(|a| *a == "hook" || *a == "git").and_then(|_| workspace::top_of(Path::new("."))))
+    && std::fs::canonicalize(&top).is_ok_and(|top| top.as_os_str() == publishing)
+  {
+    eprintln!(
+      "nv: this workspace is in the middle of `nv commit`, which started the Git hook this command runs in; nv cannot be used on it from inside that commit"
+    );
+    return ExitCode::from(2);
   }
   if args.first().is_some_and(|a| a == "hook") {
     if args.get(1).is_some_and(|a| a == "claude") {
@@ -669,13 +767,27 @@ fn main() -> ExitCode {
     return ExitCode::from(2);
   }
   // A command that trusts reported writes first lets a watcher report the last of them.
-  if let Some(top) = args.get(1).filter(|_| args.iter().any(|a| a == "--recorded")).and_then(|dir| workspace::top_of(Path::new(dir))) {
-    newvcs::watch::settle(&top);
+  // A watcher that cannot say it has is not trusted to have: the command then looks at every file itself.
+  let mut args = args;
+  if let Some(top) = args.get(1).filter(|_| args.iter().any(|a| a == "--recorded")).and_then(|dir| workspace::top_of(Path::new(dir)))
+    && !newvcs::watch::settle(&top)
+  {
+    args.retain(|a| a != "--recorded");
   }
   // One writer at a time in a workspace. A watcher takes the lock for each snapshot instead, not for as long as it runs.
   let _lock = match (args.first().map(String::as_str), args.get(1)) {
     (Some(command), Some(dir)) if command != "watch" && command != "fork" => {
-      workspace::top_of(Path::new(dir)).and_then(|top| workspace::lock(&top).ok())
+      match workspace::top_of(Path::new(dir)).map(|top| workspace::lock(&top)) {
+        Some(Ok(held)) => Some(held),
+        // Another command holds the workspace and did not let go in time: this one does not go
+        // ahead without it, which would be two writers at once.
+        Some(Err(why)) if why.contains("gave up waiting") => {
+          eprintln!("{why}");
+          return ExitCode::from(2);
+        }
+        // A lock file that cannot be made (a read-only `.nv`): the command says what it can and cannot do itself.
+        _ => None,
+      }
     }
     _ => None,
   };

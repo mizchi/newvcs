@@ -30,6 +30,52 @@ impl Entry {
   }
 }
 
+/// Whether a path may be in a tree at all. A commit is bytes that may have
+/// come from anyone, and whoever takes it in writes its paths: so a path
+/// stays inside the workspace by its form alone (no empty part, no `.` or
+/// `..`, not from the root), is nobody's own directory (`.git`, `.nv`, in
+/// any case of letters), has no NUL in it, and has no part longer than a
+/// file system will take. These are Git's rules for a tree, and one more.
+pub fn path_ok(path: &[u8]) -> bool {
+  !path.is_empty() && path.len() <= 4096 && path.split(|&b| b == b'/').all(name_ok)
+}
+
+/// Whether one name, an entry of a directory, may be in a tree: not empty, not `.` or `..`,
+/// no `/` and no NUL in it, and not a name a file system takes for `.git` or `.nv`. Those are
+/// what a checkout would write into Git's directory or nv's own through, from a tree that came
+/// from somebody else.
+pub fn name_ok(name: &[u8]) -> bool {
+  !name.is_empty() && name.len() <= 255 && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0) && !reserved(name)
+}
+
+/// A name that is `.git` or `.nv` to some file system: in any case; with characters HFS+ ignores
+/// in it; with the dots and spaces NTFS drops from the end; as NTFS's short name; or in letters
+/// that are those letters once Unicode compatibility folding is done.
+fn reserved(name: &[u8]) -> bool {
+  use unicode_normalization::UnicodeNormalization;
+  let text = String::from_utf8_lossy(name);
+  let ignorable = |c: &char| matches!(*c as u32, 0x200c..=0x200f | 0x202a..=0x202e | 0x206a..=0x206f | 0xfeff);
+  let folded: String = text.chars().filter(|c| !ignorable(c)).collect::<String>().nfkc().collect::<String>().to_lowercase();
+  let trimmed = folded.trim_end_matches(['.', ' ']);
+  let short = |stem: &str| {
+    trimmed
+      .strip_prefix(stem)
+      .and_then(|rest| rest.strip_prefix('~'))
+      .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+  };
+  trimmed == ".git" || trimmed == ".nv" || short("git") || short("nv")
+}
+
+/// The modes an entry may have: a file (with whatever permissions Git has ever
+/// written: 644, 755, and in its first weeks 664), a link, a directory, another
+/// repository's commit. What kind of thing it is must be one of those.
+pub fn mode_ok(mode: u32) -> bool {
+  match mode & 0o170000 {
+    0o100000 => mode & !0o170777 == 0,
+    _ => matches!(mode, MODE_LINK | MODE_DIR | MODE_GITLINK),
+  }
+}
+
 pub type Dir = BTreeMap<Vec<u8>, Entry>;
 
 pub fn encode(dir: &Dir) -> Vec<u8> {
@@ -43,14 +89,28 @@ pub fn encode(dir: &Dir) -> Vec<u8> {
   out
 }
 
+/// A tree, from its bytes. It is checked as a commit is: a tree may have come from a server, and
+/// whatever its names say is where its files are written.
 pub fn decode(mut bytes: &[u8]) -> Result<Dir> {
   let mut dir = Dir::new();
+  let mut last: Option<Vec<u8>> = None;
   while !bytes.is_empty() {
     let bad = || "a tree object is cut short".to_string();
     let mode = u32::from_le_bytes(bytes.get(..4).ok_or_else(bad)?.try_into().unwrap());
     let len = u32::from_le_bytes(bytes.get(4..8).ok_or_else(bad)?.try_into().unwrap()) as usize;
-    let name = bytes.get(8..8 + len).ok_or_else(bad)?.to_vec();
+    let name = bytes.get(8..8usize.saturating_add(len)).ok_or_else(bad)?.to_vec();
     let id: Id = bytes.get(8 + len..8 + len + 32).ok_or_else(bad)?.try_into().unwrap();
+    if !name_ok(&name) {
+      return Err(format!("a tree names an entry `{}`, which no tree may have", String::from_utf8_lossy(&name)));
+    }
+    if !mode_ok(mode) {
+      return Err(format!("a tree gives `{}` a mode no file has", String::from_utf8_lossy(&name)));
+    }
+    // In order and once each, as every tree is written.
+    if last.as_ref().is_some_and(|last| *last >= name) {
+      return Err(format!("a tree has `{}` out of order, or twice", String::from_utf8_lossy(&name)));
+    }
+    last = Some(name.clone());
     dir.insert(name, Entry { mode, id });
     bytes = &bytes[8 + len + 32..];
   }
@@ -434,5 +494,47 @@ mod tests {
     let step = [change("vendor/lib", Some(Entry { mode: MODE_DIR, id: other }))];
     assert_eq!(expand(&mut s, after, &step).unwrap(), [change("vendor/lib/a", file(12))]);
     assert_eq!(apply(&mut s, after, &step).unwrap(), replaced);
+  }
+
+  #[test]
+  fn a_tree_whose_names_lead_out_is_refused() {
+    let tree = |name: &[u8], mode: u32| {
+      let mut dir = Dir::new();
+      dir.insert(name.to_vec(), Entry { mode, id: [7; 32] });
+      encode(&dir)
+    };
+    for name in [
+      &b"../../outside/pwned"[..],
+      b"..",
+      b".",
+      b"",
+      b"a/b",
+      b".git",
+      b".GIT",
+      b".Git.",
+      b".git ",
+      ".g\u{200c}it".as_bytes(),
+      "\u{feff}.git".as_bytes(),
+      ".\u{ff47}it".as_bytes(),
+      b"GIT~1",
+      b".nv",
+      b".NV",
+      b"nv~1",
+      b"a\0b",
+    ] {
+      assert!(decode(&tree(name, 0o100644)).is_err(), "{:?} was taken as a name", String::from_utf8_lossy(name));
+    }
+    assert!(decode(&tree(b"ok.txt", 0o104755)).is_err(), "a set-uid mode");
+    assert!(decode(&tree(b"ok.txt", 0)).is_err(), "mode 0");
+    for name in [&b".gitignore"[..], b".github", b"git", b".gitx", b"x.git", b".nvmrc", "caf\u{e9}".as_bytes()] {
+      assert!(decode(&tree(name, 0o100644)).is_ok(), "{:?} was refused", String::from_utf8_lossy(name));
+    }
+    // Twice, and out of order.
+    let mut twice = tree(b"same", 0o100644);
+    twice.extend(tree(b"same", MODE_DIR));
+    assert!(decode(&twice).is_err());
+    let mut backwards = tree(b"b", 0o100644);
+    backwards.extend(tree(b"a", 0o100644));
+    assert!(decode(&backwards).is_err());
   }
 }

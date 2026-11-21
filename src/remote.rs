@@ -30,6 +30,18 @@ use std::io::Read;
 /// which has 128 MB for everything; the bucket takes a stream.
 pub const LARGE: usize = 1 << 20;
 
+/// The one client every request goes through: none waits for ever on a server that went quiet.
+fn http() -> &'static ureq::Agent {
+  static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+  AGENT.get_or_init(|| {
+    let mut agent = ureq::AgentBuilder::new();
+    if let Some(quiet) = crate::limits::http_quiet() {
+      agent = agent.timeout_connect(quiet.min(std::time::Duration::from_secs(10))).timeout_read(quiet).timeout_write(quiet);
+    }
+    agent.build()
+  })
+}
+
 fn body(response: ureq::Response) -> Result<Vec<u8>> {
   let mut bytes = Vec::new();
   response.into_reader().read_to_end(&mut bytes).map_err(|e| format!("cannot read the server's answer: {e}"))?;
@@ -57,9 +69,23 @@ fn id_of(value: &serde_json::Value) -> Result<Id> {
   value.as_str().and_then(unhex).and_then(|b| b.try_into().ok()).ok_or_else(|| "the server's answer lacks an id".to_string())
 }
 
+/// Nothing is pushed or caught up with while a file still holds both versions from the last
+/// sync: a second sync would forget that it does, and what was pushed next would have the
+/// markers in it.
+fn settled(ws: &Workspace) -> Result<()> {
+  let left = workspace::unsettled(ws);
+  if left.is_empty() {
+    return Ok(());
+  }
+  Err(format!(
+    "these still hold both versions between markers, from the last sync: {}\nEdit them to what they should be and `nv commit`; or `nv restore <dir> before-sync` to undo that sync.",
+    left.join(", ")
+  ))
+}
+
 fn cannot_merge(paths: &[String]) -> String {
   format!(
-    "the ref and this workspace both changed, in ways that cannot be merged as text: {}\nNothing was touched. Name your state (`nv mark <dir> mine`), give up your change to those paths, sync, and make the change again on top; `nv restore <dir> mine` goes back to where you were.",
+    "the ref and this workspace both changed, in ways that cannot be merged as text: {}\nNothing was touched. Either make those paths what the ref has and commit, or set this workspace's unpushed work aside with `nv restore <dir> pushed` (it says under which id the work is kept), sync, and make the change again on top.",
     paths.join(", ")
   )
 }
@@ -123,11 +149,13 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
   // by themselves, in one answer. The files are fetched like any others, if they are in view.
   if !dirs.is_empty() {
     let asked: String = dirs.iter().map(|id| hex(id) + "\n").collect();
-    let (status, answer) = send(ureq::post(&format!("{url}/fetch/trees")), Some(asked.as_bytes()))?;
+    let (status, answer) = send(http().post(&format!("{url}/fetch/trees")), Some(asked.as_bytes()))?;
     if status != 200 {
       return Err(format!("the server did not hand over a directory a commit names ({status})"));
     }
     for bytes in frames(&answer)? {
+      // Read before it is kept: its names are where its files will be written.
+      crate::manifest::decode(bytes)?;
       store.put(Kind::Tree, bytes, None)?;
     }
     if let Some(lost) = dirs.iter().find(|id| !store.contains(id)) {
@@ -141,10 +169,35 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
 /// names its newest commits, and the server answers with the first one the
 /// ref's history holds. `Ok(false)` when the ref does not exist yet.
 fn find_place(store: &mut Store, ws: &mut Workspace, url: &str, name: &str) -> Result<bool> {
+  // The workspace's commit stands on what it last saw of the ref, as a rule. If it was moved
+  // elsewhere (a reset to an older commit, another branch), what it "last saw" is not behind it
+  // any more: taken as the common point, the difference would read as this workspace having
+  // undone the ref's commits. Its place is then asked for again.
+  if let Some(pushed) = ws.pushed {
+    // Back from the workspace's commit through the commits it made itself: what they stand on
+    // has to be what it last saw of the ref. Another commit met first is one the ref brought
+    // some other way (a branch that caught up, gone to after this one was taken back).
+    let own: std::collections::HashSet<String> = ws.operations().into_iter().map(|(_, _, id)| id).collect();
+    let mut at = ws.base;
+    let mut stands = false;
+    while let Some(id) = at {
+      if id == pushed {
+        stands = true;
+        break;
+      }
+      if !own.contains(&hex(&id)) {
+        break;
+      }
+      at = Commit::load(store, &id)?.parents.first().copied();
+    }
+    if !stands {
+      (ws.pushed, ws.seq) = (None, 0);
+    }
+  }
   if ws.pushed.is_some() {
     return Ok(true);
   }
-  let (status, _) = send(ureq::get(&format!("{url}/refs/{name}")), None)?;
+  let (status, _) = send(http().get(&format!("{url}/refs/{name}")), None)?;
   if status == 404 {
     return Ok(false);
   }
@@ -158,7 +211,7 @@ fn find_place(store: &mut Store, ws: &mut Workspace, url: &str, name: &str) -> R
       ids.extend_from_slice(&id);
       at = Commit::load(store, &id)?.parents.first().copied();
     }
-    let (status, answer) = send(ureq::post(&format!("{url}/locate/{name}")), Some(&ids))?;
+    let (status, answer) = send(http().post(&format!("{url}/locate/{name}")), Some(&ids))?;
     if status == 200 {
       let answer = json(&answer)?;
       (ws.pushed, ws.seq) = (Some(id_of(&answer["id"])?), answer["seq"].as_u64().unwrap_or(0));
@@ -190,7 +243,7 @@ fn hand_over(store: &mut Store, url: &str, links_root: Option<Id>, path: &[u8], 
     None => None,
   };
   let query = from.map(|name| format!("?from={name}")).unwrap_or_default();
-  let (status, answer) = send(ureq::post(&format!("{url}/adopt/trees{query}")), Some(&body))?;
+  let (status, answer) = send(http().post(&format!("{url}/adopt/trees{query}")), Some(&body))?;
   if status != 200 {
     return Err(format!("the server refused a directory ({status}): {}", String::from_utf8_lossy(&answer)));
   }
@@ -219,6 +272,7 @@ pub struct Pushed {
 /// went through meanwhile. On a conflict nothing of the workspace changes
 /// and the error names the paths; the server has kept the commit aside.
 pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushed> {
+  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
   let mut done = Pushed::default();
@@ -236,6 +290,14 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   if chain.is_empty() {
     done.synced = sync(store, ws, author)?;
     return Ok(done);
+  }
+  // A ref is one line of commits. A merge has a second parent the ref would not have, and whoever
+  // synced it could not read its history.
+  if let Some(merge) = chain.iter().find(|commit| commit.parents.len() > 1) {
+    let said = String::from_utf8_lossy(&merge.rest).lines().last().unwrap_or_default().to_string();
+    return Err(format!(
+      "the commit \"{said}\" is a merge of two lines of commits, and a ref holds one line: it cannot be pushed as it is.\nNothing was sent. Make its changes one ordinary commit on the branch (with `nv git`: `reset --soft` to the commit before the merge, then `commit`), and push again."
+    ));
   }
   chain.reverse();
   // A workspace starting a ref may find, by the time its push arrives, that
@@ -276,7 +338,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     if bytes.len() >= LARGE {
       // By itself and ahead of the push: it is streamed into the bucket and never passes
       // through the object that orders the ref, which could not hold it.
-      let (status, answer) = send(ureq::put(&format!("{url}/objects/{}", hex(&id))), Some(&bytes))?;
+      let (status, answer) = send(http().put(&format!("{url}/objects/{}", hex(&id))), Some(&bytes))?;
       if status != 204 {
         return Err(format!("the server refused a large file ({status}): {}", String::from_utf8_lossy(&answer)));
       }
@@ -286,7 +348,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     }
     done.contents_sent += 1;
   }
-  let (_, answer) = send(ureq::post(&format!("{url}/push/{name}?after={}&commits={}", ws.seq, chain.len())), Some(&body))?;
+  let (_, answer) = send(http().post(&format!("{url}/push/{name}?after={}&commits={}", ws.seq, chain.len())), Some(&body))?;
   let answer = json(&answer)?;
   match answer["status"].as_str() {
     Some("updated") => done.updated += chain.len(),
@@ -305,9 +367,28 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   let tip = Some(Tip { id: id_of(&answer["commit"])?, seq: answer["seq"].as_u64().unwrap_or(0) });
   if let Some(tip) = tip {
     let commits = done.synced.commits;
-    done.synced = arrive(store, ws, &url, tip, author)?;
+    let landed_at = tip.seq;
+    let arrived = arrive(store, ws, &url, tip, author);
+    if arrived.is_err() {
+      // The ref has these commits: from here on it is this workspace's last of them that the two
+      // agree on, and what the ref takes after this position that a push is checked against.
+      (ws.pushed, ws.seq) = (ws.base, landed_at);
+      ws.save()?;
+    }
+    done.synced = arrived.map_err(|why| {
+      format!(
+        "the push landed: its {} are on the ref. Catching up with the ref afterwards did not come about, and the files are as they were:\n{why}",
+        if chain.len() == 1 { "commit is".to_string() } else { format!("{} commits are", chain.len()) }
+      )
+      .replace("commit is are on", "commit is on")
+      .replace("commits are are on", "commits are on")
+    })?;
     done.synced.commits = commits;
+    // Its own commits under the ids the ref gave them are the push itself, not commits dropped.
+    done.synced.superseded = 0;
   }
+  // What was pushed stands on what the last sync brought: there is no sync left to take back.
+  workspace::Standing::forget(ws);
   Ok(done)
 }
 
@@ -328,19 +409,27 @@ pub struct Synced {
   pub conflicts: Vec<String>,
   /// The workspace's state before any of this, to go back to: set when something was merged.
   pub before: Option<Id>,
+  /// How many commits, published here and not pushed, were put on the tip as one.
+  pub folded: usize,
+  /// How many commits, published here and not pushed, came to no change between them.
+  pub cancelled: usize,
+  /// How many commits, published here and not pushed, were dropped because the ref already has
+  /// the changes they made, under commits of its own.
+  pub superseded: usize,
 }
 
 /// Bring the workspace to the ref's tip, keeping its own unpushed work on
 /// top. One request for the commits, and one for the contents of the files
 /// that changed inside the view, if any did.
 pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synced> {
+  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
   if !find_place(store, ws, &url, &name)? {
     return Ok(Synced::default());
   }
   resume(store, ws, &url, author)?;
-  let (status, answer) = send(ureq::get(&format!("{url}/since/{name}?after={}", ws.seq)), None)?;
+  let (status, answer) = send(http().get(&format!("{url}/since/{name}?after={}", ws.seq)), None)?;
   if status != 200 {
     return Err(format!("the server refused to say where the ref is ({status})"));
   }
@@ -364,7 +453,7 @@ fn fetch_contents(store: &mut Store, url: &str, wanted: &[(Id, Option<Id>)]) -> 
     return Ok((0, 0));
   }
   let asked: String = wanted.iter().map(|(id, _)| hex(id) + "\n").collect();
-  let (status, answer) = send(ureq::post(&format!("{url}/fetch/objects")), Some(asked.as_bytes()))?;
+  let (status, answer) = send(http().post(&format!("{url}/fetch/objects")), Some(asked.as_bytes()))?;
   if status != 200 {
     return Err(format!("the server refused to hand over file contents ({status})"));
   }
@@ -379,7 +468,12 @@ fn fetch_contents(store: &mut Store, url: &str, wanted: &[(Id, Option<Id>)]) -> 
   }
   // The large ones are not in the answer: each is its own object in the bucket.
   for id in json(head)?["direct"].as_array().into_iter().flatten().filter_map(|id| id.as_str()) {
-    let (status, bytes) = send(ureq::get(&format!("{url}/objects/{id}")), None)?;
+    // Only what was asked for, by its full name: the id goes into a URL.
+    let asked = unhex(id).and_then(|bytes| Id::try_from(bytes).ok()).is_some_and(|id| wanted.iter().any(|(want, _)| *want == id));
+    if !asked {
+      return Err(format!("the server named {id} as a large file, which was not asked for"));
+    }
+    let (status, bytes) = send(http().get(&format!("{url}/objects/{id}")), None)?;
     if status != 200 {
       return Err(format!("the server did not hand over the large file {id} ({status})"));
     }
@@ -436,7 +530,7 @@ pub fn fetch_for_export(store: &mut Store, ws: &Workspace) -> Result<usize> {
 }
 
 fn arriving(ws: &Workspace) -> std::path::PathBuf {
-  ws.root.join(".nv").join("arriving")
+  workspace::arriving(ws)
 }
 
 /// Finish an arrival that a killed process left half done. Its files may be
@@ -459,13 +553,6 @@ fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &s
   arrive_from(store, ws, url, tip, author, false)
 }
 
-/// A file both sides changed: one text holding both changes, or, where they changed
-/// the same lines, both versions between markers and the entry the ref has.
-enum Merged {
-  Clean(Entry),
-  Both(Vec<u8>, Entry),
-}
-
 const MODE_KIND: u32 = 0o170000;
 const MODE_FILE: u32 = 0o100000;
 
@@ -480,7 +567,8 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   let before = ws.head;
   let standing = workspace::Standing { head: ws.head, base: ws.base, pushed: ws.pushed, seq: ws.seq };
 
-  // Both sides as changes since the point they last agreed on.
+  // Three states and the point they last agreed on: what the ref has (`tip`), what this
+  // workspace published and has not pushed (`base`), and its files as recorded (`head`).
   // A workspace that just started the ref agrees with it on its own commit.
   let common = ws.pushed.or(ws.base);
   let root = |store: &mut Store, id: Option<Id>| match id {
@@ -488,91 +576,215 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     None => Ok(None),
   };
   let from = root(store, common)?;
-  let (theirs_root, published_root, mine_root) = (root(store, Some(tip))?, root(store, ws.base)?, root(store, ws.head)?);
+  let (tip_root, base_root, head_root) = (root(store, Some(tip))?, root(store, ws.base)?, root(store, ws.head)?);
   // A directory either side set whole, and that still is that directory, stays one change.
   let mut whole = workspace::whole_since(store, Some(tip), common)?;
   whole.extend(workspace::whole_since(store, ws.head, common)?);
-  let mut theirs = diff_keeping(store, from, theirs_root, &whole)?;
-  let mut mine = diff_keeping(store, from, mine_root, &whole)?;
-  let mut published = diff_keeping(store, from, published_root, &whole)?;
-  // What both did alike is nobody's change: after a push, that is this workspace's own work.
-  let same: Vec<Change> = mine.iter().filter(|m| theirs.contains(m)).cloned().collect();
-  mine.retain(|m| !same.contains(m));
-  published.retain(|p| !same.contains(p));
-  theirs.retain(|t| !same.contains(t));
-  // A file both changed is merged, as text, the way Git merges it. Anything else both
-  // touched (one removed it, one made it a directory, a link) is for a person to decide.
-  let file = |entry: &Option<Entry>| entry.filter(|e| e.mode & MODE_KIND == MODE_FILE);
-  let both: Vec<(Vec<u8>, Entry, Entry)> = mine
-    .iter()
-    .filter_map(|(path, ours)| {
-      let (_, theirs) = theirs.iter().find(|(theirs, _)| theirs == path)?;
-      Some((path.clone(), file(ours)?, file(theirs)?))
-    })
-    .collect();
-  let clash: Vec<String> = mine
-    .iter()
-    .filter(|(m, _)| !both.iter().any(|(path, _, _)| path == m) && theirs.iter().any(|(t, _)| paths_conflict(m, t)))
-    .map(|(m, _)| String::from_utf8_lossy(m).into_owned())
-    .collect();
-  if !clash.is_empty() {
-    return Err(cannot_merge(&clash));
+  let mut theirs = diff_keeping(store, from, tip_root, &whole)?;
+  let mut published = diff_keeping(store, from, base_root, &whole)?;
+  // What the files have become since the last commit made here: kept apart from that commit all
+  // the way through. Merged with theirs as if it were committed, it would come out committed.
+  let unpublished = diff_keeping(store, base_root, head_root, &whole)?;
+  let chain = |store: &mut Store| -> Result<usize> {
+    let (mut count, mut at) = (0, ws.base);
+    while let Some(id) = at.filter(|id| Some(*id) != common) {
+      count += 1;
+      at = Commit::load(store, &id)?.parents.first().copied();
+    }
+    Ok(count)
+  };
+  if published.is_empty() && ws.base != common && Some(tip) != ws.base {
+    done.cancelled = chain(store)?;
+  }
+  // What the ref has that this workspace published is this workspace's own work, landed: not a
+  // change of theirs.
+  let landed: Vec<Change> = published.iter().filter(|p| theirs.contains(p)).cloned().collect();
+  published.retain(|p| !landed.contains(p));
+  theirs.retain(|t| !landed.contains(t));
+  if !published.is_empty() {
+    // Commits published here and not pushed come out of this as one commit: said, not done silently.
+    done.folded = chain(store)?;
+  } else if !landed.is_empty() && ws.base != common && Some(tip) != ws.base {
+    // The ref has the same changes, and not these commits: they are dropped, and that is said too.
+    let mut on_the_ref = false;
+    let mut at = Some(tip);
+    while let Some(id) = at.filter(|id| Some(*id) != common) {
+      if Some(id) == ws.base {
+        on_the_ref = true;
+        break;
+      }
+      at = Commit::load(store, &id)?.parents.first().copied();
+    }
+    if !on_the_ref {
+      done.superseded = chain(store)?;
+    }
   }
 
-  // On disk a directory is its files.
-  let theirs = workspace::removals_first(expand(store, from, &theirs)?);
-  // Their changes onto the disk, inside the view only. The contents this
-  // store lacks come in one request.
-  let mut index = ws.load_index();
-  let mut placed = workspace::Placed::default();
+  let file = |entry: &Option<Entry>| entry.filter(|e| e.mode & MODE_KIND == MODE_FILE);
+  let at = |store: &mut Store, root: Option<Id>, path: &[u8]| -> Result<Option<Entry>> {
+    Ok(match root {
+      Some(root) => crate::manifest::lookup(store, root, path)?,
+      None => None,
+    })
+  };
+  // The contents this store lacks: what is to be written inside the view, and theirs of every
+  // file that has to be merged. One request.
+  let theirs_files = workspace::removals_first(expand(store, from, &theirs)?);
+  let index = ws.load_index();
   let mut wanted: Vec<(Id, Option<Id>)> = Vec::new();
-  for (path, entry) in &theirs {
+  for (path, entry) in &theirs_files {
     if !in_view(&ws.prefixes, path, false) {
       done.outside_view += 1;
     } else if let Some(entry) = entry.filter(|e| e.mode != MODE_GITLINK && !store.contains(&e.id)) {
       wanted.push((entry.id, index.get(path).map(|known| known.entry.id)));
     }
   }
-  for (_, ours, theirs) in &both {
-    if !store.contains(&theirs.id) && !wanted.iter().any(|(id, _)| *id == theirs.id) {
-      wanted.push((theirs.id, Some(ours.id)));
+  for (path, entry) in &theirs {
+    let touched = published.iter().chain(&unpublished).any(|(mine, _)| mine == path);
+    if let Some(entry) = file(entry).filter(|e| touched && !store.contains(&e.id) && !wanted.iter().any(|(id, _)| *id == e.id)) {
+      wanted.push((entry.id, None));
     }
   }
+  drop(index);
   let (fetched, large) = fetch_contents(store, url, &wanted)?;
   done.contents_fetched += fetched;
   done.large_fetched += large;
-  // The files both changed, merged before anything is written: one that cannot be merged stops the sync here.
-  let mut merges: std::collections::HashMap<Vec<u8>, Merged> = Default::default();
-  let mut binary = Vec::new();
-  for (path, ours, theirs) in &both {
-    let content =
-      |store: &mut Store, id: &Id| store.get(id)?.ok_or_else(|| format!("the content of {} is missing", String::from_utf8_lossy(path)));
-    let base = match from {
-      Some(root) => crate::manifest::lookup(store, root, path)?.filter(|e| !e.is_dir()),
-      None => None,
+
+  // One file, three ways. `Ok(None)`: not text, not to be merged.
+  let content = |store: &mut Store, entry: Option<Entry>| -> Result<std::sync::Arc<Vec<u8>>> {
+    match entry {
+      Some(entry) => store.get(&entry.id)?.ok_or_else(|| format!("the content {} is missing", hex(&entry.id))),
+      None => Ok(Default::default()),
+    }
+  };
+  let three_way = |store: &mut Store, was: Option<Entry>, ours: Entry, theirs: Entry| -> Result<Option<(Vec<u8>, bool, u32)>> {
+    // The mode is merged as the text is: whoever changed it from what both had, has it.
+    let mode = match was {
+      Some(was) if was.mode == ours.mode => theirs.mode,
+      _ => ours.mode,
     };
-    let base = match base {
-      Some(base) => content(store, &base.id)?,
-      None => Default::default(),
-    };
-    let (ours_bytes, theirs_bytes) = (content(store, &ours.id)?, content(store, &theirs.id)?);
-    if ours_bytes.contains(&0) || theirs_bytes.contains(&0) {
-      binary.push(String::from_utf8_lossy(path).into_owned());
+    let (was, ours, theirs) = (content(store, was.filter(|e| !e.is_dir()))?, content(store, Some(ours))?, content(store, Some(theirs))?);
+    if ours.contains(&0) || theirs.contains(&0) {
+      return Ok(None);
+    }
+    let (text, clean) = crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs");
+    Ok(Some((text, clean, mode)))
+  };
+  let mut clash: Vec<String> = Vec::new();
+  let name = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
+
+  // First what was published here against what the ref took: commit against commit.
+  let mut merged_published: std::collections::HashMap<Vec<u8>, Entry> = Default::default();
+  let mut unsettled: std::collections::HashSet<Vec<u8>> = Default::default();
+  for (path, ours) in &published {
+    match theirs.iter().find(|(other, _)| other == path) {
+      Some((_, their)) => match (file(ours), file(their)) {
+        (Some(ours), Some(their)) => {
+          let was = at(store, from, path)?;
+          match three_way(store, was, ours, their)? {
+            Some((text, true, mode)) => {
+              merged_published.insert(path.clone(), Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? });
+            }
+            Some(_) => {
+              unsettled.insert(path.clone());
+            }
+            None => clash.push(name(path)),
+          }
+        }
+        _ => clash.push(name(path)),
+      },
+      None if theirs.iter().any(|(other, _)| paths_conflict(path, other)) => clash.push(name(path)),
+      None => {}
+    }
+  }
+  // What this workspace's commit is, put on the tip: its changes, the merged ones merged. A file
+  // left for a person is out of it: there the workspace is on what the ref has.
+  let had_some = !published.is_empty();
+  let published: Vec<Change> = published
+    .into_iter()
+    .filter(|(path, _)| !unsettled.contains(path))
+    .map(|(path, entry)| match merged_published.get(&path) {
+      Some(merged) => (path, Some(*merged)),
+      None => (path, entry),
+    })
+    // Merged, a change may come to exactly what the ref has: then it is no change to put on the tip.
+    .filter(|(path, entry)| theirs.iter().find(|(other, _)| other == path).is_none_or(|(_, their)| their != entry))
+    .collect();
+  if had_some && published.is_empty() && unsettled.is_empty() {
+    (done.superseded, done.folded) = (done.folded, 0);
+  }
+  // What the new commit has at a path, where that is not what the old one had.
+  let moved = |path: &[u8]| -> Option<Option<Entry>> {
+    if let Some(merged) = merged_published.get(path) {
+      return Some(Some(*merged));
+    }
+    theirs.iter().find(|(other, _)| other == path).map(|(_, entry)| *entry)
+  };
+
+  // Then what the files have become since, onto that: each change against the commit it was made on.
+  enum Outcome {
+    /// The file is to hold this, and it differs from the new commit by it.
+    Pending(Option<Entry>),
+    /// Both versions between markers, for a person.
+    Both(Vec<u8>, u32),
+  }
+  let mut outcome: std::collections::HashMap<Vec<u8>, Outcome> = Default::default();
+  let mut merges = 0;
+  for (path, now) in &unpublished {
+    if unsettled.contains(path) {
       continue;
     }
-    let (text, clean) = crate::gitcli::merge_text_named(&base, &ours_bytes, &theirs_bytes, "yours", "theirs");
-    merges.insert(
-      path.clone(),
-      if clean {
-        Merged::Clean(Entry { mode: ours.mode, id: store.put(Kind::Blob, &text, Some(ours.id))? })
-      } else {
-        Merged::Both(text, *theirs)
+    let Some(new) = moved(path) else {
+      // The commit below it did not change at this path: the change stands as it is.
+      if theirs.iter().any(|(other, _)| paths_conflict(path, other)) {
+        clash.push(name(path));
+      }
+      outcome.insert(path.clone(), Outcome::Pending(*now));
+      continue;
+    };
+    if *now == new {
+      continue;
+    }
+    let was = at(store, base_root, path)?;
+    match (file(now), file(&new)) {
+      (Some(ours), Some(their)) => match three_way(store, was, ours, their)? {
+        Some((text, true, mode)) => {
+          let merged = Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? };
+          merges += 1;
+          if Some(merged) != new {
+            outcome.insert(path.clone(), Outcome::Pending(Some(merged)));
+          }
+        }
+        Some((text, false, mode)) => {
+          outcome.insert(path.clone(), Outcome::Both(text, mode));
+        }
+        None => clash.push(name(path)),
       },
-    );
+      _ => clash.push(name(path)),
+    }
   }
-  if !binary.is_empty() {
-    return Err(cannot_merge(&binary));
+  // A file the two commits changed in the same lines: both versions, the workspace's being the
+  // file as it is now.
+  for path in &unsettled {
+    let (was, their) = (at(store, from, path)?, moved(path).flatten());
+    let ours = file(&at(store, head_root, path)?).or(file(&at(store, base_root, path)?));
+    match (ours, their) {
+      (Some(ours), Some(their)) => match three_way(store, was, ours, their)? {
+        Some((text, _, mode)) => {
+          outcome.insert(path.clone(), Outcome::Both(text, mode));
+        }
+        None => clash.push(name(path)),
+      },
+      _ => clash.push(name(path)),
+    }
   }
+  if !clash.is_empty() {
+    clash.sort();
+    clash.dedup();
+    return Err(cannot_merge(&clash));
+  }
+  done.merged = merged_published.len() + merges;
+
   // From here files are written. Should this process be killed, the next one finishes the arrival
   // from what is recorded, and does not take half-written files for the workspace's own work.
   store.flush()?;
@@ -580,46 +792,87 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     standing.keep(ws)?;
   }
   crate::write_whole(&arriving(ws), format!("{} {seq}\n", hex(&tip)))?;
-  for (path, entry) in &theirs {
-    if !in_view(&ws.prefixes, path, false) {
+  let mut index = ws.load_index();
+  let mut placed = workspace::Placed::default();
+  let mut pending: Vec<Change> = Vec::new();
+  // The paths the files may have to change at: where the commit below them moved, and where a merge was made.
+  let mut paths: Vec<(Vec<u8>, Option<Entry>)> = theirs_files.clone();
+  for path in outcome.keys() {
+    if !paths.iter().any(|(other, _)| other == path) {
+      let new = moved(path).unwrap_or(at(store, base_root, path)?);
+      paths.push((path.clone(), new));
+    }
+  }
+  for (path, new) in workspace::removals_first(paths) {
+    if !in_view(&ws.prefixes, &path, false) {
       continue;
     }
-    match merges.get(path) {
-      // Theirs and this workspace's in one file: that is what the workspace now has changed.
-      Some(Merged::Clean(merged)) => {
-        placed.add(path.clone(), workspace::place(store, &ws.root, path, *merged)?);
-        for side in [&mut mine, &mut published] {
-          side.iter_mut().filter(|(p, _)| p == path).for_each(|(_, entry)| *entry = Some(*merged));
+    // The merged commit's, where the two commits were merged in this file.
+    let new = merged_published.get(&path).map_or(new, |merged| Some(*merged));
+    let on_disk = at(store, head_root, &path)?;
+    match outcome.remove(&path) {
+      // Both versions between markers, on disk and not recorded: theirs is what the workspace is on.
+      Some(Outcome::Both(text, mode)) => {
+        let file = ws.root.join(workspace::to_path(&path));
+        if let Some(parent) = file.parent() {
+          std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        done.merged += 1;
+        std::fs::write(&file, text).map_err(|e| e.to_string())?;
+        // The text is for a person to settle; the mode is settled already, and is on the file.
+        use std::os::unix::fs::PermissionsExt;
+        let bits = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(bits)).map_err(|e| e.to_string())?;
+        match new {
+          Some(new) => index.insert(path.clone(), crate::index::Indexed { entry: new, size: 0, mtime: 0, ctime: 0 }),
+          None => index.remove(&path),
+        }
+        done.conflicts.push(name(&path));
         continue;
       }
-      // Both versions between markers, on disk and not recorded: theirs is what the workspace is on.
-      Some(Merged::Both(text, theirs)) => {
-        std::fs::write(ws.root.join(workspace::to_path(path)), text).map_err(|e| e.to_string())?;
-        index.insert(path.clone(), crate::index::Indexed { entry: *theirs, size: 0, mtime: 0 });
-        mine.retain(|(p, _)| p != path);
-        published.retain(|(p, _)| p != path);
-        done.conflicts.push(String::from_utf8_lossy(path).into_owned());
+      Some(Outcome::Pending(wanted)) => {
+        // The file as this workspace has it (merged with theirs, if theirs changed it): a
+        // difference from the new commit, as it was from the old.
+        if wanted != on_disk {
+          match wanted {
+            Some(entry) => placed.add(path.clone(), workspace::place(store, &ws.root, &path, entry)?),
+            None => {
+              workspace::unplace(&ws.root, &path);
+              index.remove(&path);
+            }
+          }
+        }
+        if wanted != new {
+          pending.push((path.clone(), wanted));
+        }
         continue;
       }
       None => {}
     }
-    match entry {
+    if new == on_disk {
+      continue;
+    }
+    match new {
       Some(entry) => {
         if entry.mode != MODE_GITLINK && !store.contains(&entry.id) {
-          return Err(format!("the server did not hand over the content of {}", String::from_utf8_lossy(path)));
+          return Err(format!("the server did not hand over the content of {}", name(&path)));
         }
-        placed.add(path.clone(), workspace::place(store, &ws.root, path, *entry)?);
+        placed.add(path.clone(), workspace::place(store, &ws.root, &path, entry)?);
         done.written += 1;
       }
       None => {
-        workspace::unplace(&ws.root, path);
-        index.remove(path);
+        workspace::unplace(&ws.root, &path);
+        index.remove(&path);
         done.removed += 1;
       }
     }
   }
+  // Changes whose paths were not walked above (outside the view there are none of the workspace's).
+  for (path, outcome) in outcome {
+    if let Outcome::Pending(wanted) = outcome {
+      pending.push((path, wanted));
+    }
+  }
+  pending.sort_by(|a, b| a.0.cmp(&b.0));
   // This workspace's own work, now on top of the tip: what it had published
   // but not pushed stays one published commit, with the message it had, and
   // what it had only recorded stays recorded on top of that.
@@ -628,20 +881,25 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
       let rest = Commit::load(store, &was)?.rest;
       let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
       root_of(store, &id)?;
+      // A commit of this workspace's own, like the one it stands for.
+      ws.log("commit", &id)?;
       id
     }
     _ => tip,
   };
-  let unpublished: Vec<Change> = mine.into_iter().filter(|m| !published.contains(m)).collect();
-  let head = if unpublished.is_empty() { base } else { workspace::carry(store, base, unpublished, author)? };
+  let head = if pending.is_empty() { base } else { workspace::carry(store, base, pending, author)? };
   store.flush()?;
+  let based = ws.base;
   (ws.pushed, ws.seq, ws.base, ws.head) = (Some(tip), seq, Some(base), Some(head));
   placed.into_index(&mut index);
   ws.adopt(&mut index)?;
+  workspace::take_branch_along(store, ws, based)?;
+  workspace::Standing::arrived_at(ws, base);
   let _ = std::fs::remove_file(arriving(ws));
   if done.merged > 0 || !done.conflicts.is_empty() {
     done.before = before;
   }
+  done.conflicts.sort();
   workspace::set_unsettled(ws, &done.conflicts)?;
   Ok(done)
 }

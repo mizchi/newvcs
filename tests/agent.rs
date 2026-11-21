@@ -2,6 +2,8 @@
 //! a recorded state, naming one, being told of writes by a hook, and
 //! publishing into a Git repository in the same directory.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -9,6 +11,10 @@ const NV: &str = env!("CARGO_BIN_EXE_nv");
 
 fn sh_with(dir: &Path, script: &str, stdin: &str) -> Output {
   let mut c = Command::new("sh");
+  {
+    use std::os::unix::process::CommandExt;
+    c.process_group(0);
+  }
   c.arg("-c").arg(script).current_dir(dir).env("NV", NV).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
   c.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null").env_remove("NV_WRITING").env_remove("NV_GIT");
   for (key, value) in
@@ -18,7 +24,7 @@ fn sh_with(dir: &Path, script: &str, stdin: &str) -> Output {
   }
   let mut child = c.spawn().unwrap();
   std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
-  child.wait_with_output().unwrap()
+  common::finish(child)
 }
 
 fn text(out: &Output) -> String {
@@ -29,6 +35,12 @@ fn ok(dir: &Path, script: &str) -> String {
   let out = sh_with(dir, script, "");
   assert!(out.status.success(), "`{script}` failed:\n{}", text(&out));
   String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The exit code of a script and what it printed.
+fn code_of(dir: &Path, script: &str) -> (i32, String) {
+  let out = sh_with(dir, script, "");
+  (out.status.code().unwrap_or(-1), text(&out))
 }
 
 fn fresh(name: &str) -> PathBuf {
@@ -470,14 +482,16 @@ fn a_name_that_differs_only_in_case_or_in_how_its_letters_are_built_is_the_same_
 }
 
 #[test]
-fn going_back_says_so_when_a_file_could_not_be_removed() {
+fn going_back_is_refused_whole_where_a_file_could_not_be_removed() {
   let dir = workspace("stuck");
   ok(&dir, "$NV mark . g >/dev/null && mkdir ro && echo c > ro/x.txt && echo a2 > a.txt && $NV mark . h >/dev/null && chmod 555 ro");
   let out = sh_with(&dir, "$NV restore . g", "");
   ok(&dir, "chmod 755 ro");
-  assert!(!out.status.success() && text(&out).contains("could not be removed") && text(&out).contains("ro/x.txt"), "{}", text(&out));
-  // The rest was done, and what is left over shows as what it is.
-  assert_eq!(ok(&dir, "cat a.txt; $NV status . 2>/dev/null"), "a1\nA ro/x.txt");
+  // A directory nothing can be removed from is found before anything is written: named, and nothing done.
+  assert!(!out.status.success() && text(&out).contains("ro"), "{}", text(&out));
+  assert_eq!(ok(&dir, "cat a.txt; $NV status . 2>/dev/null"), "a2");
+  ok(&dir, "$NV restore . g >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt; ls"), "a1\na.txt\nb.txt\nd");
 }
 
 #[test]
@@ -501,6 +515,27 @@ fn a_commit_with_no_git_beside_it_is_signed_as_git_would_sign_it() {
     ),
   );
   assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>'"), "Own <own@example.com>");
+  // A date as most tools write it is read; one that cannot be read is said to be so, and nobody is nobody.
+  ok(&dir, "echo a5 > a.txt && GIT_AUTHOR_DATE=2020-01-02T03:04:05+09:00 $NV commit . four >/dev/null");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%at"), "1577901845");
+  for (setting, complaint) in [
+    ("GIT_AUTHOR_DATE=yesterday", "is not a date nv reads"),
+    ("HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null", "nobody to sign the commit as"),
+  ] {
+    let unset = "env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL";
+    let command = if setting.starts_with("HOME") {
+      format!("rm .nv/git-config; echo a6 > a.txt && {unset} {setting} $NV commit . five")
+    } else {
+      format!("echo a6 > a.txt && {setting} $NV commit . five")
+    };
+    let out = sh_with(&dir, &command, "");
+    assert!(!out.status.success() && text(&out).contains(complaint), "{setting}: {}", text(&out));
+  }
+  ok(&dir, "$NV git config user.name Own && $NV git config user.email own@example.com");
+  // nv's own `git commit` looks in the same places.
+  ok(&dir, &format!("rm .nv/git-config && {bare} $NV git commit -q -am 'by the user of the machine'"));
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>'"), "Global <global@example.com>");
+  ok(&dir, "echo a7 > a.txt && $NV commit . six >/dev/null");
   // The time is said in the zone the machine is in.
   let zone = ok(&dir, "date +%z");
   assert!(ok(&dir, "$NV git cat-file -p HEAD | grep '^committer'").ends_with(&zone), "{zone}");
@@ -542,4 +577,405 @@ fn smaller_things_a_reviewer_tripped_on() {
   for left in ["agent-smaller-git", "agent-smaller-store", "agent-smaller-ws"] {
     let _ = std::fs::remove_dir_all(dir.join("..").join(left));
   }
+}
+
+#[test]
+fn an_edit_that_keeps_a_files_size_and_time_is_still_an_edit() {
+  let dir = workspace("same-size");
+  ok(&dir, "printf 'v1 config\\n' > a.txt && $NV mark . start >/dev/null && printf 'v2 config\\n' > a.txt && $NV mark . mid >/dev/null");
+  // Long enough ago that the file's time is trusted, then: other bytes, the same length, the same time.
+  ok(
+    &dir,
+    "sleep 1.2 && $NV snapshot . >/dev/null; cp -p a.txt ../agent-same-size-keep && printf 'v3 CONFIG\\n' > a.txt && touch -r ../agent-same-size-keep a.txt && rm ../agent-same-size-keep",
+  );
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null; $NV since . mid"), "M a.txt\nM a.txt");
+  // Reported or not, walked or not, it is seen; and going back keeps it.
+  assert_eq!(ok(&dir, "$NV record . a.txt && $NV since . mid --recorded"), "M a.txt");
+  let said = ok(&dir, "$NV restore . start");
+  assert!(said.contains("what was on disk is kept as"), "{said}");
+  assert_eq!(ok(&dir, "cat a.txt && $NV restore . '~0' >/dev/null && cat a.txt"), "v1 config\nv3 CONFIG");
+  // Written in place, the file itself the same one: still seen.
+  ok(
+    &dir,
+    "sleep 1.2 && $NV snapshot . >/dev/null; cp -p a.txt ../agent-same-size-keep && printf 'v4 config\\n' | dd of=a.txt conv=notrunc 2>/dev/null && touch -r ../agent-same-size-keep a.txt && rm ../agent-same-size-keep",
+  );
+  assert_eq!(ok(&dir, "$NV snapshot . --tracked >/dev/null && $NV git show HEAD:a.txt; $NV since . mid"), "a1\nM a.txt");
+  // A fork does not have every file read again for it, and an edit made in it afterwards, with
+  // the size and the time put back, is an edit: the index it came with is about other files.
+  ok(&dir, "$NV commit . settled >/dev/null && sleep 1.2 && $NV status . >/dev/null 2>&1 && $NV fork . ../agent-same-size-fork >/dev/null");
+  let fork = dir.join("../agent-same-size-fork");
+  let looked = ok(&fork, "$NV status . 2>&1 | grep '^looked at'");
+  assert!(looked.contains("read 0"), "{looked}");
+  for copy in ["agent-same-size-fork", "agent-same-size-copy"] {
+    if copy.ends_with("copy") {
+      ok(&dir, "cp -c -R -p . ../agent-same-size-copy");
+    }
+    let at = dir.join("..").join(copy);
+    ok(
+      &at,
+      "cp -p a.txt ../agent-same-size-keep && printf 'V5 CONFIG\\n' > a.txt && touch -r ../agent-same-size-keep a.txt && rm ../agent-same-size-keep",
+    );
+    assert_eq!(ok(&at, "$NV status . 2>/dev/null"), "M a.txt", "in {copy}");
+    let said = ok(&at, "$NV restore . start");
+    assert!(said.contains("what was on disk is kept as"), "in {copy}: {said}");
+    assert_eq!(ok(&at, "$NV restore . '~0' >/dev/null && cat a.txt"), "V5 CONFIG", "in {copy}");
+    let _ = std::fs::remove_dir_all(&at);
+  }
+}
+
+#[test]
+fn nothing_is_recorded_over_a_sync_that_was_cut_short() {
+  let dir = workspace("cut-sync");
+  // As a kill leaves it: the note that files of the ref were being written here.
+  ok(&dir, "echo half > a.txt && printf '%064d 3\\n' 0 > .nv/arriving");
+  for command in ["$NV snapshot .", "$NV mark . m", "$NV commit . c", "$NV restore . base"] {
+    let out = sh_with(&dir, command, "");
+    assert!(!out.status.success() && text(&out).contains("nv sync"), "`{command}`: {}", text(&out));
+  }
+  // Looking is still looking, and the hook neither fails nor records.
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "M a.txt");
+  assert_eq!(ok(&dir, "$NV log . | grep -c snapshot || true"), "0");
+}
+
+#[test]
+fn what_a_reviewer_broke_in_a_fourth_round_stays_fixed() {
+  let dir = workspace("fourth");
+  // A directory of files nv does not track, where a file has to go: refused, and the files stay.
+  ok(
+    &dir,
+    "echo '*.log' > .gitignore && echo o > out && $NV mark . with-out >/dev/null && rm out && mkdir out && echo precious > out/build.log",
+  );
+  let (code, said) = code_of(&dir, "$NV restore . with-out 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("out/build.log"), "{said}");
+  assert_eq!(ok(&dir, "cat out/build.log"), "precious");
+  ok(&dir, "rm -r out && $NV restore . with-out >/dev/null && cat out");
+  // A pipe in the tree is not a file: nothing waits on it.
+  ok(&dir, "mkfifo pipe && $NV status . >/dev/null 2>&1 && $NV snapshot . >/dev/null; rm pipe");
+  // A file that may not be read does not stop the others from being recorded.
+  ok(&dir, "echo s > secret.txt && $NV snapshot . >/dev/null && chmod 000 secret.txt && echo more >> a.txt");
+  let said = ok(&dir, "$NV snapshot . 2>&1; chmod 644 secret.txt");
+  assert!(said.contains("may not be read"), "{said}");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "");
+  // Two ways of looking at once is a command given wrongly.
+  assert_eq!(code_of(&dir, "$NV snapshot . --recorded --tracked 2>/dev/null").0, 2);
+  // One bit of the store flipped: nothing is restored from it, and verify says so.
+  ok(&dir, "for i in 1 2 3; do head -c 3000 /dev/urandom | xxd -p > big.txt; $NV mark . v$i >/dev/null; done");
+  let store = String::from_utf8(std::fs::read(dir.join(".nv/workspace")).unwrap()).unwrap();
+  let store = store.lines().find_map(|line| line.strip_prefix("store ")).map(|at| dir.join(at)).expect("a store");
+  let segment = store.join("objects.seg");
+  let mut bytes = std::fs::read(&segment).unwrap();
+  let before = bytes.clone();
+  let mut refused = 0;
+  for at in (bytes.len() / 2..bytes.len() - 64).step_by(97) {
+    bytes.clone_from(&before);
+    bytes[at] ^= 1;
+    std::fs::write(&segment, &bytes).unwrap();
+    let mut wrong = 0;
+    for mark in ["v1", "v2", "v3"] {
+      let (code, _) = code_of(&dir, &format!("$NV restore . {mark} >/dev/null 2>&1"));
+      if code == 0 {
+        // Restored, so what was restored is what was marked.
+        let (same, _) = code_of(&dir, &format!("test -z \"$($NV since . {mark} 2>/dev/null)\""));
+        assert_eq!(same, 0, "a bit flipped at {at}: {mark} was restored as something else");
+      } else {
+        wrong += 1;
+      }
+    }
+    if wrong > 0 {
+      refused += 1;
+      assert_ne!(
+        code_of(&dir, &format!("$NV verify {} >/dev/null 2>&1", store.display())).0,
+        0,
+        "verify passed a store with a bit flipped at {at}"
+      );
+    }
+  }
+  std::fs::write(&segment, &before).unwrap();
+  assert!(refused > 0, "no flipped bit was ever noticed");
+}
+
+#[test]
+fn a_commit_killed_at_any_moment_leaves_its_branch_with_the_workspace() {
+  let dir = workspace("killed-commit");
+  // Killed in the middle of committing, three hundred times: afterwards a commit still lands on the branch.
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo \"e$i\" >> a.txt; $NV git commit -q -am \"c$i\" >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.012))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; done; true",
+  );
+  ok(&dir, "echo more > more.txt && $NV git add more.txt && $NV git commit -q -am 'work after the kills'");
+  // The branch is where the workspace is: leaving it and coming back loses nothing.
+  ok(&dir, "$NV git switch -q -c elsewhere && $NV git switch -q main");
+  assert_eq!(
+    ok(&dir, "$NV git log -1 --format=%s && cat more.txt && tail -1 a.txt && $NV git status --short && $NV git fsck"),
+    "work after the kills\nmore\ne300"
+  );
+  // What is nv's own is no file of the tree, however it is named.
+  ok(&dir, "$NV git add .nv && $NV git add .NV/workspace; $NV git status --short");
+  assert_eq!(code_of(&dir, "$NV git mv a.txt .nv/x 2>/dev/null").0, 125);
+  assert_eq!(ok(&dir, "$NV git status --short; ls a.txt"), "a.txt");
+}
+
+#[test]
+fn what_a_fifth_reviewer_broke_in_recording_and_the_store_stays_fixed() {
+  let dir = workspace("fifth");
+  let store = String::from_utf8(std::fs::read(dir.join(".nv/workspace")).unwrap()).unwrap();
+  let store = store.lines().find_map(|line| line.strip_prefix("store ")).map(|at| dir.join(at)).expect("a store");
+  // A file that may not be read, and was never recorded as it is: a restore that would remove it is refused.
+  ok(&dir, "$NV mark . clean >/dev/null && rm b.txt && $NV mark . no-b >/dev/null && $NV restore . clean >/dev/null");
+  ok(&dir, "echo 'an edit nobody recorded' > b.txt && chmod 000 b.txt");
+  let (code, said) = code_of(&dir, "$NV restore . no-b 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("b.txt"), "{said}");
+  assert_eq!(ok(&dir, "chmod 644 b.txt && cat b.txt"), "an edit nobody recorded");
+  ok(&dir, "$NV restore . clean >/dev/null");
+  // A file the rules leave out, where a tracked file has to be written: refused, and the file stays.
+  ok(
+    &dir,
+    "echo KEY=committed > .env && $NV mark . with-env >/dev/null && rm .env && echo .env > .gitignore && $NV mark . env-ignored >/dev/null",
+  );
+  ok(&dir, "echo KEY=local-secret > .env");
+  let (code, said) = code_of(&dir, "$NV restore . with-env 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains(".env"), "{said}");
+  assert_eq!(ok(&dir, "cat .env && rm .env .gitignore && $NV snapshot . >/dev/null; true"), "KEY=local-secret");
+  // A directory that may not be listed is left out; the rest is looked at and recorded.
+  ok(&dir, "mkdir locked && echo l > locked/l.txt && $NV snapshot . >/dev/null && chmod 000 locked && echo more >> a.txt");
+  let said = ok(&dir, "$NV snapshot . 2>&1; $NV status . 2>/dev/null; chmod 755 locked");
+  assert!(said.contains("may not be listed") && !said.contains("D locked"), "{said}");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "");
+  // The store's ready copy of a file, with a byte changed: not what a restore writes, and verify says so.
+  ok(
+    &dir,
+    "printf 'ready copy v1\\n' > c.txt && $NV mark . c1 >/dev/null && printf 'ready copy v2\\n' > c.txt && $NV mark . c2 >/dev/null && $NV restore . c1 >/dev/null && $NV restore . c2 >/dev/null",
+  );
+  let copies: Vec<PathBuf> = std::fs::read_dir(store.join("files"))
+    .unwrap()
+    .flatten()
+    .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten().map(|e| e.path()))
+    .filter(|p| std::fs::read(p).is_ok_and(|bytes| bytes.starts_with(b"ready copy v1")))
+    .collect();
+  assert_eq!(copies.len(), 1, "the ready copy of c.txt as it was at c1");
+  std::fs::write(&copies[0], "ready copy vX\n").unwrap();
+  assert_ne!(code_of(&dir, &format!("$NV verify {} 2>&1", store.display())).0, 0);
+  std::fs::write(&copies[0], "ready copy vX\n").unwrap();
+  assert_eq!(ok(&dir, "$NV restore . c1 >/dev/null && cat c.txt"), "ready copy v1");
+  // A segment cut short, with refs and Git ids still naming what it had: verify does not pass it.
+  let segment = store.join("objects.seg");
+  let whole = std::fs::read(&segment).unwrap();
+  std::fs::write(&segment, b"").unwrap();
+  let _ = std::fs::remove_file(store.join("objects.idx"));
+  assert_ne!(code_of(&dir, &format!("$NV verify {} >/dev/null 2>&1", store.display())).0, 0);
+  std::fs::write(&segment, &whole).unwrap();
+  // A fork takes the index as it is after a look at every file: an edit made before the fork,
+  // with size and time put back, is an edit in the fork too.
+  ok(
+    &dir,
+    "$NV commit . settled >/dev/null; sleep 1.2; $NV status . >/dev/null 2>&1; printf 'other, longer\\n' > a.txt && $NV mark . m1 >/dev/null && $NV restore . base >/dev/null && sleep 1.2",
+  );
+  ok(
+    &dir,
+    "cp -p a.txt ../agent-fifth-keep && tr a-z A-Z < ../agent-fifth-keep > a.txt && touch -r ../agent-fifth-keep a.txt && rm ../agent-fifth-keep && $NV fork . ../agent-fifth-fork >/dev/null",
+  );
+  let fork = dir.join("../agent-fifth-fork");
+  assert_eq!(ok(&fork, "$NV status . 2>/dev/null"), "M a.txt");
+  let said = ok(&fork, "$NV restore . m1");
+  assert!(said.contains("what was on disk is kept as"), "{said}");
+  let _ = std::fs::remove_dir_all(&fork);
+  // A fork that cannot be made leaves nothing that would pass for a workspace.
+  ok(&dir, "chmod 000 b.txt; $NV fork . ../agent-fifth-fork >/dev/null 2>&1; chmod 644 b.txt");
+  assert!(
+    !fork.join(".nv").exists() || code_of(&fork, "$NV status . >/dev/null 2>&1").0 == 0 && ok(&fork, "cat b.txt") == ok(&dir, "cat b.txt")
+  );
+  let _ = std::fs::remove_dir_all(&fork);
+}
+
+#[test]
+fn what_a_sixth_reviewer_broke_in_recording_stays_fixed() {
+  let dir = workspace("sixth");
+  // A directory that became a file, reported as one path: the files it held go with it, and the way back is open.
+  ok(&dir, "$NV mark . m0 >/dev/null && echo e >> a.txt && $NV mark . m1 >/dev/null");
+  ok(&dir, "rm -r d && echo file > d && $NV record . d && $NV snapshot . --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . m1"), "M d\nD d/x.txt");
+  assert_eq!(ok(&dir, "$NV restore . m0 >/dev/null && cat d/x.txt && $NV status . 2>/dev/null"), "x1");
+  // A file that became a directory, reported by a file inside it.
+  ok(&dir, "rm b.txt && mkdir b.txt && echo in > b.txt/in.txt && $NV record . b.txt/in.txt && $NV mark . m2 --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . m2"), "");
+  assert_eq!(
+    ok(&dir, "$NV restore . m0 >/dev/null && cat b.txt && $NV restore . m2 >/dev/null && cat b.txt/in.txt && $NV restore . m0 >/dev/null"),
+    "b1\nin"
+  );
+  // Looking with `nv git` does not make nv forget what was reported and recorded.
+  ok(
+    &dir,
+    "echo new > new.txt && echo e2 >> a.txt && $NV record . new.txt a.txt && $NV snapshot . --recorded >/dev/null && $NV git status --short >/dev/null && $NV git log --oneline >/dev/null",
+  );
+  ok(&dir, "$NV commit . published --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV git show --format=%s --name-status HEAD; $NV status . 2>/dev/null"), "published\n\nM\ta.txt\nA\tnew.txt");
+  // A rule that no longer leaves a file out: the file is seen without anyone reporting it.
+  ok(&dir, "echo '*.log' > .gitignore && echo o > out.log && $NV mark . ignoring >/dev/null");
+  ok(&dir, "echo '*.tmp' > .gitignore && $NV record . .gitignore && $NV mark . seeing --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . seeing; $NV since . ignoring"), "M .gitignore\nA out.log");
+  // An ignored file where a directory has to be made: refused before anything is written.
+  ok(
+    &dir,
+    "mkdir dd && echo f > dd/f.txt && $NV mark . with-dd >/dev/null && rm -r dd && echo dd >> .gitignore && echo e3 >> a.txt && $NV mark . without-dd >/dev/null",
+  );
+  ok(&dir, "echo SECRET > dd");
+  let (code, said) = code_of(&dir, "$NV restore . with-dd 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("dd"), "{said}");
+  assert_eq!(ok(&dir, "cat dd; tail -1 a.txt; $NV since . without-dd"), "SECRET\ne3");
+  // An ignored file that already is what would be written is not in the way.
+  ok(&dir, "rm dd && mkdir dd && echo f > dd/f.txt && $NV restore . with-dd >/dev/null && cat dd/f.txt");
+}
+
+#[test]
+fn nothing_is_written_or_read_beyond_a_link() {
+  let dir = workspace("links-seventh");
+  let outside = dir.join("../agent-links-seventh-outside");
+  let _ = std::fs::remove_dir_all(&outside);
+  std::fs::create_dir_all(outside.join("sub")).unwrap();
+  // A file replaced by a link to a file that is not there: the link is replaced, nothing is made where it led.
+  ok(&dir, "$NV mark . x >/dev/null && rm a.txt && ln -s ../agent-links-seventh-outside/victim.txt a.txt && $NV restore . x >/dev/null");
+  assert_eq!(ok(&dir, "cat a.txt; test -L a.txt && echo link; ls ../agent-links-seventh-outside"), "a1\nsub");
+  // The same when a tree is built from one beside it.
+  ok(
+    &dir,
+    "ln -s $PWD/../agent-links-seventh-outside/created.txt f && $NV commit . A >/dev/null && rm f && echo regular > f && $NV commit . B >/dev/null",
+  );
+  let store = String::from_utf8(std::fs::read(dir.join(".nv/workspace")).unwrap()).unwrap();
+  let store = store.lines().find_map(|line| line.strip_prefix("store ")).map(|at| dir.join(at)).expect("a store");
+  let (a, b) = (ok(&dir, "$NV git rev-parse HEAD~1"), ok(&dir, "$NV git rev-parse HEAD"));
+  ok(
+    &dir,
+    &format!(
+      "$NV checkout {s} {a} ../agent-links-seventh-ca >/dev/null && $NV checkout {s} {b} ../agent-links-seventh-cb >/dev/null",
+      s = store.display()
+    ),
+  );
+  assert_eq!(
+    ok(&dir, "cat ../agent-links-seventh-cb/f; test -L ../agent-links-seventh-cb/f && echo link; ls ../agent-links-seventh-outside"),
+    "regular\nsub"
+  );
+  for left in ["agent-links-seventh-ca", "agent-links-seventh-cb"] {
+    let _ = std::fs::remove_dir_all(dir.join("..").join(left));
+  }
+  // A link has to go where a directory of nothing but directories stands: it goes there.
+  ok(
+    &dir,
+    "ln -s ../agent-links-seventh-outside/sub p && $NV mark . m >/dev/null && echo edited > b.txt && rm p && mkdir -p p/q && $NV restore . m >/dev/null",
+  );
+  assert_eq!(ok(&dir, "test -L p && echo link; cat b.txt"), "link\nb1");
+  // A directory of the tree replaced by a link: its files are gone, not the files the link leads to.
+  ok(
+    &dir,
+    "echo outside > ../agent-links-seventh-outside/x.txt && $NV commit . settled >/dev/null && rm -r d && ln -s ../agent-links-seventh-outside d",
+  );
+  assert_eq!(ok(&dir, "$NV git status --short; $NV git diff --name-status"), "D d/x.txt\n?? d\nD\td/x.txt");
+  ok(&dir, "$NV commit . 'a link for a directory' --tracked >/dev/null");
+  assert_eq!(ok(&dir, "$NV git show --format= --name-status HEAD; cat ../agent-links-seventh-outside/x.txt"), "D\td/x.txt\noutside");
+  // An ignored link nobody recorded, where a tracked file has to go: refused.
+  ok(
+    &dir,
+    "rm d && echo 'tracked env' > .env && $NV mark . with-env >/dev/null && rm .env && echo .env > .gitignore && $NV snapshot . >/dev/null && ln -s ../agent-links-seventh-outside/x.txt .env",
+  );
+  assert_eq!(code_of(&dir, "$NV restore . with-env 2>/dev/null").0, 2);
+  assert_eq!(ok(&dir, "test -L .env && echo link; rm .env .gitignore"), "link");
+  // A link named as a rule for directories names them is a link, and is recorded when reported.
+  ok(
+    &dir,
+    "echo 'build/' > .gitignore && $NV commit . rules >/dev/null && ln -s ../agent-links-seventh-outside build && $NV record . build && $NV mark . g --recorded >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV since . g"), "");
+  // Looking with `nv git` in between changes nothing of what a later commit publishes.
+  ok(
+    &dir,
+    "echo f > fresh.txt && $NV snapshot . >/dev/null && $NV git status >/dev/null && echo f2 >> fresh.txt && echo more >> a.txt && $NV commit . both --tracked >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV git show --format= --name-status HEAD | sort"), "A\tbuild\nA\tfresh.txt\nM\ta.txt");
+  let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn what_an_eighth_reviewer_found_in_recording_stays_fixed() {
+  let dir = workspace("eighth");
+  let outside = dir.join("../agent-eighth-outside");
+  let _ = std::fs::remove_dir_all(&outside);
+  std::fs::create_dir_all(outside.join("dir")).unwrap();
+  std::fs::write(outside.join("dir/a"), "outside a\n").unwrap();
+  let store = String::from_utf8(std::fs::read(dir.join(".nv/workspace")).unwrap()).unwrap();
+  let store = store.lines().find_map(|line| line.strip_prefix("store ")).map(|at| dir.join(at)).expect("a store");
+  // A checkout makes a workspace: it does not write over one, nor over files that are there.
+  let first = ok(&dir, "$NV git rev-parse HEAD");
+  ok(&dir, &format!("$NV checkout {} {first} ../agent-eighth-co >/dev/null && echo precious > ../agent-eighth-co/a.txt", store.display()));
+  assert_eq!(code_of(&dir, &format!("$NV checkout {} {first} ../agent-eighth-co 2>/dev/null", store.display())).0, 2);
+  assert_eq!(ok(&dir, "cat ../agent-eighth-co/a.txt"), "precious");
+  let _ = std::fs::remove_dir_all(dir.join("../agent-eighth-co"));
+  // A look in Git's terms, between recording and publishing, changes nothing of what is published.
+  for look in ["true", "$NV git status >/dev/null && $NV git diff >/dev/null && $NV git log --oneline >/dev/null"] {
+    let twin = workspace(if look == "true" { "eighth-plain" } else { "eighth-looked" });
+    ok(&twin, "echo s > notes.txt && echo v1 > f && echo v1 > g && $NV record . notes.txt f g && $NV snapshot . --recorded >/dev/null");
+    ok(
+      &twin,
+      &format!(
+        "echo notes.txt > .gitignore && echo v2 > f && rm g && {look} && $NV record . .gitignore && $NV commit . c1 --recorded >/dev/null"
+      ),
+    );
+    assert_eq!(
+      ok(&twin, "$NV git show --format= --name-status HEAD | sort; $NV git show HEAD:f"),
+      "A\t.gitignore\nA\tf\nA\tnotes.txt\nv2",
+      "after `{look}`"
+    );
+  }
+  // Two states of this workspace's own, one with a link and one with a directory at the same path: both ways.
+  ok(
+    &dir,
+    "ln -s ../agent-eighth-outside/dir l && $NV mark . linked >/dev/null && rm l && mkdir l && echo mine > l/a && $NV mark . dir >/dev/null",
+  );
+  ok(&dir, "$NV restore . linked >/dev/null && test -L l && $NV restore . dir >/dev/null && cat l/a && $NV restore . linked >/dev/null");
+  assert_eq!(std::fs::read_to_string(outside.join("dir/a")).unwrap(), "outside a\n");
+  // A link nobody recorded, standing where a tracked directory was: a restore that would remove it says so first.
+  ok(
+    &dir,
+    "rm l && $NV commit . settled >/dev/null && echo more > d/y.txt && $NV commit . two-in-d >/dev/null && $NV mark . green >/dev/null",
+  );
+  ok(&dir, "echo x2 > d/x.txt && $NV record . d/x.txt && rm -rf d && ln -s ../agent-eighth-outside/dir d");
+  let (code, said) = code_of(&dir, "$NV restore . green --recorded 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert_eq!(ok(&dir, "test -L d && echo link"), "link");
+  ok(&dir, "rm d && $NV restore . green >/dev/null && cat d/x.txt");
+  // A watcher sees a file become an empty directory.
+  ok(
+    &dir,
+    "$NV watch . --start >/dev/null && rm b.txt && mkdir b.txt && sleep 0.4 && $NV mark . emptied --recorded >/dev/null; $NV watch . --stop >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV since . emptied"), "");
+  let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn nothing_waits_for_ever() {
+  let dir = workspace("limits");
+  // A lock held by a process that does not let go: the command gives up, says why, and changes nothing.
+  ok(&dir, "echo held > a.txt");
+  let started = std::time::Instant::now();
+  let (code, said) = code_of(
+    &dir,
+    "perl -e 'use Fcntl qw(:flock); open(my $f, \">>\", \".nv/lock\") or die; flock($f, LOCK_EX) or die; sleep 30' & holder=$!; sleep 0.3; NV_LOCK_TIMEOUT=1 $NV snapshot . 2>&1; code=$?; kill $holder; exit $code",
+  );
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("gave up waiting") && started.elapsed().as_secs() < 10, "{said}");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null"), "M a.txt", "nothing was recorded");
+  // A command whose input never ends is stopped at its limit, with exit code 124.
+  let started = std::time::Instant::now();
+  // (The writer holds the pipe open, and is not waited for: only nv is.)
+  let (code, said) = code_of(
+    &dir,
+    "rm -f ../agent-limits-input && mkfifo ../agent-limits-input && { sleep 30 > ../agent-limits-input 2>/dev/null & writer=$!; } ; NV_TIMEOUT=1 $NV hook claude < ../agent-limits-input 2>&1; code=$?; kill $writer; rm -f ../agent-limits-input; exit $code",
+  );
+  assert!(started.elapsed().as_secs() < 10, "it ran for {:?}", started.elapsed());
+  assert_eq!(code, 124, "{said}");
+  assert!(said.contains("was stopped"), "{said}");
+  ok(&dir, "$NV snapshot . >/dev/null");
 }

@@ -44,7 +44,7 @@
 // of them. What a repository may read is what its table says it was given:
 // knowing an id is not having the content.
 
-import { hex, unhex } from "./commit.ts";
+import { hex, refOk, unhex } from "./commit.ts";
 import { blobHasher, blobId, hash, objectId } from "./hash.ts";
 import { Repo, type Placed, type Step } from "./repo.ts";
 import { decodeTree, KIND_TREE, MODE_DIR, MODE_GITLINK } from "./tree.ts";
@@ -96,7 +96,15 @@ const steps = (since: Step[]) => since.map((s) => ({ seq: s.seq, id: s.id, bytes
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const [owner, repository, what, ...rest] = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    let parts: string[];
+    try {
+      parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    } catch {
+      return json({ error: "a part of that address is not a well-formed escape" }, 400);
+    }
+    const [owner, repository, what, ...rest] = parts;
+    // An owner or a repository is one part of the address: a `/` spelled `%2F` would make two addresses one repository.
+    if (owner?.includes("/") || repository?.includes("/")) return json({ error: "an owner or a repository name has no `/` in it" }, 400);
     const arg = rest.join("/");
     if (!owner || !repository || !what || !arg) return json({ error: "expected /<owner>/<owner>/<repo>/<operation>/<name>" }, 404);
     const name = `${owner}/${repository}`;
@@ -104,9 +112,12 @@ export default {
     const repos = env.REPO as unknown as DurableObjectNamespace<Repo>;
     const repo = repos.get(repos.idFromName(name));
     const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : null;
+    // A position in a ref's history; -1 is before its first commit, which is at 0.
+    if (after !== null && !(Number.isSafeInteger(after) && after >= -1)) return json({ error: "`after` is a position in a ref's history: a whole number, -1 or more" }, 400);
     const body = async () => new Uint8Array(await request.arrayBuffer());
     try {
       if (request.method === "POST") {
+        if (what === "push" && !refOk(arg)) return json({ error: "that is not a name for a ref" }, 400);
         if (what === "push") {
           // The commits of the push, oldest first, then the contents they name.
           const all = frames(await body());
@@ -147,7 +158,9 @@ export default {
           };
           const has = async (ids: Uint8Array[]) => new Set((await repo.where(ids)).map((c) => hex(c.id)));
           const outside = [...below(true)].filter(([id]) => !given.has(id)).map(([, id]) => id);
-          if ((await has(outside)).size !== outside.length) return json({ error: "a directory below these was not handed over" }, 400);
+          if ((await has(outside)).size !== outside.length || (await repo.trees(outside)).size !== new Set(outside.map(hex)).size) {
+            return json({ error: "a directory below these was not handed over" }, 400);
+          }
           const files = [...below(false).values()];
           const had = await has(files);
           let missing = files.filter((id) => !had.has(hex(id)));
@@ -168,6 +181,8 @@ export default {
             await env.OBJECTS.put(`packs/${hex(packId)}`, pack);
             await repo.place(fresh.map((t, i) => ({ id: t.id, pack: packId, at: at[i]!, length: t.bytes.length })));
           }
+          // Each of them a directory from now on.
+          await repo.markTrees(trees.map((t) => t.id));
           return json({ adopted, missing: missing.map(hex) });
         }
         if (what === "fetch" && arg === "trees") {
@@ -178,7 +193,8 @@ export default {
           let level = (await request.text()).split("\n").filter(Boolean).map(unhex);
           while (level.length > 0) {
             const found = await repo.where(level);
-            if (found.length !== level.length) return json({ error: "no such directory" }, 404);
+            const asTrees = await repo.trees(level);
+            if (found.length !== level.length || asTrees.size !== new Set(level.map(hex)).size) return json({ error: "no such directory" }, 404);
             const next = new Map<string, Uint8Array>();
             for (const c of found) {
               if (!c.pack) throw new Error("a directory is not in a pack");
@@ -224,6 +240,8 @@ export default {
           const length = Number(request.headers.get("content-length"));
           if (!request.body || !Number.isFinite(length)) return json({ error: "an upload says how long it is" }, 411);
           // Into the bucket as it arrives, hashed on the way: the content is never held whole.
+          // It goes under a name of its own first. The name it claims is shared by every
+          // repository, and bytes that turn out not to be what they claim must never have been there.
           const hasher = blobHasher();
           const hashing = new TransformStream<Uint8Array, Uint8Array>({
             transform(chunk, controller) {
@@ -231,11 +249,18 @@ export default {
               controller.enqueue(chunk);
             },
           });
-          await env.OBJECTS.put(key, request.body.pipeThrough(hashing).pipeThrough(new FixedLengthStream(length)));
-          if (hex(hasher.digest()) !== arg) {
-            // Nobody was told it was there: a repository reads only what its table lists.
-            await env.OBJECTS.delete(key);
-            return json({ error: "the bytes do not hash to that id" }, 400);
+          const arriving = `uploads/${crypto.randomUUID()}`;
+          await env.OBJECTS.put(arriving, request.body.pipeThrough(hashing).pipeThrough(new FixedLengthStream(length)));
+          try {
+            if (hex(hasher.digest()) !== arg) return json({ error: "the bytes do not hash to that id" }, 400);
+            // Stored once: if it is there already, these bytes are the same bytes.
+            if (!(await env.OBJECTS.head(key))) {
+              const checked = await env.OBJECTS.get(arriving);
+              if (!checked) throw new Error("the upload is gone from the bucket");
+              await env.OBJECTS.put(key, checked.body);
+            }
+          } finally {
+            await env.OBJECTS.delete(arriving);
           }
           await repo.place([{ id, pack: null, at: 0, length }]);
           return new Response(null, { status: 204 });

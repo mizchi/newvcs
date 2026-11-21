@@ -3,6 +3,8 @@
 //! own, nothing of nv's stands in its way, and nv follows wherever it goes.
 //! What nv adds is the record of work between commits.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -19,7 +21,7 @@ fn clean(c: &mut Command) -> &mut Command {
 }
 
 fn sh(dir: &Path, script: &str) -> Output {
-  clean(Command::new("sh").arg("-c").arg(script).current_dir(dir).env("NV", NV)).output().unwrap()
+  common::bounded(clean(Command::new("sh").arg("-c").arg(script).current_dir(dir).env("NV", NV)))
 }
 
 fn text(out: &Output) -> String {
@@ -266,4 +268,220 @@ fn publishing_leaves_what_the_user_staged_as_the_user_staged_it() {
   ok(&dir, "rm .git/hooks/pre-commit && git update-index --skip-worktree d/x.txt && echo skipped >> d/x.txt && echo plain >> a.txt");
   let out = sh(&dir, "$NV commit . 'with a skipped file'");
   assert_eq!(ok(&dir, "git diff --cached --name-only | wc -l").trim(), "0", "{}", text(&out));
+}
+
+#[test]
+fn an_adoption_cut_short_is_finished_by_adopting_again() {
+  let dir = adopted("cut-short");
+  // As a kill during the import leaves it: a workspace that was never joined to Git.
+  ok(&dir, "rm .nv/git-synced");
+  assert_eq!(ok(&dir, "git status --porcelain"), "", "Git never saw nv's directory, even then");
+  assert!(ok(&dir, "$NV adopt .").starts_with("adopted"));
+  assert_eq!(ok(&dir, "$NV check ."), "in step");
+  assert!(!sh(&dir, "$NV adopt .").status.success(), "and once it is done, it is done");
+}
+
+#[test]
+fn what_git_keeps_out_of_the_tree_on_purpose_is_not_a_file_removed() {
+  let dir = adopted("sparse");
+  ok(&dir, "mkdir big && echo b > big/b.txt && git add -A && git commit -q -m big && $NV since . base");
+  ok(&dir, "git sparse-checkout set --no-cone '/*' '!/big/' && test ! -e big/b.txt");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null; $NV snapshot . >/dev/null; $NV since . base"), "");
+  ok(&dir, "echo more >> a.txt && $NV commit . 'beside what is kept out' >/dev/null");
+  assert_eq!(ok(&dir, "git ls-tree -r --name-only HEAD | tr '\\n' ' '; $NV since . base; $NV check ."), "a.txt big/b.txt d/x.txt in step");
+  // Seen from a directory below the top, the two are as much in step.
+  assert_eq!(ok(&dir, "cd d && $NV check ."), "in step");
+}
+
+#[test]
+fn a_file_staged_in_part_and_a_bisect_are_the_users_to_finish() {
+  let dir = adopted("in-part");
+  // Half of a file's edits staged, half not: neither half is nv's to decide about.
+  ok(&dir, "printf 'ONE\\ntwo\\nthree\\n' > a.txt && git add a.txt && printf 'ONE\\ntwo\\nTHREE\\n' > a.txt");
+  let staged = ok(&dir, "git status --porcelain | tr ' ' _; git diff --cached | grep -c '^+ONE'; git diff | grep -c '^+THREE'");
+  let refused = sh(&dir, "$NV commit . half");
+  assert!(!refused.status.success() && text(&refused).contains("staged in part"), "{}", text(&refused));
+  assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _; git diff --cached | grep -c '^+ONE'; git diff | grep -c '^+THREE'"), staged);
+  assert_eq!(ok(&dir, "git log --format=%s"), "base");
+  // Staged whole, it is published.
+  ok(&dir, "git add a.txt && $NV commit . whole >/dev/null && git status --porcelain");
+  // In the middle of a bisect a commit would be on no branch.
+  ok(&dir, "echo n >> a.txt && git commit -q -am next && git bisect start -q HEAD HEAD~2 >/dev/null 2>&1; echo edit >> d/x.txt");
+  let refused = sh(&dir, "$NV commit . oops");
+  assert!(!refused.status.success() && text(&refused).contains("in the middle of a bisect"), "{}", text(&refused));
+  ok(&dir, "git checkout -q d/x.txt; git bisect reset -q >/dev/null 2>&1; git fsck --strict");
+}
+
+#[test]
+fn what_a_fifth_reviewer_found_beside_git_stays_fixed() {
+  let dir = adopted("fifth");
+  ok(&dir, "echo k > keep.txt && echo k2 > keep2.txt && git add -A && git commit -q -m more");
+  // A file removed, and nothing else: published as a removal. A file moved: both halves of the move.
+  // (Named from the directory above, as a tool that does not change directory names it.)
+  ok(&dir, "rm keep.txt && cd .. && $NV commit colocated-fifth removed >/dev/null");
+  assert_eq!(ok(&dir, "git show --format=%s --name-status HEAD; git status --porcelain"), "removed\n\nD\tkeep.txt");
+  ok(&dir, "mv keep2.txt kept.txt && $NV commit . moved >/dev/null");
+  assert_eq!(ok(&dir, "git show --format=%s --name-status -M HEAD; git status --porcelain"), "moved\n\nR100\tkeep2.txt\tkept.txt");
+  // Back to a mark over a commit of one's own, and that published: the file the bad commit added goes.
+  ok(
+    &dir,
+    "$NV mark . green >/dev/null && echo bad > bad.txt && $NV commit . 'bad attempt' >/dev/null && $NV restore . green >/dev/null && $NV commit . 'back to green' >/dev/null",
+  );
+  assert_eq!(ok(&dir, "git status --porcelain; git show --format=%s --name-status HEAD"), "back to green\n\nD\tbad.txt");
+  // The repository is the one in the directory, whatever the environment says of another.
+  ok(&dir, "git init -q -b main ../colocated-fifth-other && git -C ../colocated-fifth-other commit -q --allow-empty -m z");
+  ok(
+    &dir,
+    "echo e2 >> a.txt && GIT_DIR=$PWD/../colocated-fifth-other/.git GIT_INDEX_FILE=$PWD/../colocated-fifth-other/.git/elsewhere $NV commit . 'with a foreign GIT_DIR' >/dev/null",
+  );
+  assert_eq!(
+    ok(&dir, "git log -1 --format=%s; git status --porcelain; git -C ../colocated-fifth-other log --format=%s"),
+    "with a foreign GIT_DIR\nz"
+  );
+  let _ = std::fs::remove_dir_all(dir.join("../colocated-fifth-other"));
+  // A mark from before Git brought commits in: going back to it would undo them, and is refused.
+  ok(
+    &dir,
+    "$NV mark . before-pull >/dev/null && git checkout -q -b theirs && echo t > theirs.txt && echo more >> a.txt && git add -A && git commit -q -m theirs && git checkout -q main && git merge -q --ff-only theirs",
+  );
+  let refused = sh(&dir, "$NV restore . before-pull");
+  assert!(!refused.status.success() && text(&refused).contains("Git moved"), "{}", text(&refused));
+  assert_eq!(ok(&dir, "git status --porcelain; cat theirs.txt"), "t");
+}
+
+#[test]
+fn taking_nv_out_leaves_the_exclude_file_as_it_was_found() {
+  for (name, before) in [("no-newline", Some("foo")), ("absent", None), ("had-line", Some("x\n.nv/\ny\n")), ("plain", Some("# c\nfoo\n"))] {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("colocated-exclude-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    ok(&dir, "git init -q -b main . && echo a > a.txt && git add -A && git commit -q -m base");
+    let exclude = dir.join(".git/info/exclude");
+    match before {
+      Some(text) => std::fs::write(&exclude, text).unwrap(),
+      None => std::fs::remove_dir_all(dir.join(".git/info")).unwrap(),
+    }
+    ok(&dir, "$NV adopt . >/dev/null && git status --porcelain && $NV adopt . --undo >/dev/null");
+    assert_eq!(std::fs::read_to_string(&exclude).ok().as_deref(), before, "{name}");
+    assert_eq!(dir.join(".git/info").exists(), before.is_some(), "{name}");
+  }
+}
+
+#[test]
+fn a_reported_write_is_published_however_often_publishing_is_killed() {
+  let dir = adopted("reported-kills");
+  // Each write is reported, then the publishing of it killed: Git's own commit may finish behind nv's back.
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 150 ]; do i=$((i+1)); echo \"e$i\" >> a.txt; echo $i > new-$i.txt; $NV record . a.txt new-$i.txt; $NV commit . \"c$i\" --recorded >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.07))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; done; sleep 1",
+  );
+  // Without looking at any file nobody reported, the next publishing has all of them.
+  ok(&dir, "$NV commit . rest --recorded >/dev/null 2>&1; git fsck --strict >/dev/null");
+  assert_eq!(ok(&dir, "git status --porcelain; git ls-files | grep -c '^new-'"), "150");
+}
+
+#[test]
+fn a_publishing_that_is_killed_leaves_gits_index_with_gits_commit() {
+  let dir = adopted("killed-late");
+  // A slow hook: the command is killed while Git's commit is under way, as a tool's time limit would.
+  ok(
+    &dir,
+    "printf '#!/bin/sh\\nsleep 0.4\\necho hooked >> hooked.txt; git add hooked.txt\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+  );
+  ok(
+    &dir,
+    "echo x >> a.txt; echo n > n.txt; $NV commit . m >/dev/null 2>&1 & pid=$!; sleep 0.2; kill -9 $pid; wait $pid 2>/dev/null; sleep 1.2; true",
+  );
+  // The commit was made all the same, and Git's index knows of it: nothing is staged that would undo it.
+  assert_eq!(ok(&dir, "git log -1 --format=%s; git status --porcelain"), "m");
+  // And nothing is taken for staged in part afterwards.
+  ok(
+    &dir,
+    "rm .git/hooks/pre-commit && echo edit >> hooked.txt && echo y >> a.txt && $NV commit . two >/dev/null && git status --porcelain",
+  );
+  // A hook that runs nv on the workspace being published is told so; nothing waits for ever.
+  ok(&dir, "printf '#!/bin/sh\\n\"$NV\" snapshot . >/dev/null 2>&1\\nexit 0\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit");
+  assert_eq!(ok(&dir, "echo z >> a.txt && $NV commit . three >/dev/null && git log -1 --format=%s && git status --porcelain"), "three");
+  // A file the user took out of Git and wrote a rule for is not put back in by nv.
+  ok(&dir, "rm .git/hooks/pre-commit && echo KEY=1 > .env && git add .env && git commit -q -m oops && $NV status . >/dev/null 2>&1");
+  ok(&dir, "git rm -q --cached .env && echo .env >> .gitignore && echo KEY=secret2 >> .env && $NV commit . m4 >/dev/null");
+  // (Its removal from Git stays staged, the user's to commit.)
+  assert_eq!(ok(&dir, "git show --format= --name-status HEAD; git status --porcelain | tr ' ' _"), "A\t.gitignore\nD__.env");
+}
+
+#[test]
+fn what_a_seventh_reviewer_found_beside_git_stays_fixed() {
+  let dir = adopted("seventh");
+  // A publishing that came to nothing, then the user moving Git themselves: their staging is theirs.
+  ok(
+    &dir,
+    "echo new > g.txt && $NV commit . 'nv publishes g.txt' >/dev/null && echo a2 >> a.txt && $NV snapshot . >/dev/null && git reset -q --hard",
+  );
+  ok(&dir, "$NV commit . x --recorded >/dev/null 2>&1; git reset -q --soft HEAD~1 && $NV commit . y --recorded >/dev/null 2>&1; true");
+  assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _"), "A__g.txt");
+  ok(&dir, "git commit -q -m 'the user commits it'");
+  // A new file nv recorded is still published after a commit Git made on its own.
+  ok(&dir, "echo new > n1.txt && echo a3 >> a.txt && $NV mark . m1 >/dev/null && echo x2 >> d/x.txt && git commit -q -am 'by git'");
+  ok(&dir, "echo a4 >> a.txt && $NV commit . pub --tracked >/dev/null");
+  assert_eq!(ok(&dir, "git show --format= --name-status HEAD | sort; git status --porcelain"), "A\tn1.txt\nM\ta.txt");
+}
+
+#[test]
+fn what_an_eighth_reviewer_found_beside_git_stays_fixed() {
+  let dir = adopted("eighth");
+  // A publishing a hook refused, then a commit of the user's own, then staging of theirs: recording leaves it alone.
+  ok(&dir, "printf '#!/bin/sh\\nexit 1\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit && echo a2 >> a.txt");
+  assert!(!sh(&dir, "$NV commit . 'nv tries'").status.success());
+  ok(&dir, "rm .git/hooks/pre-commit && git commit -q -am 'by hand' && echo x2 >> d/x.txt && echo c > c.txt && git add d/x.txt c.txt");
+  let staged = ok(&dir, "git status --porcelain | tr ' ' _; git reflog | wc -l");
+  ok(&dir, "$NV snapshot . >/dev/null && $NV mark . m >/dev/null && $NV since . m >/dev/null && $NV snapshot . --tracked >/dev/null; true");
+  assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _; git reflog | wc -l"), staged);
+  ok(&dir, "git commit -q -m 'the user commits'");
+  // A file recorded and then removed without a word: publishing by report does not stop at it.
+  ok(
+    &dir,
+    "echo n > new.txt && $NV snapshot . >/dev/null && rm new.txt && echo more >> a.txt && $NV record . a.txt && $NV commit . m --recorded >/dev/null",
+  );
+  assert_eq!(ok(&dir, "git show --format= --name-status HEAD; git status --porcelain"), "M\ta.txt");
+}
+
+#[test]
+fn a_hook_that_adds_to_the_message_does_not_leave_gits_index_behind() {
+  let dir = adopted("trailer");
+  ok(&dir, "echo b > b.txt && echo c > c.txt && git add -A && git commit -q -m more");
+  // A commit-msg hook that signs off, and something the user has staged of their own.
+  ok(
+    &dir,
+    "printf '#!/bin/sh\\nprintf \"\\\\nSigned-off-by: t\\\\n\" >> \"$1\"\\n' > .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg",
+  );
+  ok(&dir, "echo a2 >> a.txt && git add a.txt && echo b2 >> b.txt && echo c2 >> c.txt && $NV commit . publish >/dev/null");
+  // nv's commit has all three, with the hook's line in its message; Git's index knows it.
+  assert_eq!(
+    ok(&dir, "git log -1 --format=%B | head -1; git show --format= --name-only HEAD | sort; git status --porcelain"),
+    "publish\na.txt\nb.txt\nc.txt"
+  );
+  // So the user's next commit does not take b and c back.
+  ok(&dir, "echo x2 >> d/x.txt && git commit -q -am \"the user's own\"");
+  assert_eq!(ok(&dir, "git show --format= --name-only HEAD; git show HEAD:b.txt | tail -1"), "d/x.txt\nb2");
+  assert_eq!(ok(&dir, "ls .nv | grep -c git-index-publishing || true"), "0");
+}
+
+#[test]
+fn a_hook_that_never_returns_is_stopped_and_gits_index_is_as_it_was() {
+  let dir = adopted("hook-hangs");
+  ok(
+    &dir,
+    "printf '#!/bin/sh\\necho $$ > .git/hook.pid\\nexec sleep 60\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit && echo a2 >> a.txt",
+  );
+  let before = ok(&dir, "git status --porcelain; git rev-parse HEAD; shasum .git/index");
+  let started = std::time::Instant::now();
+  let out = sh(&dir, "NV_GIT_TIMEOUT=2 $NV commit . 'waits on a hook'");
+  std::thread::sleep(std::time::Duration::from_millis(300));
+  assert!(started.elapsed().as_secs() < 20, "it ran for {:?}", started.elapsed());
+  assert!(!out.status.success() && text(&out).contains("did not finish"), "{}", text(&out));
+  assert_eq!(ok(&dir, "git status --porcelain; git rev-parse HEAD; shasum .git/index"), before);
+  // And the hook's sleep is gone with it.
+  assert_eq!(ok(&dir, "kill -0 $(cat .git/hook.pid) 2>/dev/null && echo alive || echo gone"), "gone");
+  // Without the hook, the work is published as ever.
+  ok(&dir, "rm .git/hooks/pre-commit && $NV commit . 'no hook' >/dev/null && git status --porcelain");
 }

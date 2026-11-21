@@ -25,6 +25,20 @@ pub fn git(repo: &Path) -> Command {
   let mut c = Command::new(std::env::var_os("NV_REAL_GIT").unwrap_or_else(|| "git".into()));
   // A partial clone would otherwise fetch what it lacks, one object at a time.
   c.env("GIT_NO_LAZY_FETCH", "1").arg("-C").arg(repo);
+  // The repository is the one named. Inside a hook, or a command a rebase runs, the environment
+  // names another repository, index or work tree, and Git would obey it over `-C`.
+  for name in [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+  ] {
+    c.env_remove(name);
+  }
   c
 }
 
@@ -56,6 +70,42 @@ pub fn config_value(root: &Path, section: &str, key: &str) -> Option<String> {
     }
     found
   })
+}
+
+/// A date as a commit carries it, `<seconds> <+hhmm>`, from the forms of
+/// `GIT_AUTHOR_DATE` that are spoken: that one, with or without `@` before
+/// it, and `YYYY-MM-DD HH:MM:SS +hh:mm` with `T` for the space, `Z` for the
+/// zone, or the colon left out.
+pub fn stamp(date: &str) -> Option<String> {
+  let date = date.trim();
+  let zone_ok =
+    |zone: &str| zone.len() == 5 && (zone.starts_with('+') || zone.starts_with('-')) && zone[1..].bytes().all(|b| b.is_ascii_digit());
+  if let Some((seconds, zone)) = date.trim_start_matches('@').split_once(' ')
+    && seconds.parse::<i64>().is_ok()
+    && zone_ok(zone)
+  {
+    return Some(format!("{seconds} {zone}"));
+  }
+  let (day, rest) = date.split_at_checked(10)?;
+  let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' '))?;
+  let (time, zone) = rest.split_at_checked(8)?;
+  let zone = match zone.trim() {
+    "Z" | "" => "+0000".to_string(),
+    zone => zone.replace(':', ""),
+  };
+  let number = |text: &str| text.parse::<i64>().ok();
+  let (year, month, date_of) = (number(day.get(..4)?)?, number(day.get(5..7)?)?, number(day.get(8..10)?)?);
+  let (hour, minute, second) = (number(time.get(..2)?)?, number(time.get(3..5)?)?, number(time.get(6..8)?)?);
+  if !zone_ok(&zone) || !(1..=12).contains(&month) || !(1..=31).contains(&date_of) || hour > 23 || minute > 59 || second > 60 {
+    return None;
+  }
+  // Days since the epoch, by the civil calendar.
+  let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
+  let era = y.div_euclid(400);
+  let of_era = y.rem_euclid(400);
+  let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + (153 * m + 2) / 5 + date_of - 1 - 719_468;
+  let east = (number(&zone[1..3])? * 3600 + number(&zone[3..5])? * 60) * if zone.starts_with('-') { -1 } else { 1 };
+  Some(format!("{} {zone}", days * 86_400 + hour * 3600 + minute * 60 + second - east))
 }
 
 /// The file of patterns Git ignores in every repository of this user's.
@@ -192,8 +242,24 @@ pub fn import_tips(store: &mut Store, repo: &Path, revs: &[&str], limit: Option<
     "-z",
     "--format=C %H",
   ]);
+  // One commit, made on the very commit already had: by far the usual case, a commit just made.
+  // Asked for by itself. Asked for as "everything behind it that is not behind the other", Git
+  // sorts history to answer, and without a commit-graph that is a walk of all of it.
+  let next = match (revs, have) {
+    ([rev], [had]) => {
+      let line = git(repo).args(["rev-list", "--parents", "-n", "1", rev]).output().map_err(|e| format!("cannot run git: {e}"))?;
+      let line = String::from_utf8_lossy(&line.stdout).into_owned();
+      let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
+      parents == [had.as_str()]
+    }
+    _ => false,
+  };
   log.args(revs);
-  log.args(have.iter().map(|oid| format!("^{oid}")));
+  if next {
+    log.arg("--no-walk");
+  } else {
+    log.args(have.iter().map(|oid| format!("^{oid}")));
+  }
   let out = log.output().map_err(|e| format!("cannot run git: {e}"))?;
   if !out.status.success() {
     return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -662,7 +728,9 @@ fn write_object(repo: &Path, kind: &str, bytes: &[u8]) -> Result<()> {
 /// having a tree means having everything below it.
 fn export_tree(store: &mut Store, repo: &Path, has: &mut Has, dir: Option<Id>, memo: &mut TreeMemo, written: &mut usize) -> Result<GitOid> {
   let oid = git_tree_of(store, dir, memo, &mut |_, _| Ok(()))?;
-  if has.object(&oid)? {
+  // Git answers that it has the empty tree whether or not the object is there, and `git fsck`
+  // then finds it missing: that one is written without asking.
+  if oid != empty_tree() && has.object(&oid)? {
     return Ok(oid);
   }
   let mut entries: Vec<(Vec<u8>, Entry)> = match dir {

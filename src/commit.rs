@@ -88,7 +88,19 @@ impl Commit {
         0 => None,
         _ => Some(Entry { mode: u32::from_le_bytes(c.take(4)?.try_into().unwrap()), id: c.take(32)?.try_into().unwrap() }),
       };
+      // A commit may have come from anyone. Its paths will be written by whoever takes it in.
+      if !crate::manifest::path_ok(&path) {
+        return Err(format!("a commit names `{}`, which is not a path a tree may have", String::from_utf8_lossy(&path)));
+      }
+      if entry.is_some_and(|entry| !crate::manifest::mode_ok(entry.mode)) {
+        return Err(format!("a commit gives `{}` a mode no file has", String::from_utf8_lossy(&path)));
+      }
       changes.push((path, entry));
+    }
+    let mut named: Vec<&[u8]> = changes.iter().map(|(path, _)| path.as_slice()).collect();
+    named.sort_unstable();
+    if named.windows(2).any(|pair| pair[0] == pair[1]) {
+      return Err("a commit says two things of one path".to_string());
     }
     Ok(Commit { parents, rest, changes })
   }
@@ -131,6 +143,51 @@ pub fn root_of(store: &mut Store, id: &Id) -> Result<Option<Id>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A commit is bytes that may have come from anyone: one that names a path no tree may have is no commit.
+  #[test]
+  fn a_commit_that_names_a_path_no_tree_may_have_is_refused() {
+    let with = |path: &[u8], mode: u32| {
+      Commit { parents: vec![], rest: b"r".to_vec(), changes: vec![(path.to_vec(), Some(Entry { mode, id: [1; 32] }))] }.encode()
+    };
+    for path in [
+      &b""[..],
+      b"d/",
+      b"../escape.txt",
+      b"src/../../escape.txt",
+      b"./a.txt",
+      b"a//b",
+      b"/etc/hosts",
+      b".git/hooks/pre-commit",
+      b"sub/.GIT/config",
+      b".nv/workspace",
+      b"sub/.Nv/x",
+      b"a\0b",
+    ] {
+      assert!(Commit::decode(&with(path, 0o100644)).is_err(), "{:?} was taken as a path", String::from_utf8_lossy(path));
+    }
+    let long = vec![b'x'; 300];
+    assert!(Commit::decode(&with(&long, 0o100644)).is_err());
+    for mode in [0, 0o777, 0o200644, 0o120777, 0o40755] {
+      assert!(Commit::decode(&with(b"a.txt", mode)).is_err(), "{mode:o} was taken as a mode");
+    }
+    // What Git has: a name that is not text, a file that is a link, a directory, another repository's commit.
+    for (path, mode) in [
+      (&b"caf\xff.txt"[..], 0o100644),
+      (b"bin/run", 0o100755),
+      (b"link", 0o120000),
+      (b"vendor/lib", 0o40000),
+      (b"sub", 0o160000),
+      (b".gitignore", 0o100644),
+      (b"a/.github/x", 0o100644),
+      (b"old", 0o100664),
+    ] {
+      assert!(Commit::decode(&with(path, mode)).is_ok(), "{:?} was refused", String::from_utf8_lossy(path));
+    }
+    // One path, said twice.
+    let twice = Commit { parents: vec![], rest: b"r".to_vec(), changes: vec![(b"a".to_vec(), None), (b"a".to_vec(), None)] }.encode();
+    assert!(Commit::decode(&twice).is_err());
+  }
 
   #[test]
   fn a_commit_survives_encoding() {

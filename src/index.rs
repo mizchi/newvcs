@@ -20,20 +20,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// What the index knows of one file. A file whose `size` and `mtime` are
-/// still these is taken to still have the entry's id.
+/// What the index knows of one file. A file whose `size`, `mtime` and
+/// `ctime` are still these is taken to still have the entry's id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Indexed {
   pub entry: Entry,
   pub size: u64,
   /// Nanoseconds since the epoch; 0 for "do not trust, look at the file".
   pub mtime: u128,
+  /// When the file's bytes or its attributes last changed, by the file
+  /// system's own account, which nobody can set: nanoseconds since the
+  /// epoch. A file can be given back its size and its `mtime` after an
+  /// edit; not this. 0 for "not known yet": it is noted the next time the
+  /// file is looked at and found unchanged otherwise.
+  pub ctime: u64,
 }
 
-const MAGIC: &[u8; 8] = b"nvindex1";
+/// The index file's first bytes: with `ctime` in each entry, and as it was before.
+const MAGIC: &[u8; 8] = b"nvindex2";
+const MAGIC_BEFORE: &[u8; 8] = b"nvindex1";
 const HEADER: usize = 16;
-/// mode, id, size, mtime.
-const FIXED: usize = 4 + 32 + 8 + 16;
+/// mode, id, size, mtime, ctime.
+const FIXED: usize = 4 + 32 + 8 + 16 + 8;
+/// An entry as it was written before `ctime` was kept.
+const FIXED_BEFORE: usize = 4 + 32 + 8 + 16;
+/// A record of the log: a path removed, set as before `ctime` was kept, or set.
+const REMOVED: u8 = 0;
+const SET_BEFORE: u8 = 1;
+const SET: u8 = 2;
 /// The log is merged into the index once it holds this many entries, or a
 /// quarter as many as the index if that is more.
 const MERGE_AT: usize = 256;
@@ -43,6 +57,7 @@ fn put_fixed(out: &mut Vec<u8>, i: &Indexed) {
   out.extend_from_slice(&i.entry.id);
   out.extend_from_slice(&i.size.to_le_bytes());
   out.extend_from_slice(&i.mtime.to_le_bytes());
+  out.extend_from_slice(&i.ctime.to_le_bytes());
 }
 
 fn fixed(f: &[u8]) -> Indexed {
@@ -51,6 +66,8 @@ fn fixed(f: &[u8]) -> Indexed {
     entry: Entry { mode: u32::from_le_bytes(f[..4].try_into().unwrap()), id },
     size: u64::from_le_bytes(f[36..44].try_into().unwrap()),
     mtime: u128::from_le_bytes(f[44..60].try_into().unwrap()),
+    // An entry written before `ctime` was kept has none.
+    ctime: f.get(60..68).map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap())),
   }
 }
 
@@ -58,6 +75,8 @@ pub struct Index {
   dir: PathBuf,
   base: Option<memmap2::Mmap>,
   count: usize,
+  /// How long an entry of `base` is: it may have been written before `ctime` was kept.
+  fixed: usize,
   /// Entries set (`Some`) or removed (`None`) since the base was written.
   overlay: BTreeMap<Vec<u8>, Option<Indexed>>,
   /// Log records made by this process and not yet appended.
@@ -84,18 +103,25 @@ impl Index {
   /// Open the index kept in a workspace's metadata directory. A missing or
   /// damaged file is an empty index: everything is then looked at afresh.
   pub fn open(dir: &Path) -> Index {
-    let mut index = Index { dir: dir.to_path_buf(), base: None, count: 0, overlay: BTreeMap::new(), pending: Vec::new() };
+    let mut index = Index { dir: dir.to_path_buf(), base: None, count: 0, fixed: FIXED, overlay: BTreeMap::new(), pending: Vec::new() };
     // SAFETY: the file is replaced by rename, never written in place.
     if let Ok(file) = std::fs::File::open(dir.join("index"))
       && let Ok(map) = unsafe { memmap2::Mmap::map(&file) }
       && map.len() >= HEADER
-      && &map[..8] == MAGIC
+      && (&map[..8] == MAGIC || &map[..8] == MAGIC_BEFORE)
     {
+      index.fixed = if &map[..8] == MAGIC { FIXED } else { FIXED_BEFORE };
       let count = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
       let table_end = HEADER.saturating_add(count.saturating_add(1).saturating_mul(8));
       let last = |m: &[u8]| u64::from_le_bytes(m[table_end - 8..table_end].try_into().unwrap()) as usize;
       if table_end <= map.len() && table_end + last(&map) == map.len() {
-        (index.count, index.base) = (count, Some(map));
+        // Every record where the table says it is, and long enough to be one: a table that says
+        // otherwise is damage, and a damaged index is an empty one.
+        let at = |k: usize| u64::from_le_bytes(map[HEADER + k * 8..HEADER + k * 8 + 8].try_into().unwrap());
+        let fixed = index.fixed as u64;
+        if at(0) == 0 && (0..count).all(|k| at(k + 1) >= at(k) + fixed) {
+          (index.count, index.base) = (count, Some(map));
+        }
       }
     }
     // A record cut short by a crash ends the replay; what came before it stands.
@@ -103,9 +129,13 @@ impl Index {
     let mut rest = log.as_slice();
     while rest.len() >= 5 {
       let len = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
-      let body = if rest[0] == 1 { FIXED } else { 0 };
+      let body = match rest[0] {
+        SET => FIXED,
+        SET_BEFORE => FIXED_BEFORE,
+        _ => 0,
+      };
       let Some(record) = rest.get(5..5 + len + body) else { break };
-      let value = (rest[0] == 1).then(|| fixed(&record[len..]));
+      let value = (rest[0] != REMOVED).then(|| fixed(&record[len..]));
       index.overlay.insert(record[..len].to_vec(), value);
       rest = &rest[5 + len + body..];
     }
@@ -144,7 +174,7 @@ impl Index {
     let offset = |k: usize| u64::from_le_bytes(map[HEADER + k * 8..HEADER + k * 8 + 8].try_into().unwrap()) as usize;
     let records = HEADER + (self.count + 1) * 8;
     let record = &map[records + offset(i)..records + offset(i + 1)];
-    let (path, f) = record.split_at(record.len() - FIXED);
+    let (path, f) = record.split_at(record.len() - self.fixed);
     (path, fixed(f))
   }
 
@@ -185,7 +215,7 @@ impl Index {
   }
 
   pub fn insert(&mut self, path: Vec<u8>, indexed: Indexed) {
-    self.pending.push(1);
+    self.pending.push(SET);
     self.pending.extend_from_slice(&(path.len() as u32).to_le_bytes());
     self.pending.extend_from_slice(&path);
     put_fixed(&mut self.pending, &indexed);
@@ -193,7 +223,7 @@ impl Index {
   }
 
   pub fn remove(&mut self, path: &[u8]) {
-    self.pending.push(0);
+    self.pending.push(REMOVED);
     self.pending.extend_from_slice(&(path.len() as u32).to_le_bytes());
     self.pending.extend_from_slice(path);
     self.overlay.insert(path.to_vec(), None);
@@ -246,7 +276,7 @@ impl Index {
     if self.pending.is_empty() {
       return Ok(());
     }
-    if self.overlay.len() >= MERGE_AT.max(self.count / 4) {
+    if self.overlay.len() >= MERGE_AT.max(self.count / 4) || self.fixed != FIXED {
       let entries = self.entries();
       // The mapping of the old file goes before the file does.
       (self.base, self.count) = (None, 0);
@@ -273,7 +303,7 @@ mod tests {
   }
 
   fn file(n: u8) -> Indexed {
-    Indexed { entry: Entry { mode: 0o100644, id: [n; 32] }, size: n as u64, mtime: 1_000 + n as u128 }
+    Indexed { entry: Entry { mode: 0o100644, id: [n; 32] }, size: n as u64, mtime: 1_000 + n as u128, ctime: 2_000 + n as u64 }
   }
 
   fn names(entries: &[(Vec<u8>, Indexed)]) -> Vec<String> {
