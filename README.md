@@ -479,6 +479,62 @@ Not done: nothing searches the snapshots for the one that broke a test,
 watcher does not come back after a restart of the machine until something
 asks for it, and it has only been run on macOS.
 
+### Checkpoints: what the tests passed on
+
+The point of recording every write is that a writer should not have to
+think about version control at all. What it is asked for instead is what
+it is asked for anyway: that the tests pass. A repository declares, in
+`nv.toml` at its top, the conditions a state is accepted on, and the
+stages of a pipeline that come after them:
+
+```toml
+auto = true                 # run them behind every write a hook records
+
+[checks.unit]
+run = "cargo test --lib"    # passes when it exits 0
+timeout = 600               # seconds; past it, it fails, with all it started
+
+[checks.compat]
+run = "tools/git-compat.sh"
+after = ["unit"]            # run only on a state `unit` passed
+
+[message]
+run = "claude -p 'Write a one-paragraph commit message for this diff'"
+timeout = 120               # the change on stdin, as `git diff` writes it
+```
+
+`nv checkpoint <dir>` records what is on disk and runs the conditions on
+it, each after those it waits for. The state becomes `checkpoint-unit`,
+`checkpoint-compat`, as far as it got: names `nv restore` and `nv since`
+take like any mark. A condition whose wait did not pass is not run. When
+every condition passes, the `[message]` hook drafts a commit message from
+the change since the last commit, and keeps it with that state.
+
+With `auto = true`, `nv hook claude` starts the same run behind the tool
+call and returns at once. There is one runner to a workspace; it goes
+round again while the files change under it, and gives up after twenty
+rounds.
+
+`nv commit <dir>` with no message then publishes that state under the
+drafted message. A message given is used instead. Either way, where
+conditions are declared, the state must pass them first: a state they
+passed on before is not run again; a new one is run, and refused with
+exit 1 when it fails (`--no-checks` commits it all the same).
+
+What a run finds is about the state it began on only if the files are
+still that state when it ends. The conditions run in the workspace
+itself, not a copy, so a writer that went on writing during the run makes
+it prove nothing. Then nothing is named and nothing is kept, and the
+runner goes again. The workspace is held only to record and to name,
+never while a condition runs.
+
+Not done: the watcher does not start runs, only the hook does. A write
+that lands after a runner's last look and before it ends waits for the
+next write to be run on. Conditions do not run in a copy, so a slow test
+suite and a busy writer may never agree on a state. Nothing is shared
+with other workspaces yet: taking another writer's checkpoint in early,
+and running one's own conditions on the two together, is the next step.
+
 ## Sharing a directory with Git
 
 `nv adopt <dir>` makes a Git repository's directory an nv workspace as
@@ -1479,6 +1535,46 @@ hung or damaged, and:
   conflicted file did not do what Git does (`mv` is now refused as Git
   refuses it; the others end the merge or settle the path as Git does).
 
+In the eleventh round the reviewer sending crafted input went around the
+tenth's checks again, and wrote outside a directory once more:
+
+- **Names APFS takes for one and lower case alone does not, let a
+  checkout write outside its directory**: a link `ss` to `../outside` and
+  a file `ß/pwned`; the same with `s` and `ſ`, `fi` and `ﬁ`, `σ` and `ς`,
+  and a dozen more. The tenth round's fix folded names as NFC and lower
+  case; both sides now fold case as Unicode does in full, as APFS does
+  (lower, upper and lower again), and take more pairs for one where in
+  doubt, never fewer.
+- **Names that collide across two commits, two pushes, or a commit and a
+  directory set whole were taken by the server**, which only looked
+  within one commit, and every macOS client was then refused the ref.
+  The server now keeps the folded spelling of every path on each ref,
+  the directories on the way and the entries of directories set whole
+  included, and refuses a push that would give a path a second spelling.
+  The honest form of this is a writer on Linux committing `Readme` one
+  day and `README` the next.
+- **A directory whose files were never sent, a file entry holding a
+  directory's id, and paths too long once the place a directory is set
+  at, or several handings-over, are counted, were taken by the server.**
+  It now keeps, for each directory handed over, what is in it and the
+  longest path below it, and refuses a push setting a directory that is
+  not whole or would make a path too long.
+- **A client checked length and depth only the first time it saw a
+  commit**: the second sync of a 20,000-deep tree overflowed its stack,
+  and a path that fits 1,024 bytes but not below where the workspace is
+  left it half-written. Both are checked at every arrival, against what
+  is left of 1,024 bytes once the workspace's own place is counted,
+  before anything is written.
+- **The answer to a push could move the ref backwards**, and the client
+  removed another writer's file to follow it. The forward-only check of a
+  sync is made of a push's answer as well. And an answer is read to at
+  most 1,024 MB (`NV_ANSWER_MB`): a server that never stopped sending
+  took the client's memory with it.
+
+The server's checks are tested by `server/test/hostile.ts`; the client's,
+against a server that lies (it passes requests to the real one and
+changes the answers), by `tests/lying_server.rs`.
+
 Publishing beside Git was measured by a reviewer at 3 to 14 times
 `git commit`, on a clone with no commit-graph: taking Git's new commit in
 asked Git for "what is behind this and not behind that", which without a
@@ -1550,6 +1646,29 @@ held went on without it once its wait failed: two writers at once. It now
 stops.
 
 ## Not done
+
+- **Found by the eleventh round and not fixed yet**, each a way to lose
+  work or publish the wrong thing in ordinary use:
+  - a `nv snapshot` killed after it moved the workspace's state and
+    before it logged it leaves a state nothing names, and the next
+    `nv restore` removes a file's only copy;
+  - `nv git merge --abort` throws away an unstaged edit to a file the
+    merge did not touch;
+  - finishing a conflicting sync with `--amend` amends the other writer's
+    commit, and a later sync can then undo a third writer's change;
+  - `nv commit` opens what a link to a pipe leads to, and waits;
+  - a directory renamed only in case (`d` to `D`) on a file system that
+    folds case is recorded beside the old spelling;
+  - `git rm way` then `nv git add WAY` stages nothing; beside Git,
+    `git mv` and `nv commit --tracked` publish half the move;
+  - a kill can tear a line of `.nv/oplog`, and the id on it is then not a
+    name `restore` takes.
+
+- The server checks a push against the spellings of the ref's paths it
+  has kept since those checks were added: a ref older than them was not
+  gone over. It knows the entries of a directory set whole one level
+  down, not all the way. A server that sends one byte a second is cut
+  off only by the command's own limit (30 minutes).
 
 - Publishing a commit beside Git is three to four times slower than
   `git commit`: on oxc 126 ms with `--recorded`, 135 with `--tracked`,

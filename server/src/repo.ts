@@ -23,7 +23,7 @@
 // tip, so a writer a million commits behind costs what one at the tip does.
 
 import { DurableObject } from "cloudflare:workers";
-import { decode, encode, hex, idOf } from "./commit.ts";
+import { decode, encode, folded, hex, idOf, MAX_PATH } from "./commit.ts";
 import { MODE_DIR, MODE_GITLINK } from "./tree.ts";
 
 export type Step = { seq: number; id: string; bytes: Uint8Array };
@@ -50,6 +50,10 @@ export class Repo extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS landed (ref TEXT NOT NULL, sent BLOB NOT NULL, landed BLOB NOT NULL, moved INTEGER NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS placed (id BLOB PRIMARY KEY, pack BLOB, at INTEGER NOT NULL, length INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS trees (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_entries (tree BLOB NOT NULL, name TEXT NOT NULL, child BLOB NOT NULL, dir INTEGER NOT NULL, PRIMARY KEY (tree, name)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_depth (id BLOB PRIMARY KEY, deepest INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS live (ref TEXT NOT NULL, folded TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (ref, folded)) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS live_by_path ON live (ref, path);
     `);
   }
 
@@ -109,6 +113,16 @@ export class Repo extends DurableObject<Env> {
       if (this.where(dirs).length !== dirs.length || this.trees(dirs).size !== new Set(dirs.map(hex)).size) {
         throw new Error("the commit sets a directory this repository was not handed");
       }
+      // Whole: every file below it sent, as a file; and no path below it, from where it is set,
+      // longer than a file system takes.
+      this.whole(dirs);
+      for (const commit of commits) {
+        for (const c of commit.changes) {
+          if (c.entry?.mode === MODE_DIR && c.path.length + 1 + this.deepest(c.entry.id) > MAX_PATH) {
+            throw new Error("the commit sets a directory where paths below it grow longer than a file system takes");
+          }
+        }
+      }
       // Nor may a ref name contents nobody sent: whoever synced next could not, and nobody after them.
       const files = commits.flatMap((commit) => commit.changes.flatMap((c) => (c.entry && c.entry.mode !== MODE_DIR && c.entry.mode !== MODE_GITLINK ? [c.entry.id] : [])));
       const given = new Set(this.where(files).map((c) => hex(c.id)));
@@ -145,6 +159,7 @@ export class Repo extends DurableObject<Env> {
           sql.exec("INSERT INTO history (ref, seq, id) VALUES (?, ?, ?)", ref, seq, id);
           for (const c of commit.changes) {
             sql.exec("INSERT INTO changed (ref, path, seq) VALUES (?, ?, ?) ON CONFLICT (ref, path) DO UPDATE SET seq = excluded.seq", ref, decoder.decode(c.path), seq);
+            this.spell(ref, decoder.decode(c.path), c.entry);
           }
           ids.push(id);
           previous = id;
@@ -176,6 +191,74 @@ export class Repo extends DurableObject<Env> {
       // Nothing in the way: the same changes, on the tip.
       return accept(tip, "rebased", behind);
     });
+  }
+
+  /// Keep the spellings of the ref's paths up to date with one change, and refuse one a file
+  /// system that folds case would take for a path the ref has under another spelling: on macOS
+  /// one would be written on, or through, the other, and no one could sync the ref there. The
+  /// directories on the way count, and so do the entries of a directory set whole.
+  private spell(ref: string, path: string, entry: { mode: number; id: Uint8Array } | null): void {
+    const sql = this.ctx.storage.sql;
+    // What was at the path, and below it, is gone: replaced or removed.
+    sql.exec("DELETE FROM live WHERE ref = ? AND (path = ? OR (path > ? AND path < ?))", ref, path, path + "/", path + "0");
+    const parts = path.split("/");
+    if (!entry) {
+      // A directory left with nothing in it is gone as well.
+      for (let n = parts.length - 1; n >= 1; n--) {
+        const dir = parts.slice(0, n).join("/");
+        if (sql.exec("SELECT 1 FROM live WHERE ref = ? AND path > ? AND path < ? LIMIT 1", ref, dir + "/", dir + "0").toArray().length > 0) break;
+        sql.exec("DELETE FROM live WHERE ref = ? AND path = ?", ref, dir);
+      }
+      return;
+    }
+    const names = parts.map((_, n) => parts.slice(0, n + 1).join("/"));
+    if (entry.mode === MODE_DIR) {
+      for (const row of sql.exec<{ name: string }>("SELECT name FROM tree_entries WHERE tree = ?", entry.id).toArray()) names.push(`${path}/${row.name}`);
+    }
+    for (const name of names) {
+      const key = folded(name);
+      const had = sql.exec<{ path: string }>("SELECT path FROM live WHERE ref = ? AND folded = ?", ref, key).toArray()[0];
+      if (had && had.path !== name) throw new Error(`the ref has \`${had.path}\`, which macOS and Windows take for \`${name}\``);
+      if (!had) sql.exec("INSERT INTO live (ref, folded, path) VALUES (?, ?, ?)", ref, key, name);
+    }
+  }
+
+  /// Refuse, of directories to be set whole, one with a file below it this repository was not
+  /// sent, or whose entry for a file holds a directory's id. Walked without recursion.
+  private whole(dirs: Uint8Array[]): void {
+    const sql = this.ctx.storage.sql;
+    const seen = new Set<string>();
+    const todo = [...dirs];
+    while (todo.length > 0) {
+      const dir = todo.pop()!;
+      if (seen.has(hex(dir))) continue;
+      seen.add(hex(dir));
+      for (const row of sql.exec<{ child: ArrayBuffer; dir: number }>("SELECT child, dir FROM tree_entries WHERE tree = ?", dir).toArray()) {
+        const child = new Uint8Array(row.child);
+        if (row.dir) {
+          if (this.trees([child]).size === 0) throw new Error("the commit sets a directory with a directory below it this repository was not handed");
+          todo.push(child);
+        } else if (row.dir === 0) {
+          if (this.where([child]).length === 0) throw new Error("the commit sets a directory with a file below it this repository was not sent");
+          if (this.trees([child]).size > 0) throw new Error("the commit sets a directory whose entry for a file holds a directory's id");
+        }
+      }
+    }
+  }
+
+  /// The longest path below a directory handed over, from its top.
+  deepest(id: Uint8Array): number {
+    return this.ctx.storage.sql.exec<{ deepest: number }>("SELECT deepest FROM tree_depth WHERE id = ?", id).toArray()[0]?.deepest ?? 0;
+  }
+
+  /// Note what a directory handed over holds, and the longest path below it.
+  describe(id: Uint8Array, entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean }[], deepest: number): void {
+    const sql = this.ctx.storage.sql;
+    for (const e of entries) {
+      // Another repository's commit is neither: nothing below it is this repository's to have.
+      sql.exec("INSERT OR IGNORE INTO tree_entries (tree, name, child, dir) VALUES (?, ?, ?, ?)", id, e.name, e.child, e.gitlink ? 2 : e.dir ? 1 : 0);
+    }
+    sql.exec("INSERT OR REPLACE INTO tree_depth (id, deepest) VALUES (?, ?)", id, deepest);
   }
 
   /// Note where contents are. One that is placed already stays where it is.

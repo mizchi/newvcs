@@ -1520,10 +1520,7 @@ impl<'a> Names<'a> {
   }
 
   fn fold(path: &[u8]) -> Vec<u8> {
-    match std::str::from_utf8(path) {
-      Ok(text) if !path.is_ascii() => composed(text).to_lowercase().into_bytes(),
-      _ => path.to_ascii_lowercase(),
-    }
+    path.split(|&b| b == b'/').map(crate::manifest::fold_name).collect::<Vec<_>>().join(&b'/')
   }
 
   /// The path to know a file by, for one the index does not have under the name it was found
@@ -2306,6 +2303,14 @@ pub fn mark(store: &mut Store, ws: &mut Workspace, name: &str, author: &str, loo
   Ok(id)
 }
 
+/// Give a state already recorded a name, as `mark` does for the state it records.
+pub fn name_state(ws: &Workspace, name: &str, id: &Id) -> Result<()> {
+  let file = mark_file(ws, name);
+  std::fs::create_dir_all(file.parent().expect("under .nv")).map_err(|e| e.to_string())?;
+  crate::write_whole(&file, hex(id))?;
+  ws.log(&format!("mark:{name}"), id)
+}
+
 /// A recorded state by what someone would call it: a name given with
 /// `mark`, `base` for the last published commit, `~N` for the Nth snapshot
 /// or commit before the latest, or the start of an id.
@@ -2520,6 +2525,21 @@ pub fn commit_selected(
 /// are, so a file that differs from what was committed shows as a
 /// difference afterwards. This is what committing from an index is.
 pub fn commit_entries(store: &mut Store, ws: &mut Workspace, rest: Vec<u8>, changes: Vec<Change>, merged: Option<Id>) -> Result<Id> {
+  commit_entries_as(store, ws, rest, changes, merged, None)
+}
+
+/// As `commit_entries`; with `replacing`, the commit made takes the place of the workspace's
+/// commit (an amend): on that one's parents, with everything since them as its changes. Either
+/// way the store has the commit before the workspace names it, and the workspace is written once:
+/// a kill at any moment leaves what was or what was meant.
+pub fn commit_entries_as(
+  store: &mut Store,
+  ws: &mut Workspace,
+  rest: Vec<u8>,
+  changes: Vec<Change>,
+  merged: Option<Id>,
+  replacing: Option<&Commit>,
+) -> Result<Id> {
   let mut index = ws.load_index();
   for (path, entry) in &changes {
     match entry {
@@ -2529,8 +2549,15 @@ pub fn commit_entries(store: &mut Store, ws: &mut Workspace, rest: Vec<u8>, chan
     }
   }
   // A merge being concluded has the commit merged in as a second parent.
-  let id = Commit { parents: ws.head.into_iter().chain(merged).collect(), rest, changes }.store(store)?;
+  let mut id = Commit { parents: ws.head.into_iter().chain(merged).collect(), rest: rest.clone(), changes }.store(store)?;
   root_of(store, &id)?;
+  if let Some(previous) = replacing {
+    let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+    let (from, to) = (root(store, previous.parents.first().copied())?, root(store, Some(id))?);
+    let changes = crate::manifest::diff(store, from, to)?;
+    id = Commit { parents: previous.parents.clone(), rest, changes }.store(store)?;
+    root_of(store, &id)?;
+  }
   store.flush()?;
   (ws.base, ws.head) = (Some(id), Some(id));
   ws.save()?;

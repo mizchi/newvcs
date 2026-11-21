@@ -126,8 +126,11 @@ export function nameOk(name: Uint8Array): boolean {
 /// The longest path a tree may have (`manifest::MAX_PATH`): what macOS takes in one path.
 export const MAX_PATH = 1024;
 
-/// A name as a file system that does not tell case or composed characters apart sees it.
-export const folded = (text: string) => text.normalize("NFC").toLowerCase();
+/// A name as a file system that does not tell case or composed characters apart sees it
+/// (`manifest::fold_name` on the other side): composed, and folded as Unicode folds case in full,
+/// as APFS does (`ß` is `ss`, `ſ` is `s`, `ﬁ` is `fi`). Lower, upper, then lower again brings
+/// together what lower case alone leaves apart.
+export const folded = (text: string) => text.normalize("NFC").toLowerCase().toUpperCase().toLowerCase().normalize("NFC");
 
 /// A ref's name: parts of letters, digits and `-_.`, with `/` between them.
 export const refOk = (name: string) => name.length <= 255 && name.split("/").every((part) => /^[A-Za-z0-9_.-]+$/.test(part) && part !== "." && part !== "..");

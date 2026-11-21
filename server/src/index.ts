@@ -151,23 +151,35 @@ export default {
           // answer, for the writer to send.
           const trees = frames(await body()).map((bytes) => ({ id: objectId(KIND_TREE, bytes), bytes, entries: decodeTree(bytes) }));
           const given = new Set(trees.map((t) => hex(t.id)));
-          // No path below these longer than a file system takes: worked out without recursion,
-          // from each tree handed over down through the others handed over with it.
+          // No path below these longer than a file system takes, those handed over before
+          // included: the longest below each, worked out from the bottom up without recursion.
+          const deepest = new Map<string, number>();
           {
             const byId = new Map(trees.map((t) => [hex(t.id), t]));
-            const below = new Set(trees.flatMap((t) => t.entries.filter((e) => e.mode === MODE_DIR).map((e) => hex(e.id))));
-            const todo: [string, number][] = trees.filter((t) => !below.has(hex(t.id))).map((t) => [hex(t.id), 0]);
-            const deepest = new Map<string, number>();
-            while (todo.length > 0) {
-              const [id, length] = todo.pop()!;
-              if ((deepest.get(id) ?? -1) >= length) continue;
-              deepest.set(id, length);
-              for (const e of byId.get(id)?.entries ?? []) {
-                const path = length + e.name.length + 1;
-                if (path > MAX_PATH) return json({ error: "a directory below these has a path longer than a file system takes" }, 400);
-                if (e.mode === MODE_DIR && byId.has(hex(e.id))) todo.push([hex(e.id), path]);
+            const waiting = new Map<string, number>();
+            const above = new Map<string, string[]>();
+            for (const t of trees) {
+              const inside = t.entries.filter((e) => e.mode === MODE_DIR && byId.has(hex(e.id)) && hex(e.id) !== hex(t.id));
+              waiting.set(hex(t.id), new Set(inside.map((e) => hex(e.id))).size);
+              for (const id of new Set(inside.map((e) => hex(e.id)))) above.set(id, [...(above.get(id) ?? []), hex(t.id)]);
+            }
+            const ready = [...waiting].filter(([, n]) => n === 0).map(([id]) => id);
+            while (ready.length > 0) {
+              const id = ready.pop()!;
+              let longest = 0;
+              for (const e of byId.get(id)!.entries) {
+                const below = e.mode === MODE_DIR ? 1 + (deepest.get(hex(e.id)) ?? (await repo.deepest(e.id))) : 0;
+                longest = Math.max(longest, e.name.length + below);
+              }
+              if (longest > MAX_PATH) return json({ error: "a directory below these has a path longer than a file system takes" }, 400);
+              deepest.set(id, longest);
+              for (const parent of above.get(id) ?? []) {
+                const left = waiting.get(parent)! - 1;
+                waiting.set(parent, left);
+                if (left === 0) ready.push(parent);
               }
             }
+            if (deepest.size !== trees.length) return json({ error: "these directories are each other's, round in a circle" }, 400);
           }
           const below = (dirs: boolean) => {
             const ids = new Map<string, Uint8Array>();
@@ -202,7 +214,12 @@ export default {
             await env.OBJECTS.put(`packs/${hex(packId)}`, pack);
             await repo.place(fresh.map((t, i) => ({ id: t.id, pack: packId, at: at[i]!, length: t.bytes.length })));
           }
-          // Each of them a directory from now on.
+          // Each of them a directory from now on, with what it holds and how deep it goes.
+          const names = new TextDecoder();
+          for (const t of trees) {
+            const entries = t.entries.map((e) => ({ name: names.decode(e.name), child: e.id, dir: e.mode === MODE_DIR, gitlink: e.mode === MODE_GITLINK }));
+            await repo.describe(t.id, entries, deepest.get(hex(t.id))!);
+          }
           await repo.markTrees(trees.map((t) => t.id));
           return json({ adopted, missing: missing.map(hex) });
         }

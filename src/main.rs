@@ -23,9 +23,15 @@ nv: an experiment in keeping Git's object ids without Git's storage
         publishes everything recorded so far, by whichever command recorded it
   nv record <dir> <path>...
         Say that these paths were written (for a tool that knows its writes)
-  nv commit <dir> <message> [--recorded | --tracked]
+  nv commit <dir> [<message>] [--recorded | --tracked] [--no-checks]
         Publish the snapshots since the last commit as one commit; the rest
-        of the tree is not needed
+        of the tree is not needed. Where nv.toml declares conditions, the
+        state must pass them first (--no-checks makes it anyway); with no
+        message, the one its [message] hook drafted or drafts now
+  nv checkpoint <dir>
+        Record what is on disk and run the conditions nv.toml declares on
+        it, in order: the state is then `checkpoint-<name>` for each that
+        passed. Exits 1 where one did not, or the files changed meanwhile
   nv watch <dir> [--start | --stop | --status]
         Stay, and snapshot whatever is written there by whatever writes it:
         the operating system reports the writes, so nothing has to. With
@@ -95,6 +101,9 @@ A <dir> may be the top of a workspace or any directory inside one. After
 
 const AUTHOR: &str = "nv <nv@localhost>";
 
+/// The state the conditions passed on, when `nv commit` ran them before taking the workspace.
+static GATED: std::sync::OnceLock<newvcs::Id> = std::sync::OnceLock::new();
+
 /// What to put in `.claude/settings.json` so that every write a tool makes is recorded.
 const CLAUDE_HOOKS: &str = r#"{
   "hooks": {
@@ -138,6 +147,8 @@ fn claude_hook() -> Option<()> {
     None => Look::Everywhere,
   };
   workspace::snapshot(&mut store, &mut ws, AUTHOR, look).ok()?;
+  // Where the repository declares conditions to run behind writes, they are started here.
+  newvcs::checks::start_behind(&root);
   Some(())
 }
 
@@ -213,10 +224,15 @@ fn run(args: &[String]) -> Result<()> {
   let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
   // `--recorded` after the arguments: the writer reported every write, so the tree need not be walked.
   // `--tracked`: only the files already known, as `git commit -a` looks; what is new is not found.
-  let look = |at: usize| match args.get(at).map(String::as_str) {
-    Some("--recorded") => Look::Recorded,
-    Some("--tracked") => Look::Tracked,
-    _ => Look::Everywhere,
+  let look = |at: usize| {
+    let given = |option: &str| args.iter().skip(at.min(2)).any(|a| a == option);
+    if given("--recorded") {
+      Look::Recorded
+    } else if given("--tracked") {
+      Look::Tracked
+    } else {
+      Look::Everywhere
+    }
   };
   match arg(0)? {
     "import" => {
@@ -354,7 +370,35 @@ fn run(args: &[String]) -> Result<()> {
           unsettled.join(", ")
         ));
       }
-      if arg(2)?.trim().is_empty() {
+      // The message given, or else the one drafted for the state this commit is of.
+      let given = args.get(2).filter(|a| !["--recorded", "--tracked", "--no-checks"].contains(&a.as_str()));
+      let config = newvcs::checks::load(&ws.root)?;
+      // Refused before anything is recorded: a refused command changes nothing.
+      if given.is_none() && config.as_ref().is_none_or(|c| c.message.is_none()) {
+        return Err("a commit needs a message: give one, or declare a [message] hook in nv.toml to draft one".into());
+      }
+      let message = if given.is_some() && GATED.get().is_none() {
+        given.cloned().unwrap_or_default()
+      } else {
+        workspace::snapshot(&mut store, &mut ws, AUTHOR, look(3))?;
+        if let (Some(passed), Some(now)) = (GATED.get(), ws.head)
+          && *passed != now
+        {
+          return Err("the files changed after the conditions passed on them: run `nv commit` again".into());
+        }
+        match given {
+          Some(given) => given.clone(),
+          None => {
+            let state = ws.head.ok_or("nothing to commit")?;
+            let hook = config.as_ref().and_then(|c| c.message.as_ref());
+            newvcs::checks::draft(&ws.root, &state)
+              .or_else(|| hook.and_then(|hook| newvcs::checks::write_draft(&ws.root, hook, &state).ok()))
+              .ok_or("a commit needs a message: give one, or declare a [message] hook in nv.toml to draft one")?
+          }
+        }
+      };
+      let message = message.as_str();
+      if message.trim().is_empty() {
         return Err("a commit needs a message that says something".into());
       }
       // A file holding both versions between a sync's markers, put back by a restore after the
@@ -368,7 +412,7 @@ fn run(args: &[String]) -> Result<()> {
       }
       // Beside a Git repository it is Git that makes the commit, by its own rules.
       if newvcs::colocated::shared(&ws.root) {
-        match newvcs::colocated::commit(&mut store, &mut ws, AUTHOR, arg(2)?, look(3))? {
+        match newvcs::colocated::commit(&mut store, &mut ws, AUTHOR, message, look(3))? {
           Some(oid) => println!("{oid} in {:.0} ms", ms(started)),
           None => println!("nothing to commit"),
         }
@@ -377,7 +421,7 @@ fn run(args: &[String]) -> Result<()> {
       // The committer is the author unless the environment or the configuration names another, as with Git.
       let author = signature(&ws, "AUTHOR")?;
       let committer = signature(&ws, "COMMITTER")?;
-      let rest = format!("author {author}\ncommitter {committer}\n\n{}\n", arg(2)?.trim_end()).into_bytes();
+      let rest = format!("author {author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes();
       let based = ws.base;
       match workspace::commit_saying(&mut store, &mut ws, AUTHOR, rest, look(3))? {
         Some(id) => {
@@ -389,6 +433,29 @@ fn run(args: &[String]) -> Result<()> {
         }
         None => println!("nothing to commit"),
       }
+    }
+    "checkpoint" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      let config = newvcs::checks::load(&root)?
+        .filter(|c| !c.checks.is_empty())
+        .ok_or(format!("{} declares no conditions: [checks.<name>] with `run = \"<command>\"`", newvcs::checks::FILE))?;
+      // Behind a write: run until a run finds the files as it began, quietly.
+      if args.iter().any(|a| a == "--until-still") {
+        newvcs::checks::run_until_still(&root, &config, AUTHOR)?;
+        return Ok(());
+      }
+      let run = newvcs::checks::run(&root, &config, AUTHOR)?;
+      eprint!("{}", run.said());
+      if !run.passed() {
+        std::process::exit(1);
+      }
+      if let Some(hook) = &config.message
+        && newvcs::checks::draft(&root, &run.state).is_none()
+        && let Err(why) = newvcs::checks::write_draft(&root, hook, &run.state)
+      {
+        eprintln!("nv: {why}");
+      }
+      println!("{} passed every condition, in {:.1} ms", hex(&run.state), ms(started));
     }
     "restore" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -630,7 +697,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("status", 1, 1, &[]),
   ("record", 2, usize::MAX, &[]),
   ("snapshot", 1, 1, &["--recorded", "--tracked"]),
-  ("commit", 2, 2, &["--recorded", "--tracked"]),
+  ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
+  ("checkpoint", 1, 1, &["--until-still"]),
   ("watch", 1, 1, &["--start", "--stop", "--status"]),
   ("log", 1, 1, &[]),
   ("restore", 2, 2, &["--recorded", "--tracked"]),
@@ -793,9 +861,40 @@ fn main() -> ExitCode {
   {
     args.retain(|a| a != "--recorded");
   }
+  // A commit where conditions are declared is of a state that passed them. They run before the
+  // workspace is held: they can take minutes, and each run holds it only to record and to name.
+  if args[0] == "commit"
+    && !args.iter().any(|a| a == "--no-checks")
+    && let Some(top) = workspace::top_of(Path::new(&args[1]))
+  {
+    match newvcs::checks::load(&top) {
+      Err(why) => {
+        eprintln!("{why}");
+        return ExitCode::from(2);
+      }
+      Ok(Some(config)) if !config.checks.is_empty() => match newvcs::checks::run(&top, &config, AUTHOR) {
+        Ok(run) if run.passed() => {
+          let _ = GATED.set(run.state);
+        }
+        Ok(run) => {
+          eprint!("{}", run.said());
+          eprintln!(
+            "nv: not committed: the state does not pass the conditions {} declares (`--no-checks` commits it all the same)",
+            newvcs::checks::FILE
+          );
+          return ExitCode::from(1);
+        }
+        Err(why) => {
+          eprintln!("{why}");
+          return ExitCode::from(2);
+        }
+      },
+      Ok(_) => {}
+    }
+  }
   // One writer at a time in a workspace. A watcher takes the lock for each snapshot instead, not for as long as it runs.
   let _lock = match (args.first().map(String::as_str), args.get(1)) {
-    (Some(command), Some(dir)) if command != "watch" && command != "fork" => {
+    (Some(command), Some(dir)) if command != "watch" && command != "fork" && command != "checkpoint" => {
       match workspace::top_of(Path::new(dir)).map(|top| workspace::lock(&top)) {
         Some(Ok(held)) => Some(held),
         // Another command holds the workspace and did not let go in time: this one does not go

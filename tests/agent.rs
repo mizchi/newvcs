@@ -424,7 +424,7 @@ fn a_command_given_wrongly_says_what_was_wrong_and_does_nothing() {
   // A misspelt option is not silently the slow way of doing the same thing.
   for (command, complaint) in [
     ("$NV snapshot . --recoded", "unknown option `--recoded` (it takes --recorded, --tracked)"),
-    ("$NV commit .", "too few arguments"),
+    ("$NV commit .", "a commit needs a message"),
     ("$NV commit . ''", "a message that says something"),
     ("$NV log . extra", "too many arguments"),
     ("$NV frobnicate", "is not a command"),
@@ -1020,22 +1020,30 @@ fn what_a_ninth_reviewer_found_in_recording_stays_fixed() {
 
 #[test]
 fn a_tree_with_names_this_file_system_takes_for_one_is_not_written() {
-  let dir = fresh("twins");
-  // A commit a case-sensitive file system can hold: a link `Link` to outside, and `link/pwned`.
-  ok(
-    &dir,
-    "mkdir outside repo && cd repo && git init -q -b main . && l=$(printf '../outside' | git hash-object -w --stdin) && f=$(echo pwned | git hash-object -w --stdin) && git update-index --add --cacheinfo 120000,$l,Link && git update-index --add --cacheinfo 100644,$f,link/pwned && git commit -q -m twins",
-  );
-  ok(&dir, "$NV import repo store >/dev/null");
-  let head = ok(&dir, "git -C repo rev-parse HEAD");
-  for prefix in ["", " Link link"] {
-    let (code, said) = code_of(&dir, &format!("rm -rf co && $NV checkout store {head} co{prefix} 2>&1"));
-    let folds = ok(&dir, "touch probe-case && test -e PROBE-CASE && echo yes || echo no; rm -f probe-case");
-    if folds == "yes" {
-      assert_eq!(code, 2, "{said}");
-      assert!(said.contains("Link") && said.contains("link"), "{said}");
+  // Pairs a case-sensitive file system holds apart and APFS takes for one name: case, and the
+  // whole of Unicode case folding (an eleventh reviewer wrote outside through `ß` and `ss`).
+  for (n, (link, dir_name)) in
+    [("Link", "link"), ("ss", "ß"), ("s", "ſ"), ("fi", "ﬁ"), ("σ", "ς"), ("μ", "µ"), ("SS", "ẞ")].into_iter().enumerate()
+  {
+    let dir = fresh(&format!("twins-{n}"));
+    // A commit a case-sensitive file system can hold: a link to outside, and a file below its twin.
+    ok(
+      &dir,
+      &format!(
+        "mkdir outside repo && cd repo && git init -q -b main . && l=$(printf '../outside' | git hash-object -w --stdin) && f=$(echo pwned | git hash-object -w --stdin) && git update-index --add --cacheinfo 120000,$l,'{link}' && git update-index --add --cacheinfo 100644,$f,'{dir_name}/pwned' && git commit -q -m twins"
+      ),
+    );
+    ok(&dir, "$NV import repo store >/dev/null");
+    let head = ok(&dir, "git -C repo rev-parse HEAD");
+    let folds = ok(&dir, &format!("mkdir -p probe/'{dir_name}' && test -d probe/'{link}' && echo yes || echo no; rm -rf probe"));
+    for prefix in ["".to_string(), format!(" '{link}' '{dir_name}'")] {
+      let (code, said) = code_of(&dir, &format!("rm -rf co && $NV checkout store {head} co{prefix} 2>&1"));
+      if folds == "yes" {
+        assert_eq!(code, 2, "`{link}`/`{dir_name}`: {said}");
+        assert!(said.contains(link) && said.contains(dir_name), "{said}");
+      }
+      assert_eq!(ok(&dir, "ls outside | wc -l | tr -d ' '"), "0", "nothing was written outside, through `{link}`/`{dir_name}` `{prefix}`");
     }
-    assert_eq!(ok(&dir, "ls outside | wc -l | tr -d ' '"), "0", "nothing was written outside, through `{prefix}`");
   }
 }
 

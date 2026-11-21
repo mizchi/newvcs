@@ -45,10 +45,25 @@ pub fn path_ok(path: &[u8]) -> bool {
 /// ref would stop at it.
 pub const MAX_PATH: usize = 1024;
 
+/// A name as a file system that does not tell case or composed characters apart sees it: composed,
+/// and folded as Unicode folds case in full (`ß` is `ss`, `ſ` is `s`, `ﬁ` is `fi`, `ς` is `σ`), as
+/// APFS does. Lower, upper, then lower again: what `to_lowercase` alone leaves apart, the round
+/// through capitals brings together. Where it takes more for one than a file system does, more is
+/// refused, never less.
+pub fn fold_name(name: &[u8]) -> Vec<u8> {
+  use unicode_normalization::UnicodeNormalization;
+  match std::str::from_utf8(name) {
+    Ok(text) if !name.is_ascii() => {
+      let once: String = text.nfc().collect::<String>().to_lowercase().to_uppercase().to_lowercase();
+      once.nfc().collect::<String>().into_bytes()
+    }
+    _ => name.to_ascii_lowercase(),
+  }
+}
+
 /// Two entries of one directory that a file system which does not tell case or composed
 /// characters apart takes for one name.
 pub fn dir_twins(store: &mut Store, root: Option<Id>, dir: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-  use unicode_normalization::UnicodeNormalization;
   let id = match (root, dir.is_empty()) {
     (Some(root), true) => root,
     (Some(root), false) => match lookup(store, root, dir)? {
@@ -59,10 +74,7 @@ pub fn dir_twins(store: &mut Store, root: Option<Id>, dir: &[u8]) -> Result<Opti
   };
   let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
   for name in load(store, &id)?.into_keys() {
-    let folded = match std::str::from_utf8(&name) {
-      Ok(text) => text.nfc().collect::<String>().to_lowercase().into_bytes(),
-      Err(_) => name.to_ascii_lowercase(),
-    };
+    let folded = fold_name(&name);
     let path = if dir.is_empty() { name.clone() } else { [dir, b"/", name.as_slice()].concat() };
     if let Some(other) = seen.insert(folded, path.clone()) {
       return Ok(Some((other, path)));
@@ -75,20 +87,20 @@ pub fn dir_twins(store: &mut Store, root: Option<Id>, dir: &[u8]) -> Result<Opti
 /// first such pair in each directory below `root`, as two paths. Walked without recursion, and
 /// refused as too deep past `MAX_PATH`.
 pub fn folded_twins(store: &mut Store, root: Id, at: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-  use unicode_normalization::UnicodeNormalization;
-  let fold = |name: &[u8]| -> Vec<u8> {
-    match std::str::from_utf8(name) {
-      Ok(text) => text.nfc().collect::<String>().to_lowercase().into_bytes(),
-      Err(_) => name.to_ascii_lowercase(),
-    }
-  };
+  folded_twins_within(store, root, at, MAX_PATH)
+}
+
+/// As `folded_twins`, with the longest path that may be below `at` given: what is left of what
+/// a file system takes once the workspace's own place is counted.
+pub fn folded_twins_within(store: &mut Store, root: Id, at: &[u8], longest: usize) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+  let fold = fold_name;
   let mut todo = vec![(at.to_vec(), root)];
   while let Some((dir, id)) = todo.pop() {
     let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
     for (name, entry) in load(store, &id)? {
       let path = if dir.is_empty() { name.clone() } else { [dir.as_slice(), b"/", name.as_slice()].concat() };
-      if path.len() > MAX_PATH {
-        return Err(format!("a tree has a path longer than {MAX_PATH} bytes, below `{}`", String::from_utf8_lossy(&dir)));
+      if path.len() > longest {
+        return Err(format!("a tree has a path longer than {longest} bytes, below `{}`", String::from_utf8_lossy(&dir)));
       }
       if let Some(other) = seen.insert(fold(&name), path.clone()) {
         return Ok(Some((other, path)));

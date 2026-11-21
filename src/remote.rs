@@ -51,7 +51,11 @@ fn http() -> &'static ureq::Agent {
 
 fn body(response: ureq::Response) -> Result<Vec<u8>> {
   let mut bytes = Vec::new();
-  response.into_reader().read_to_end(&mut bytes).map_err(|e| format!("cannot read the server's answer: {e}"))?;
+  let most = crate::limits::answer_bytes();
+  response.into_reader().take(most + 1).read_to_end(&mut bytes).map_err(|e| format!("cannot read the server's answer: {e}"))?;
+  if bytes.len() as u64 > most {
+    return Err(format!("the server's answer is larger than {} MB, and was not read to its end (NV_ANSWER_MB sets the limit)", most >> 20));
+  }
   Ok(bytes)
 }
 
@@ -183,6 +187,28 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
     }
   }
   Ok(taken)
+}
+
+/// A ref only goes forward: a tip the server names has to have what this workspace last saw of
+/// the ref behind it, whether the tip came with a sync or with the answer to a push.
+fn forward(store: &mut Store, seen: Option<Id>, tip: &Id) -> Result<()> {
+  let Some(seen) = seen else { return Ok(()) };
+  let mut at = Some(*tip);
+  for _ in 0..1_000_000 {
+    let Some(id) = at else { break };
+    if id == seen {
+      return Ok(());
+    }
+    at = match Commit::load(store, &id) {
+      Ok(commit) => commit.parents.first().copied(),
+      Err(_) => None,
+    };
+  }
+  Err(format!(
+    "the server says the ref is at {}, which does not have {} behind it, where this workspace last saw the ref: a ref only goes forward. Nothing was touched.",
+    &hex(tip)[..12],
+    &hex(&seen)[..12]
+  ))
 }
 
 /// A workspace that has never looked at the ref asks where it stands: it
@@ -341,6 +367,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   if ws.pushed.is_none() {
     ws.pushed = chain[0].parents.first().copied();
   }
+  let seen_before = ws.pushed;
   // Where linked directories came from is in a file of the latest published commit.
   let links_root = match ws.base {
     Some(base) => root_of(store, &base)?,
@@ -399,7 +426,14 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     _ => return Err(format!("the server refused the push: {answer}")),
   }
   done.synced.commits += take_commits(store, &url, &answer)?;
-  let tip = Some(Tip { id: id_of(&answer["commit"])?, seq: answer["seq"].as_u64().unwrap_or(0) });
+  let landed = id_of(&answer["commit"])?;
+  // What the push landed as stands on where the ref was when the workspace last saw it.
+  if let Err(why) = forward(store, seen_before, &landed) {
+    (ws.pushed, ws.seq) = (None, 0);
+    ws.save()?;
+    return Err(format!("the push landed, but {why}"));
+  }
+  let tip = Some(Tip { id: landed, seq: answer["seq"].as_u64().unwrap_or(0) });
   if let Some(tip) = tip {
     let commits = done.synced.commits;
     let landed_at = tip.seq;
@@ -475,26 +509,7 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
     return Ok(Synced::default());
   }
   let commits = take_commits(store, &url, &answer)?;
-  // A ref only goes forward: its tip now has what this workspace last saw of it behind it.
-  if let Some(seen) = ws.pushed {
-    let mut at = Some(tip.id);
-    let mut found = false;
-    for _ in 0..1_000_000 {
-      let Some(id) = at else { break };
-      if id == seen {
-        found = true;
-        break;
-      }
-      at = Commit::load(store, &id)?.parents.first().copied();
-    }
-    if !found {
-      return Err(format!(
-        "the server says the ref is at {}, which does not have {} behind it, where this workspace last saw the ref: a ref only goes forward. Nothing was touched.",
-        &hex(&tip.id)[..12],
-        &hex(&seen)[..12]
-      ));
-    }
-  }
+  forward(store, ws.pushed, &tip.id)?;
   let mut done = arrive(store, ws, &url, tip, author)?;
   done.commits = commits;
   Ok(done)
@@ -734,6 +749,23 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   };
   // The contents this store lacks: what is to be written inside the view, and theirs of every
   // file that has to be merged. One request.
+  // Nothing too long or too deep for this file system, from where the workspace is, before a
+  // directory set whole is so much as opened: checked at every arrival, not only when its
+  // commits first came, so a refusal is a refusal each time and never a crash or half a write.
+  let room = crate::manifest::MAX_PATH.saturating_sub(std::fs::canonicalize(&ws.root).map_or(0, |r| r.as_os_str().len() + 1) + 1);
+  for (path, entry) in &theirs {
+    if path.len() > room {
+      return Err(format!(
+        "the ref has `{}…`, a path longer than this file system takes here ({room} bytes, below {}). Nothing was touched; a workspace nearer the top of the disk could hold it.",
+        String::from_utf8_lossy(&path[..60.min(path.len())]),
+        ws.root.display()
+      ));
+    }
+    if let Some(dir) = entry.filter(|e| e.is_dir()) {
+      crate::manifest::folded_twins_within(store, dir.id, path, room)
+        .map_err(|why| format!("{why}: longer than this file system takes here ({room} bytes). Nothing was touched."))?;
+    }
+  }
   let theirs_files = workspace::removals_first(expand(store, from, &theirs)?);
   // Where this file system takes two names for one, a directory of the ref's that has both cannot
   // be written: one would land on the other, or be written through it.

@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { blake3 } from "@noble/hashes/blake3.js";
-import { blobHasher, blobIdOf, encode, hex, type Commit } from "../src/commit.ts";
+import { blobHasher, blobIdOf, encode, hex, idOf, type Commit } from "../src/commit.ts";
 
 const server = process.env.NV_SERVER ?? "http://localhost:8799";
 const stamp = Date.now();
@@ -203,5 +203,81 @@ assert.equal((await push("main", commit((await tip()).tip, [{ path: long, entry:
   assert.equal(taken.adopted, 0, "a directory of another repository was taken over as a file's content");
   const now2 = await tip();
   assert.equal((await push("main", commit(now2.tip, [{ path: text("f"), entry: { mode: 0o100644, id: treeId(inner) } }]))).status, 400);
+}
+
+// ---------------------------------------------------------------- what an eleventh reviewer got past
+// Pairs APFS folds that lower case alone does not: refused in one commit as `Link` and `link/x` are.
+for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], ["\u03c3", "\u03c2"]] as const) {
+  const target = text("../outside");
+  const changes = [
+    { path: text(link), entry: { mode: 0o120000, id: blobIdOf(target) } },
+    { path: text(`${dir}/pwned`), entry: { mode: 0o100644, id: blobIdOf(payload) } },
+  ].sort((x, y) => (hex(x.path) < hex(y.path) ? -1 : 1));
+  assert.equal((await push("main", commit((await tip()).tip, changes), target, payload)).status, 400, `${link} and ${dir}/pwned were taken`);
+}
+// Twins spread over two commits of one push, or over two pushes, against what the ref has.
+{
+  const target = text("../outside");
+  const first = commit((await tip()).tip, [{ path: text("Twin"), entry: { mode: 0o120000, id: blobIdOf(target) } }]);
+  const chained = encode({ parents: [idOf(first)], rest, changes: [{ path: text("twin/pwned"), entry: { mode: 0o100644, id: blobIdOf(payload) } }] });
+  const two = await fetch(`${server}/${repo}/push/main?commits=2`, { method: "POST", body: frame(first, chained, target, payload) });
+  assert.equal(two.status, 400, "twins in two commits of one push were taken");
+  const landed = (await (await push("main", first, target)).json()) as { status: string };
+  assert.equal(landed.status, "updated");
+  const later = commit((await tip()).tip, [{ path: text("twin/pwned"), entry: { mode: 0o100644, id: blobIdOf(payload) } }]);
+  assert.equal((await push("main", later, payload)).status, 400, "a path whose twin the ref has was taken");
+  // Once the twin is gone, the name is free.
+  const gone = (await (await push("main", commit((await tip()).tip, [{ path: text("Twin"), entry: null }]))).json()) as { status: string };
+  assert.equal(gone.status, "updated");
+  const free = (await (await push("main", commit((await tip()).tip, [{ path: text("twin/fine"), entry: { mode: 0o100644, id: blobIdOf(payload) } }]), payload)).json()) as { status: string };
+  assert.equal(free.status, "updated");
+  // A directory set whole whose entry has a twin in the same commit.
+  const inner = tree([0o100644, text("x"), blobIdOf(good)]);
+  assert.equal((await adopt(inner)).status, 200);
+  const both = commit((await tip()).tip, [
+    { path: text("w"), entry: { mode: 0o40000, id: treeId(inner) } },
+    { path: text("w/X"), entry: { mode: 0o100644, id: blobIdOf(payload) } },
+  ]);
+  assert.equal((await push("main", both, payload)).status, 400, "a directory's entry and its twin in one commit were taken");
+}
+// A directory whose files the repository was never sent, and a file entry holding a directory's id.
+{
+  const unsent = text(`never sent ${stamp}\n`);
+  const hollow = tree([0o100644, text("x"), blobIdOf(unsent)]);
+  const answer = (await (await adopt(hollow)).json()) as { missing: string[] };
+  assert.equal(answer.missing.length, 1);
+  assert.equal((await push("main", commit((await tip()).tip, [{ path: text("hollow"), entry: { mode: 0o40000, id: treeId(hollow) } }]))).status, 400, "a directory with a file nobody sent was taken");
+  // Sent with the push, it is whole.
+  const filled = (await (await push("main", commit((await tip()).tip, [{ path: text("hollow"), entry: { mode: 0o40000, id: treeId(hollow) } }]), unsent)).json()) as { status: string };
+  assert.equal(filled.status, "updated");
+  const inner = tree([0o100644, text("y"), blobIdOf(good)]);
+  assert.equal((await adopt(inner)).status, 200);
+  const disguised = tree([0o100644, text("f"), treeId(inner)]);
+  await adopt(disguised);
+  assert.equal((await push("main", commit((await tip()).tip, [{ path: text("disguised"), entry: { mode: 0o40000, id: treeId(disguised) } }]))).status, 400, "a file entry with a directory's id was taken");
+}
+// Too long once the place a directory is set at counts, and too deep built over several adopts.
+{
+  const leaf = tree([0o100644, text("f".repeat(200)), blobIdOf(good)]);
+  let below = leaf;
+  const chain = [below];
+  for (let i = 0; i < 2; i++) {
+    below = tree([0o40000, text("d".repeat(100)), treeId(below)]);
+    chain.push(below);
+  }
+  assert.equal((await adopt(...chain.reverse())).status, 200);
+  const deep = text(Array.from({ length: 8 }, () => "p".repeat(99)).join("/"));
+  assert.equal((await push("main", commit((await tip()).tip, [{ path: deep, entry: { mode: 0o40000, id: treeId(below) } }]))).status, 400, "a directory set where its paths grow too long was taken");
+  let top = below;
+  let refused = false;
+  for (let round = 0; round < 5 && !refused; round++) {
+    const more = [];
+    for (let i = 0; i < 2; i++) {
+      top = tree([0o40000, text("e".repeat(100)), treeId(top)]);
+      more.push(top);
+    }
+    refused = (await adopt(...more.reverse())).status === 400;
+  }
+  assert.ok(refused, "a tree built too deep over several adopts was taken");
 }
 console.log("ok");

@@ -33,6 +33,7 @@ flate2 = "1"
 # Plain HTTP only: the server is local so far.
 ureq = { version = "2", default-features = false }
 serde_json = "1"
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [profile.release]
 lto = "fat"

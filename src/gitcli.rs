@@ -1565,18 +1565,10 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     None => identity(&repo, "AUTHOR")?,
   };
   let rest = format!("author {author}\ncommitter {}\n\n{message}\n", identity(&repo, "COMMITTER")?).into_bytes();
-  let mut id = workspace::commit_entries(&mut repo.store, &mut repo.ws, rest.clone(), changes, merging.map(|(theirs, _)| theirs))?;
+  // An amend is one commit in place of the one before, made and named in one step.
+  let id =
+    workspace::commit_entries_as(&mut repo.store, &mut repo.ws, rest, changes, merging.map(|(theirs, _)| theirs), previous.as_ref())?;
   repo.end_merge();
-  if let Some(previous) = previous {
-    // The same tree, as one commit in place of the one before: its changes are everything since that one's parent.
-    let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
-    let (from, to) = (root(&mut repo.store, previous.parents.first().copied())?, root(&mut repo.store, Some(id))?);
-    let changes = diff(&mut repo.store, from, to)?;
-    id = Commit { parents: previous.parents, rest, changes }.store(&mut repo.store)?;
-    root_of(&mut repo.store, &id)?;
-    (repo.ws.base, repo.ws.head) = (Some(id), Some(id));
-    repo.ws.save()?;
-  }
   repo.set_staged(&Staged::new())?;
   repo.advance(before, id)?;
   let oid = repo.git_oid(&id)?;

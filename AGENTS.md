@@ -113,9 +113,15 @@ tracked asks about what is tracked.
   have checked, nor a client. An object read from the store is hashed
   before it is used. The server keeps what kind of object each id it was
   handed is, and takes only one line of commits for a ref. Paths are 1,024
-  bytes at most; two names a case-folding, normalizing file system takes
-  for one are not in one tree; a ref only goes forward, as a client sees
-  it.
+  bytes at most, counted from where a directory is set and, on a client,
+  from where the workspace is; two names a case-folding, normalizing file
+  system takes for one are not in one tree, nor on one ref across commits.
+  Names are folded in one place on each side (`manifest::fold_name`,
+  `folded` in `server/src/commit.ts`), as Unicode folds case in full: a
+  fold that takes more names for one refuses more, one that takes fewer
+  writes through a link. A check is made at every arrival, not once per
+  object. A ref only goes forward, as a client sees it, whether from a
+  sync or from the answer to a push.
 - **nv removes only what it can give back.** A file it tracks is recorded
   before it is written over. A file it does not track, or may not read,
   is never removed or written over to make way: the command refuses and

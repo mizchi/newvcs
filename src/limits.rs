@@ -28,6 +28,12 @@ pub fn http_quiet() -> Option<Duration> {
   seconds("NV_HTTP_TIMEOUT", 60)
 }
 
+/// How much of one answer from a server is read (`NV_ANSWER_MB`, 1024 MB): an answer is held
+/// whole, and a server that does not stop sending would otherwise take all the memory there is.
+pub fn answer_bytes() -> u64 {
+  std::env::var("NV_ANSWER_MB").ok().and_then(|text| text.trim().parse::<u64>().ok()).filter(|mb| *mb > 0).unwrap_or(1024) << 20
+}
+
 /// How long a commit Git makes for nv may take, its hooks included (`NV_GIT_TIMEOUT`, 300 s).
 pub fn git_commit() -> Option<Duration> {
   seconds("NV_GIT_TIMEOUT", 300)

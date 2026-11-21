@@ -11,6 +11,7 @@
 //! - `workspace`: checkouts of a set of path prefixes, shared copy-on-write.
 //! - `remote`: pushing to and catching up with a server that owns the refs.
 
+pub mod checks;
 pub mod colocated;
 pub mod commit;
 pub mod eol;
