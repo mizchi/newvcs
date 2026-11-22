@@ -608,7 +608,8 @@ fn an_edit_that_keeps_a_files_size_and_time_is_still_an_edit() {
   assert!(looked.contains("read 0"), "{looked}");
   for copy in ["agent-same-size-fork", "agent-same-size-copy"] {
     if copy.ends_with("copy") {
-      ok(&dir, "cp -c -R -p . ../agent-same-size-copy");
+      // A clone where the file system makes one (`-c` is macOS's), a copy keeping the times elsewhere.
+      ok(&dir, "cp -c -R -p . ../agent-same-size-copy 2>/dev/null || cp -R -p . ../agent-same-size-copy");
     }
     let at = dir.join("..").join(copy);
     ok(

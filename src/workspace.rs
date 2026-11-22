@@ -205,7 +205,16 @@ fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
       return Ok(());
     }
   }
-  let status = std::process::Command::new("cp").arg("-R").arg(from).arg(to).status()?;
+  // Elsewhere a copy, keeping the times the files were written: the index that comes with the
+  // tree knows each file by them, and a copy that changed them would have every file read again.
+  // Sharing blocks where the file system can (Btrfs, XFS), as APFS does.
+  let mut cp = std::process::Command::new("cp");
+  if cfg!(target_os = "linux") {
+    cp.args(["-R", "--preserve=mode,timestamps", "--reflink=auto"]);
+  } else {
+    cp.arg("-Rp");
+  }
+  let status = cp.arg(from).arg(to).status()?;
   if status.success() { Ok(()) } else { Err(std::io::Error::other("cp failed")) }
 }
 
@@ -2749,6 +2758,12 @@ pub fn write_entries(store: &mut Store, ws: &Workspace, entries: &[(Vec<u8>, Ent
 /// Move the workspace to another commit. Refused, with nothing touched, if
 /// a file it would change has been changed here, or sits here untracked.
 pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
+  switch_over(store, ws, target, &[])
+}
+
+/// `switch`, where the files at `staged` are what the commit gone to has (staged as it has them,
+/// for a fast-forward): those are not in the way, if on disk they are that too.
+pub fn switch_over(store: &mut Store, ws: &mut Workspace, target: Id, staged: &[Vec<u8>]) -> Result<()> {
   let (found, _) = status(ws, Look::Everywhere)?;
   let from = match ws.head {
     Some(head) => root_of(store, &head)?,
@@ -2756,10 +2771,15 @@ pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
   };
   let to = root_of(store, &target)?;
   let changes = removals_first(crate::manifest::diff(store, from, to)?);
-  // A file gone from the disk that the commit gone to does not have either is not in the way.
+  // A file gone from the disk that the commit gone to does not have either is not in the way, nor
+  // one staged as the commit has it that is that on disk too.
+  let already = |path: &Vec<u8>, new: &Option<Content>, entry: &Option<Entry>| match (new, entry) {
+    (Some((mode, bytes)), Some(entry)) => staged.contains(path) && *mode == entry.mode && object_id(Kind::Blob, bytes) == entry.id,
+    _ => false,
+  };
   let in_the_way: Vec<String> = found
     .iter()
-    .filter(|(path, new, _)| changes.iter().any(|(p, entry)| p == path && (new.is_some() || entry.is_some())))
+    .filter(|(path, new, _)| changes.iter().any(|(p, entry)| p == path && (new.is_some() || entry.is_some()) && !already(path, new, entry)))
     .map(|(path, _, _)| String::from_utf8_lossy(path).into_owned())
     .collect();
   if !in_the_way.is_empty() {
@@ -2769,7 +2789,10 @@ pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
   if !blocking.is_empty() {
     return Err(format!("Updating the following directories would lose untracked files in them:\n\t{}", blocking.join("\n\t")));
   }
-  let untracked = untracked_in_the_way(store, &ws.root, from, &changes)?;
+  let mut untracked = untracked_in_the_way(store, &ws.root, from, &changes)?;
+  untracked.retain(|path| {
+    !found.iter().any(|(p, new, _)| p.as_slice() == path.as_bytes() && changes.iter().any(|(c, entry)| c == p && already(p, new, entry)))
+  });
   if !untracked.is_empty() {
     return Err(format!(
       "The following untracked working tree files would be overwritten by checkout:\n\t{}\nPlease move or remove them before you switch branches.",

@@ -31,10 +31,7 @@ to "What reviewers found" in the README when it is fixed. What was fixed is list
 
 ## Differs from Git (output, exit codes)
 
-- [ ] `nv git show --stat <merge>` prints nothing after the message; Git 2.43 prints the stat
-  against the first parent. Check what newer Git does before matching it.
-- [ ] A fast-forward `nv git merge` over a staged file that the move changes is refused as not
-  spoken (125); find what Git says, and add a case.
+Nothing known: case 33 covers what was found, and everything listed before is fixed.
 
 ## Smaller
 
@@ -46,16 +43,18 @@ to "What reviewers found" in the README when it is fixed. What was fixed is list
 - [ ] A change to `.nv/exclude` made before a workspace's first snapshot by this version is not
   seen by `--recorded` until something walks: nothing was noted to compare it with.
 
-## Speed
+## Speed (oxc, 4-core Linux VM; see "Tuning on Linux" in the README)
 
-- [ ] Publishing beside Git with `--tracked` (150 ms on oxc against `git commit -qam` 39 ms)
-  looks at every tracked file twice: once for a sync's markers in `main.rs`, once to record in
-  `colocated::commit`. Record first and look for markers in what was recorded.
-- [ ] `nv git switch` between two commits 108 files apart: 418 ms against Git's 188 (measured
-  under load; not measured again).
-- [ ] A copy on a file system without clones (ext4) has every file read once after it is made
-  (`roundtrip.rs` and `agent.rs` expect none, as on APFS). Linux has `FICLONE` on Btrfs and XFS;
-  elsewhere a copy is a copy.
+- [ ] Publishing beside Git: `nv commit --recorded` 79 ms against `git commit -qam` 37 ms. Git's
+  index is written twice (`git add` into nv's copy, then Git's commit, 17 ms each for 2 MB);
+  `git commit --only <paths>` could do both in one, but its handling of hooks that stage files
+  and of new files has to be gone through first.
+- [ ] `nv git diff --stat` 19.7 ms against Git's 14.2: what is left is a stat of every tracked file
+  and the paths of the index (17,002 allocations).
+- [ ] `nv fork` of a workspace whose store is inside it (`nv git clone`) copies the store: 390 MB
+  and 10 s for oxc on ext4. It could share the store, as workspaces beside one another do.
+- [ ] Opening the store still reads `roots.map` after `roots.idx`, up to 1,024 records, and
+  `git.map` likewise; `objects.idx` up to 512 objects.
 
 ## The model (`formal/sync`)
 

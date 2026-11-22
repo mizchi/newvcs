@@ -1646,6 +1646,39 @@ were. Its counterexamples, each then reproduced with nv against the server:
 - Found beside it: **amending a commit that was pushed and heard** did the same. A ref only
   goes forward, and the amend is refused.
 
+**Tuning on Linux.** Measured on oxc (17,002 files, 22,530 commits) on a
+4-core Linux VM (ext4, Git 2.43), each row the old binary and the new one
+back to back, medians of 20 runs, with Git beside them in the same session:
+
+| | before | after | Git |
+| --- | ---: | ---: | ---: |
+| `nv status` (beside Git) / `git status` | 36.3 ms | 34.9 ms | 52.1 ms |
+| `nv git status` (no Git beside it) | 48.5 ms | 39.9 ms | 52.1 ms |
+| `nv git diff --stat` | 29.2 ms | 19.7 ms | 14.2 ms |
+| `nv git commit -qam` | 36.4 ms | 22.2 ms | 36.9 ms |
+| `nv git switch` there and back, 52 files | 101.3 ms | 89.6 ms | 81.6 ms |
+| `nv git log -20 --oneline` | 7.7 ms | 3.1 ms | 2.5 ms |
+| `nv snapshot --recorded` | 10.4 ms | 4.0 ms | |
+| `nv snapshot --tracked` | 29.1 ms | 18.9 ms | |
+| `nv mark` / `nv since` with `--recorded` | 11.3 / 9.9 ms | 4.8 / 4.7 ms | |
+| `nv commit` beside Git, `--recorded` | 81.1 ms | 78.8 ms | 36.9 ms (`commit -qam`) |
+| `nv commit` beside Git, `--tracked` | 144.9 ms | 105.9 ms | |
+| `nv commit` beside Git, walking | 172.9 ms | 130.0 ms | |
+| first `nv status` after `nv fork` | 121 ms, 17,002 files read | 63 ms, none read | |
+
+What changed, found with callgrind: opening the store read every commit's
+root into a hash map, which was 90% of a `rev-parse`; roots are now in a
+sorted, mapped `roots.idx` as Git ids are in `git.idx`. Maps keyed by ids
+hash the id's first eight bytes, where SipHash cost more than the lookups.
+Listing the index merged its parts through a map of every path, and comparing
+a file with it allocated its path; both are gone. A commit looked for a
+sync's markers with a look of its own, so `--tracked` and walking looked at
+the tree twice; it now looks in what it recorded. A copy made where there is
+no clone kept nothing of when files were written, and every file was read
+again after a fork. Publishing beside Git is still twice `git commit`: Git's
+index (2 MB for oxc) is written twice, by `git add` and by Git's commit,
+where `git commit -a` writes it once.
+
 What the rounds agree on, measured three times by different hands on a
 machine busy with the other reviewers: recording is about three times
 quicker than Git's quickest commit; going back is five to six times
@@ -1893,8 +1926,11 @@ stops.
   sees its `target` and `node_modules`.
 - Nothing searches the snapshots for the one that broke a test.
 - The watcher has been run on macOS, and on Linux by the tests only.
-  Copy-on-write clones are APFS's: on another file system a checkout or
-  fork copies, and the copy's files are read once afterwards.
+  Copy-on-write clones are APFS's, and Btrfs's and XFS's through
+  `cp --reflink=auto`: on another file system (ext4) a checkout or fork
+  copies, keeping the times files were written, so that the index that
+  comes with them still vouches for them. A store inside the workspace (as
+  `nv git clone` makes one) is copied with a fork: 390 MB for oxc, 10 s on ext4.
 - A tree whose entries are not in Git's order, or whose directory modes are
   written with a leading zero, would not round-trip. File modes Git no
   longer writes do. None of the former turned up in 271,812 commits.
@@ -1918,9 +1954,7 @@ the path. Some tests make files unreadable with `chmod 000`, which does not
 stop root: run them as another user.
 
 On Linux (ext4, Git 2.43, the tests run as an unprivileged user and against
-a local server) everything passes but what depends on copy-on-write clones,
-which ext4 does not have (two tests in `roundtrip.rs`, one in `agent.rs`:
-a copy has every file read again once), case 27 of the Git cases (Git 2.43
+a local server) everything passes but case 27 of the Git cases (Git 2.43
 takes `log -n abc`, newer Git refuses it), and, now and then, the check that
 a hook's process is gone after it was stopped, which can still be seen there
 for a moment until it is reaped.

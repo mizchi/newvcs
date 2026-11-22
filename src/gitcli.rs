@@ -2457,8 +2457,15 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
     println!();
   }
   // A merge that needed no decisions has nothing of its own to show: an empty line stands for it.
+  // Its stat is what it brought, against its first parent, as Git counts it.
   if commit.parents.len() > 1 {
     println!();
+    if has(args, "--stat") && !has(args, "--name-only") && !has(args, "--name-status") {
+      let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+      let (from, to) = (root(&mut repo.store, commit.parents.first().copied())?, root(&mut repo.store, Some(id))?);
+      let changes = between(&mut repo, from, to)?;
+      out(diffstat(&changes).as_bytes());
+    }
     return Ok(0);
   }
   // Before the diff: an empty line, unless the format was empty or was given as one that separates.
@@ -2919,12 +2926,36 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let ahead = ancestors(&mut repo.store, theirs)?;
   let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
   // A fast-forward is a checkout: what is staged stays staged, unless the move has to write it.
+  // There, what is staged has to be what the move brings, or Git will not move.
+  let mut brought_as_staged: Vec<Vec<u8>> = Vec::new();
   if ahead.contains(&ours) && !has(args, "--no-ff") && !repo.staged().is_empty() {
     let (from, to) = (root(&mut repo.store, Some(ours))?, root(&mut repo.store, Some(theirs))?);
     let moved = diff(&mut repo.store, from, to)?;
     let staged = repo.staged();
-    if moved.iter().any(|(path, _)| staged.keys().any(|s| under(std::slice::from_ref(s), path) || under(std::slice::from_ref(path), s))) {
-      return unsupported("merge` that only moves the branch forward, over a file staged that it changes");
+    let nested =
+      |a: &[u8], b: &[u8]| a != b && (under(std::slice::from_ref(&a.to_vec()), b) || under(std::slice::from_ref(&b.to_vec()), a));
+    if moved.iter().any(|(path, _)| staged.keys().any(|s| nested(s, path))) {
+      return unsupported("merge` that only moves the branch forward, over a staged file where it has a directory, or the other way");
+    }
+    let mut in_the_way = Vec::new();
+    for (path, entry) in &moved {
+      match staged.get(path) {
+        Some(staged) if staged == entry => brought_as_staged.push(path.clone()),
+        Some(_) => in_the_way.push(String::from_utf8_lossy(path).into_owned()),
+        None => {}
+      }
+    }
+    if !in_the_way.is_empty() {
+      if !quiet(args) {
+        println!("Updating {}..{}", &repo.git_oid(&ours)?[..abbrev()], &repo.git_oid(&theirs)?[..abbrev()]);
+      }
+      return fatal(
+        1,
+        format!(
+          "error: Your local changes to the following files would be overwritten by merge:\n\t{}\nPlease commit your changes or stash them before you merge.\nAborting",
+          in_the_way.join("\n\t")
+        ),
+      );
     }
   }
   // Git merges into the last commit, not into what has been added since: with anything staged it will not start.
@@ -2939,9 +2970,15 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     );
   }
   if ahead.contains(&ours) && !has(args, "--no-ff") {
-    // Nothing of ours that they lack: the branch just moves to where they are.
-    if let Err(refusal) = workspace::switch(&mut repo.store, &mut repo.ws, theirs) {
+    // Nothing of ours that they lack: the branch just moves to where they are. What was staged
+    // as they have it is, once there, no longer a difference from HEAD.
+    if let Err(refusal) = workspace::switch_over(&mut repo.store, &mut repo.ws, theirs, &brought_as_staged) {
       return fatal(1, format!("error: {refusal}\nAborting"));
+    }
+    if !brought_as_staged.is_empty() {
+      let mut staged = repo.staged();
+      staged.retain(|path, _| !brought_as_staged.contains(path));
+      repo.set_staged(&staged)?;
     }
     repo.advance(Some(ours), theirs)?;
     if !quiet(args) {
