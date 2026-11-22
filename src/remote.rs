@@ -312,6 +312,9 @@ pub struct Pushed {
   /// Paths `.gitattributes` merges by union that the ref had changed too: the server merged
   /// them, as a sync would have, and the push landed.
   pub merged_on_server: Vec<String>,
+  /// Contents sent for the server to merge with, beside those the commits name: what union
+  /// paths were at the base, and the rules above them.
+  pub sent_for_merge: usize,
   pub synced: Synced,
 }
 
@@ -448,7 +451,8 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   // Of the paths it changes that `.gitattributes` merges by union, as the chain's base has them:
   // what each was there, and the rules above it, so that the server can merge them if the ref
   // changed them too. Their contents go with the push.
-  let (stated, mut named) = union_statement(store, &chain)?;
+  let (stated, for_merge) = union_statement(store, &chain)?;
+  let mut named: Vec<Id> = Vec::new();
   if let Some(stated) = &stated {
     frame(&mut body, stated.as_bytes());
   }
@@ -467,7 +471,13 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   }
   named.sort_unstable();
   named.dedup();
-  for id in named {
+  // What the server would merge with goes too, counted apart: what the paths were at the base,
+  // and the rules above them.
+  let mut merge_with: Vec<Id> = for_merge.into_iter().filter(|id| named.binary_search(id).is_err()).collect();
+  merge_with.sort_unstable();
+  merge_with.dedup();
+  done.sent_for_merge = merge_with.len();
+  for id in named.into_iter().chain(merge_with) {
     let bytes = store.get(&id)?.ok_or_else(|| format!("blob {} is not in the store", hex(&id)))?;
     if bytes.len() >= LARGE {
       // By itself and ahead of the push: it is streamed into the bucket and never passes
@@ -482,6 +492,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     }
     done.contents_sent += 1;
   }
+  done.contents_sent -= done.sent_for_merge;
   // From here until an answer is heard, the push may land without this workspace knowing.
   let last = object_id(Kind::Commit, &chain.last().expect("a push carries a commit").encode());
   crate::write_whole(&workspace::unheard(ws), format!("{} {}\n", chain.len(), hex(&last)))?;

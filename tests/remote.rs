@@ -1427,7 +1427,13 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
     said.contains("pushed 1 commit: 0 as they were, 1 put on a newer tip") && said.contains("merged on the server (merge=union): list"),
     "{said}"
   );
+  assert!(
+    said.contains("1 file content sent (and 2 for the server to merge with)"),
+    "what the base was, and the rules, are counted apart: {said}"
+  );
   assert_eq!(read("bob", "list"), "start\nbob\nann\n", "the workspace has what landed");
+  let tip = run("bob", "$NV git log -1 --format=%h").1;
+  assert!(said.contains(&format!("is now at {}", tip.trim())) && !tip.trim().is_empty(), "the push names the tip: {said}");
   let (_, said) = run("bob", "$NV pending . --wait");
   assert!(said.starts_with("nothing committed here that is not pushed"), "its own commit is known as landed: {said}");
   assert!(said.ends_with("settled: what is recorded is committed, and passed unit\n"), "what the server made is run on: {said}");

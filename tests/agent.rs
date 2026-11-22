@@ -1223,6 +1223,13 @@ fn each_checkpoint_is_committed_and_the_commits_are_made_again_fewer() {
     assert_ne!(code, 0, "{plan}: {said}");
   }
   assert_eq!(ok(&dir, "$NV git log --format=%s | head -2"), "Add three\nAdd one and two");
+  // Made again by someone else, as `git rebase` does: the author stays, the committer is who made them again.
+  ok(
+    &dir,
+    "GIT_AUTHOR_NAME=R GIT_AUTHOR_EMAIL=r@example.com GIT_COMMITTER_NAME=R GIT_COMMITTER_EMAIL=r@example.com $NV rebuild . 2 'Add one, two and three' >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>|%cn <%ce>|%s'"), "A <a@example.com>|R <r@example.com>|Add one, two and three");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "one\nthree\ntwo");
 }
 
 /// The state the conditions passed on is committed though the files moved on since: what came

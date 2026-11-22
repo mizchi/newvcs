@@ -49,7 +49,9 @@ nv: an experiment in keeping Git's object ids without Git's storage
         `nv pending`, or the start of its Git id or nv's. Commits after the
         last one named are made again as they were. Where each <commit>
         passed the conditions, each new commit does; it is said where one
-        did not. The files are not touched
+        did not. Each new commit keeps the author of the first commit it is
+        made of, as a squash in Git does; its committer is whoever runs
+        this. The files are not touched
   nv watch <dir> [--start | --stop | --status]
         Stay, and snapshot whatever is written there by whatever writes it:
         the operating system reports the writes, so nothing has to. With
@@ -551,14 +553,23 @@ fn run(args: &[String]) -> Result<()> {
         return Err("`nv rebuild` takes pairs: a commit, and the message of the commit that ends with it".to_string());
       }
       let mut plan = Vec::new();
+      // Each new commit is by whoever wrote the first of the commits it is made of, as a squash
+      // in Git keeps it; who made it again is its committer.
+      let chain = workspace::pending(&mut store, &ws)?;
+      let committer = signature(&ws, "COMMITTER")?;
+      let mut from = 0;
       for pair in rest.chunks(2) {
         let id = commit_named(&mut store, &ws, &pair[0])?;
         if pair[1].trim().is_empty() {
           return Err(format!("the commit ending with {} needs a message that says something", pair[0]));
         }
-        let author = signature(&ws, "AUTHOR")?;
-        let committer = signature(&ws, "COMMITTER")?;
+        let first = chain.get(from).map(|(_, commit)| String::from_utf8_lossy(&commit.rest).into_owned());
+        let author = match first.as_deref().and_then(|rest| rest.lines().find_map(|line| line.strip_prefix("author "))) {
+          Some(author) => author.to_string(),
+          None => signature(&ws, "AUTHOR")?,
+        };
         plan.push((id, format!("author {author}\ncommitter {committer}\n\n{}\n", pair[1].trim_end()).into_bytes()));
+        from = chain.iter().position(|(c, _)| *c == id).map_or(from, |at| at + 1);
       }
       let before = workspace::pending(&mut store, &ws)?.len();
       let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
@@ -663,7 +674,13 @@ fn run(args: &[String]) -> Result<()> {
       }
       let landed = done.updated + done.rebased;
       if landed > 0 {
-        let tip = ws.pushed.map(|id| newvcs::git::git_id_of(&mut store, &id).map(|oid| hex(&oid)[..7].to_string()).unwrap_or_default());
+        // Git's id of the tip needs the content of every version of every file since the last
+        // id known, those the server merged and nobody fetched among them: fetched as `nv git` does.
+        let _ = remote::fetch_for_export(&mut store, &ws);
+        let tip = ws.pushed.map(|id| match newvcs::git::git_id_of(&mut store, &id) {
+          Ok(oid) => hex(&oid)[..7].to_string(),
+          Err(_) => format!("{} (nv's id)", &hex(&id)[..12]),
+        });
         println!(
           "pushed {landed} {}: {} as they were, {} put on a newer tip; `{}` on {} is now at {}",
           if landed == 1 { "commit" } else { "commits" },
@@ -677,9 +694,11 @@ fn run(args: &[String]) -> Result<()> {
       if !done.merged_on_server.is_empty() {
         println!("merged on the server (merge=union): {}", done.merged_on_server.join(", "));
       }
+      let for_merge =
+        if done.sent_for_merge > 0 { format!(" (and {} for the server to merge with)", done.sent_for_merge) } else { String::new() };
       println!(
-        "{} file contents sent, {} of linked directories not sent; {} in {:.0} ms",
-        done.contents_sent,
+        "{} sent{for_merge}, {} of linked directories not sent; {} in {:.0} ms",
+        counted(done.contents_sent, "file content"),
         done.adopted,
         describe(&done.synced, &ws.root),
         ms(started)

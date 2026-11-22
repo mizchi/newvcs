@@ -100,23 +100,48 @@ committers pushed again with nothing to settle.
 | 21 | `nv rebuild` cannot split a checkpoint by path | 1 | Not done |
 | 22 | `nv log` prints times as epoch milliseconds | 2 | Not done |
 
+## Round 4 (2026-11-22)
+
+The same tasks, prompts and seed as round 3, on nv at `d703761`: the server merges a push that
+clashes only on `merge=union` paths, and the push lands.
+
+**What the ref came to**: four commits after the start, each passing; nothing provisional, no
+markers, every function exported. No push was refused: the second and third committers' pushes
+landed on the first try, `__init__.py` merged on the server, and no committer ran `nv sync`.
+
+**The committers' findings**:
+
+| # | Finding | Met by | Done |
+| --- | --- | ---: | --- |
+| 23 | `nv rebuild` signs the new commits with the committer's own identity, so the developer's name is lost | 3 | Keeps the author of the first commit of each, as a squash does; the committer is whoever runs it |
+| 24 | After a push the server merged, "is now at" names nothing: Git's id of the tip needed a version of the list nobody had fetched | 2 | Fetched as `nv git` does; nv's id where it still cannot be had |
+| 25 | "6 file contents sent" for a commit of 4 files | 1 | The contents sent for the server to merge with are counted apart |
+| 26 | The new ids of one's own commits on the ref are not printed | 2 | Not done |
+| 27 | `nv git show -s`, `nv git show <rev> -- <path>`, `nv git diff A B <path>` are refused | 2 | Not done |
+| 28 | Nothing says whether the tip the server merged passes the conditions, short of `nv pending --wait` | 1 | Not done |
+
+The committers spent more than in round 3 (vcs tokens +10%, calls +6%) on the things above: two
+looked at the merged file and ran the tests by hand, and all three looked into the author and
+the empty tip.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
-better. Tokens are above a baseline agent that does nothing (67,316 tokens). Every round had
-three refused pushes.
+better. Tokens are above a baseline agent that does nothing (67,316 tokens).
 
-| | Round 1 | Round 2 | Round 3 |
-| --- | ---: | ---: | ---: |
-| makespan, s | 157.9 | 152.1 | 122.2 |
-| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 |
-| vcs tokens (committers) | 54,600 | 48,217 | 41,241 |
-| dev tokens (workers) | 18,404 | 18,966 | 19,269 |
-| vcs share | 74.8% | 71.8% | 68.2% |
-| vcs calls (committers' tool calls) | 47 | 37 | 32 |
+| | Round 1 | Round 2 | Round 3 | Round 4 |
+| --- | ---: | ---: | ---: | ---: |
+| makespan, s | 157.9 | 152.1 | 122.2 | 92.7 |
+| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 | 41.7 |
+| vcs tokens (committers) | 54,600 | 48,217 | 41,241 | 45,558 |
+| dev tokens (workers) | 18,404 | 18,966 | 19,269 | 18,378 |
+| vcs share | 74.8% | 71.8% | 68.2% | 71.3% |
+| vcs calls (committers' tool calls) | 47 | 37 | 32 | 34 |
+| refused pushes | 3 | 3 | 3 | 0 |
 
 Against round 1, round 3 took 23% less time to the last push, 45% less latency, 24% fewer
 committer tokens and 32% fewer committer calls, for the same work and the same number of
-refusals. The workers' cost stayed flat (18.4k to 19.3k), as it should: version control does
+refusals. Round 4, with no refusals, took 41% less time than round 1 to the last push and 59%
+less latency; its committers' tokens went back up on what they had to check (round 4 above). The workers' cost stayed flat (18.4k to 19.3k), as it should: version control does
 not reach them. What a conflict costs a committer, from the committers of each round who met
 none, one and two: round 2, 12.4k, 15.9k and 19.9k tokens; round 3, 11.2k, 14.3k and 15.7k.

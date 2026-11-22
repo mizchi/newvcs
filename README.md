@@ -559,7 +559,9 @@ again before anyone else sees them:
   whether what is on disk is committed or did not pass.
 - `nv rebuild <dir> <commit> <message> [<commit> <message>...]` makes them
   again as fewer commits: each new one ends at a `<commit>` (its number, or
-  the start of either id) and holds everything since the one before.
+  the start of either id) and holds everything since the one before,
+  under the author of the first commit it is made of, as a squash in Git
+  keeps it; the committer is whoever ran it.
   Where each `<commit>` passed, each new commit did, as results are kept by
   the files' tree as well as by the state. The files are not touched. It
   refuses where there is no end to what is not pushed (no ref and no commit
