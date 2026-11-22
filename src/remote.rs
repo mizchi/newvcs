@@ -842,19 +842,23 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
       None => Ok(Default::default()),
     }
   };
-  let three_way = |store: &mut Store, was: Option<Entry>, ours: Entry, theirs: Entry| -> Result<Option<(Vec<u8>, bool, u32)>> {
-    // The mode is merged as the text is: whoever changed it from what both had, has it.
-    let mode = match was {
-      Some(was) if was.mode == ours.mode => theirs.mode,
-      _ => ours.mode,
+  // `merge=union` paths, as `.gitattributes` on disk says: both sides' lines, and merged.
+  let root = ws.root.clone();
+  let three_way =
+    |store: &mut Store, path: &[u8], was: Option<Entry>, ours: Entry, theirs: Entry| -> Result<Option<(Vec<u8>, bool, u32)>> {
+      // The mode is merged as the text is: whoever changed it from what both had, has it.
+      let mode = match was {
+        Some(was) if was.mode == ours.mode => theirs.mode,
+        _ => ours.mode,
+      };
+      let (was, ours, theirs) = (content(store, was.filter(|e| !e.is_dir()))?, content(store, Some(ours))?, content(store, Some(theirs))?);
+      if ours.contains(&0) || theirs.contains(&0) {
+        return Ok(None);
+      }
+      let (text, clean) =
+        crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs", crate::eol::merges_by_union(&root, path));
+      Ok(Some((text, clean, mode)))
     };
-    let (was, ours, theirs) = (content(store, was.filter(|e| !e.is_dir()))?, content(store, Some(ours))?, content(store, Some(theirs))?);
-    if ours.contains(&0) || theirs.contains(&0) {
-      return Ok(None);
-    }
-    let (text, clean) = crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs");
-    Ok(Some((text, clean, mode)))
-  };
   let mut clash: Vec<String> = Vec::new();
   let name = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
 
@@ -866,7 +870,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
       Some((_, their)) => match (file(ours), file(their)) {
         (Some(ours), Some(their)) => {
           let was = at(store, merge_base, path)?;
-          match three_way(store, was, ours, their)? {
+          match three_way(store, path, was, ours, their)? {
             Some((text, true, mode)) => {
               merged_published.insert(path.clone(), Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? });
             }
@@ -932,7 +936,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     }
     let was = at(store, base_root, path)?;
     match (file(now), file(&new)) {
-      (Some(ours), Some(their)) => match three_way(store, was, ours, their)? {
+      (Some(ours), Some(their)) => match three_way(store, path, was, ours, their)? {
         Some((text, true, mode)) => {
           let merged = Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? };
           merges += 1;
@@ -954,7 +958,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     let (was, their) = (at(store, merge_base, path)?, moved(path).flatten());
     let ours = file(&at(store, head_root, path)?).or(file(&at(store, base_root, path)?));
     match (ours, their) {
-      (Some(ours), Some(their)) => match three_way(store, was, ours, their)? {
+      (Some(ours), Some(their)) => match three_way(store, path, was, ours, their)? {
         Some((text, _, mode)) => {
           outcome.insert(path.clone(), Outcome::Both(text, mode));
         }

@@ -1373,3 +1373,69 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   assert_eq!(code, 125, "{said}");
   assert!(said.contains("a range of commits (`HEAD~1..HEAD`)") && said.contains("`nv pending`"), "{said}");
 }
+
+/// Two writers who each add an entry to a list `.gitattributes` gives `merge=union` do not leave
+/// each other a conflict: the sync keeps both, and the conditions are run on what it made, so the
+/// committer knows whether to push without running anything (round 2 of `eval/commit-agents`).
+#[test]
+fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-union");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/union-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src
+      printf 'start\n' > list && printf 'start\n' > plain && printf 'list merge=union\n' > .gitattributes
+      printf 'auto = true\n[checks.unit]\nrun = "test $(grep -c . list) -ge 2 && ! grep -q \\"<<<<<<<\\" list"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} git clone -q src bob
+      {nv} remote ann {url} main && {nv} remote bob {url} main
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  let (code, said) = run("ann", "echo ann >> list && $NV commit . 'Ann adds an entry' >/dev/null && $NV push .");
+  assert_eq!(code, 0, "{said}");
+  let (code, said) = run("bob", "echo bob >> list && $NV commit . 'Bob adds an entry' >/dev/null && $NV push .");
+  assert_eq!(code, 2, "{said}");
+  // The sync merges the list, both entries kept, and nothing is left for a person.
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "start\nbob\nann\n");
+  // What the sync made is run on: the committer is told it passed, and pushes it as it is.
+  let (code, said) = run("bob", "$NV pending . --wait");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("Bob adds an entry  (passed unit)"), "{said}");
+  assert!(said.ends_with("settled: what is recorded is committed, and passed unit\n"), "{said}");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // A file without the attribute still clashes as text.
+  let (code, said) = run("ann", "$NV sync . >/dev/null; echo a2 >> plain && $NV commit . 'Ann edits plain' && $NV push .");
+  assert_eq!(code, 0, "{said}");
+  let (code, said) = run("bob", "echo b2 >> plain && $NV commit . 'Bob edits plain' >/dev/null && ($NV push . || $NV sync .)");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("both sides changed the same lines of: plain"), "{said}");
+}

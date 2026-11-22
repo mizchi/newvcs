@@ -31,6 +31,36 @@ then says what the ref came to: each commit after the start, its message and fil
 whether the tests pass on it; how many provisional messages were pushed; whether any file at
 the tip holds a conflict's markers.
 
-What is judged, besides what `verify.sh` says: what the agents report got in their way, and how
-many commands the committing agent needed that failed or that it had to work out. The rounds
-and what came of each are in `rounds.md`.
+## Scores
+
+```
+eval/commit-agents/verify.sh <work-dir> <ref-url> > <work-dir>/verify.txt
+eval/commit-agents/score.py <work-dir> [<an earlier round's work-dir>]
+```
+
+`score.py` reads `verify.txt` and `usage.tsv`, which the one running the round writes from what
+it is told as each agent finishes (tokens, tool calls, milliseconds; for a committer, the pushes
+it had refused), with one more agent as a baseline: told to answer "OK" and use no tools, it is
+what any agent costs before it does anything, and tokens are counted above it.
+
+First the gates: every commit on the ref passes its tests, no provisional message and no marker
+reached it, every public function is exported, a commit for every task. A round that fails one
+has no score: nothing is traded for speed. Then, lower being better:
+
+| Score | What it is |
+| --- | --- |
+| makespan | seconds from launch until the last committer was done |
+| latency | the median over tasks of how long after its developer was done the work was on the ref (the committer's time less the worker's; both start together) |
+| vcs tokens | the committers' tokens above the baseline, in all |
+| dev tokens | the workers' tokens above the baseline: version control should not cost them |
+| vcs share | vcs tokens as a part of vcs and dev tokens |
+| vcs calls | the committers' tool calls, each a turn |
+
+Against an earlier round it prints each with the change in per cent. The tokens are as the
+harness reports them for an agent: they grow with what it read and wrote, not with its turns,
+so the tool calls stand for the turns. A committer polls for the developer's file every ten
+seconds, so latency is to within that.
+
+What is judged besides: what the agents report got in their way, and how many commands the
+committing agent needed that failed or that it had to work out. The rounds and what came of
+each are in `rounds.md`.

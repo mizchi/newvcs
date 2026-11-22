@@ -16,7 +16,22 @@ cd "$work"
 
 # The project: a package of text utilities and its tests, which take a fraction of a second.
 mkdir -p seed/textkit seed/tests && cd seed
-printf '"""Small text utilities."""\n' > textkit/__init__.py
+# The file every task adds to is a list, one entry to a line, which `merge=union` merges by
+# keeping every writer's lines (rounds 3 on). PLAIN_SEED=1 makes the seed of rounds 1 and 2.
+if [ -n "${PLAIN_SEED:-}" ]; then
+  printf '"""Small text utilities."""\n' > textkit/__init__.py
+else
+  cat > textkit/__init__.py <<'PY'
+"""Small text utilities."""
+
+# One import to a line, and one name to a line in __all__: writers add lines here at once,
+# and a sync keeps the lines of each (merge=union in .gitattributes).
+
+__all__ = [
+]
+PY
+  printf 'textkit/__init__.py merge=union\n' > .gitattributes
+fi
 : > tests/__init__.py
 cat > tests/test_package.py <<'PY'
 import unittest

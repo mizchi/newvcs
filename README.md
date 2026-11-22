@@ -289,8 +289,11 @@ all of Git has it by keeping Git in the directory.
   file is binary, it refuses and touches nothing.
 - `diff` while a merge has conflicts is refused: Git shows both sides
   against the result, which is not spoken.
-- `.gitattributes` is read for line endings only (`text`, `text=auto`,
-  `eol`, `-text`, `binary`), as Git does with `core.autocrlf` unset on a
+- `.gitattributes` is read for line endings (`text`, `text=auto`,
+  `eol`, `-text`, `binary`), and for `merge=union`, which `git merge` and
+  `nv sync` both honour: where both sides changed the same lines of such a
+  path, both sides' lines are kept, ours first, and the path is merged.
+  Line endings are read as Git does with `core.autocrlf` unset on a
   system whose line ending is LF. Filters, `ident` and
   `working-tree-encoding` are not applied. A file under `text=auto` that
   was committed with CRLF and is then edited is stored with LF, where Git
@@ -569,10 +572,10 @@ and pushes, all to one ref. `rounds.md` there has what each round found.
 
 Not done: a write
 that lands after a runner's last look and before it ends waits for the
-next write to be run on. A sync's own commit on the ref's tip is not run
-on, and leaves out a file it left with both versions; the settling is
-committed after it as a checkpoint of its own, and the two are made into
-one with `nv rebuild`. Conditions do not run in a copy, so a slow test
+next write to be run on. A sync's own commit on the ref's tip leaves out
+a file the sync left with both versions; the settling is committed after
+it as a checkpoint of its own, and the two are made into one with `nv
+rebuild`. Conditions do not run in a copy, so a slow test
 suite and a busy writer may never agree on a state. Nothing is shared
 with other workspaces yet: taking another writer's checkpoint in early,
 and running one's own conditions on the two together, is the next step.
@@ -861,7 +864,8 @@ before:
   (`gix-merge`). Where the two changed different lines the result is the
   workspace's change on top of theirs, and the push then goes through.
   Where they changed the same lines the file is left holding both versions
-  between Git's markers, as a change not yet recorded; the sync exits 1,
+  between Git's markers, as a change not yet recorded, unless
+  `.gitattributes` gives it `merge=union` (below); the sync exits 1,
   as `git pull` does, and `nv commit` refuses while a file from that sync
   still holds the markers. What cannot be merged as text (a file one side
   removed, a binary file) stops the sync with nothing touched. The way on
@@ -869,6 +873,17 @@ before:
   as it last saw it, and what it had beyond that (commits not pushed,
   snapshots, the files) is set aside under an id it prints, to be read
   with `nv since` or written out beside the workspace with `nv checkout`.
+- **A list every writer adds to need not be a conflict.** A file of
+  entries, one to a line (imports, a changelog, names exported), meets
+  the same lines changed by every writer after the first, though no two
+  disagree. Given `merge=union` in `.gitattributes`, as Git users give a
+  changelog, a sync keeps both sides' lines and goes on. Union is only
+  right where each entry is a line of its own and order does not matter:
+  two writers who each wrote `__all__ = ["theirs"]` on one line get both
+  lines, and the second assignment wins. Where the conditions run behind
+  writes (`auto`), they are run on what a sync or a push made, so that
+  `nv pending` says whether the merged commit passes; a union that went
+  wrong is caught there, when the conditions look at it.
 - **What a workspace pushed is its own work, not a change of someone
   else's.** A file committed, edited again and then pushed stays as
   edited, the edit an unpublished change on the commit; a file committed
@@ -1960,7 +1975,10 @@ stops.
 - A fork keeps build output, but whether a build tool still trusts it under
   a new absolute path has not been tried.
 - In a workspace with no Git beside it, `.gitattributes` is read for line
-  endings only: no filters, no LFS. Beside Git, commits are Git's and
+  endings and `merge=union` only: no filters, no LFS, no `-merge` (it is
+  merged as text), no merge drivers of one's own (`merge=<name>` with
+  `merge.<name>.driver`, which would let a syntax-aware tool or an agent
+  settle a conflict before a person sees it). Beside Git, commits are Git's and
   filters apply to them; nv's own snapshots hold the files as they are on
   disk.
 - `.gitignore` is honoured, and `.nv/exclude` is a workspace's own list in

@@ -163,6 +163,47 @@ impl Eols {
   }
 }
 
+/// Whether `.gitattributes` gives a path Git's `union` merge (`merge=union`): where both sides
+/// changed the same lines, the lines of both are kept, ours first, and the file is merged. Read
+/// from the files on disk, as Git reads them in a working tree, and only for a path that is
+/// being merged: not part of looking at what changed, which this would slow.
+pub fn merges_by_union(root: &Path, path: &[u8]) -> bool {
+  // The file's own directory first, the root last; in a file, the last line first. The first
+  // rule that matches and says anything of `merge` decides.
+  let mut ends: Vec<usize> = path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(at, _)| at).collect();
+  loop {
+    let (dir, relative) = match ends.pop() {
+      Some(end) => (&path[..end], &path[end + 1..]),
+      None => (&path[..0], path),
+    };
+    let file = root.join(crate::workspace::to_path(dir)).join(".gitattributes");
+    let bytes = std::fs::read(file).unwrap_or_default();
+    let mut said = None;
+    for (kind, assignments, _) in gix_attributes::parse(&bytes).flatten() {
+      let gix_attributes::parse::Kind::Pattern(pattern) = kind else { continue };
+      let mut union = None;
+      for assignment in assignments.flatten() {
+        match (assignment.name.as_str(), assignment.state) {
+          ("merge", StateRef::Value(value)) => union = Some(value.as_bstr() == "union"),
+          ("merge", _) | ("binary", StateRef::Set) => union = Some(false),
+          _ => {}
+        }
+      }
+      let Some(union) = union else { continue };
+      let base = relative.rfind_byte(b'/').map(|at| at + 1);
+      if pattern.matches_repo_relative_path(relative.as_bstr(), base, Some(false), Case::Sensitive, Mode::NO_MATCH_SLASH_LITERAL) {
+        said = Some(union);
+      }
+    }
+    if let Some(union) = said {
+      return union;
+    }
+    if dir.is_empty() {
+      return false;
+    }
+  }
+}
+
 #[derive(Default)]
 struct Stats {
   lone_lf: usize,

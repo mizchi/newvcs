@@ -21,4 +21,16 @@ done
 rm -rf at
 markers=$(grep -rl '^<<<<<<< ' verify --include='*.py' --include='*.md' 2>/dev/null | grep -v '/.nv/' | wc -l)
 echo "commits: $total, passing their tests: $passing, provisional messages left: $provisional, files with markers at the tip: $markers"
+# Every public function of a module of the package is exported from it, and named in `__all__`
+# where there is one: what a merge that kept both sides' lines can get wrong while the tests pass.
+missing=$(cd verify && python3 - <<'PY'
+import ast, importlib, pathlib
+pkg = importlib.import_module("textkit")
+names = [n.name for f in sorted(pathlib.Path("textkit").glob("*.py")) if f.name != "__init__.py"
+         for n in ast.parse(f.read_text()).body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")]
+listed = getattr(pkg, "__all__", None)
+print(" ".join(n for n in names if not hasattr(pkg, n) or (listed is not None and n not in listed)))
+PY
+)
+echo "exports missing at the tip: ${missing:-none}"
 echo "files at the tip: $(cd verify && find . -type f -not -path "./.nv/*" -not -path "*/__pycache__/*" | sort | tr "\n" " ")"

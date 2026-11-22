@@ -1270,7 +1270,7 @@ fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
   // Waited for, the write is committed once it is said to be settled.
   let waited = ok(&dir, "$NV pending . --wait");
   assert!(waited.contains("checkpoint: unit passed") && waited.contains("A one"), "{waited}");
-  assert!(waited.ends_with("settled: what is recorded is committed"), "{waited}");
+  assert!(waited.ends_with("settled: what is recorded is committed, and passed unit"), "{waited}");
   // A state that does not pass is settled as well, and said not to have passed.
   ok(&dir, "echo x > broken");
   let waited = ok(&dir, "$NV pending . --wait");
@@ -1300,4 +1300,23 @@ fn a_checkpoint_commit_is_signed_by_whoever_the_workspace_says() {
   assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed", "nothing was committed");
   let waited = ok(&dir, "$NV pending . --wait");
   assert!(waited.ends_with("it was not committed: `nv checkpoint <dir>` says why"), "{waited}");
+}
+
+/// `nv commit` of files the runner behind writes committed meanwhile (`[commit] each`) is not
+/// refused as files that changed: the files are as the conditions passed on them. It says where
+/// they went, and only for a commit the runner made.
+#[test]
+fn a_commit_of_what_the_runner_committed_meanwhile_says_so() {
+  let dir = workspace("commit-after-runner");
+  ok(
+    &dir,
+    "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  let said = ok(&dir, "$NV commit . 'Add one'");
+  assert!(said.starts_with("nothing to commit: these files were committed already, as "), "{said}");
+  assert!(said.contains("`nv rebuild <dir> <n> <message>`"), "{said}");
+  // A commit of one's own, and then nothing new: nothing to commit, and nothing more said.
+  ok(&dir, "echo 2 > two && $NV commit . 'Add two' >/dev/null");
+  assert_eq!(ok(&dir, "$NV commit . 'Again'"), "nothing to commit");
 }

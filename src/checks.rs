@@ -249,8 +249,19 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
     results.push((check.name.clone(), outcome, started.elapsed()));
   }
   // What the run found is about the state it began on only if the files are that state still.
+  // The files, not the state's id: a runner behind this one may have committed that state
+  // meanwhile, which moves the head and leaves the files as they were.
   let after = recorded(Look::Everywhere)?;
-  let run = Run { state, results, moved: after != Some(state) };
+  let moved = match after {
+    Some(after) if after == state => false,
+    Some(after) => {
+      let ws = Workspace::open(root)?;
+      let mut store = Store::open(&ws.store)?;
+      root_of(&mut store, &after)? != root_of(&mut store, &state)?
+    }
+    None => true,
+  };
+  let run = Run { state, results, moved };
   if !run.moved {
     let _held = workspace::lock(root)?;
     let ws = Workspace::open(root)?;
@@ -290,7 +301,17 @@ pub fn commit_checkpoint(root: &Path, config: &Config, state: &Id, author: &str)
   // Signed as any commit made here is: nv does not make a name up.
   let signed = |role: &str| workspace::signature(&ws, role).map_err(|why| format!("not committed: {why}"));
   let rest = format!("author {}\ncommitter {}\n\n{}\n", signed("AUTHOR")?, signed("COMMITTER")?, message.trim_end()).into_bytes();
-  workspace::commit_state(&mut store, &mut ws, *state, rest, author)
+  let made = workspace::commit_state(&mut store, &mut ws, *state, rest, author)?;
+  // Which commit was the runner's own, for a command to say so: a note, nothing depends on it.
+  if let Some(id) = made {
+    let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(&id).as_bytes());
+  }
+  Ok(made)
+}
+
+/// Whether this commit is one the conditions' runner made (`[commit] each`), as far as its note says.
+pub fn committed_by_runner(root: &Path, id: &Id) -> bool {
+  std::fs::read_to_string(runs_dir(root).join("committed")).is_ok_and(|said| said.trim() == hex(id))
 }
 
 /// Whether the conditions are known to have passed on this state.
@@ -418,14 +439,18 @@ pub fn run_until_still(root: &Path, config: &Config, author: &str) -> Result<Opt
 }
 
 /// Wait until nothing more is coming: the watcher has recorded every write made before this
-/// call, no run of the conditions is under way, and what is recorded is either committed or
-/// known not to have passed. Says which, in a line. Gives up at `limits::command()`.
+/// call, no run of the conditions is under way, and what is recorded has its verdict where the
+/// conditions run behind writes (`auto`): committed, or known not to have passed. A commit no
+/// run has reached, as a sync or a push leaves one, is run on. Says which, in a line. Gives up
+/// at `limits::command()`.
 pub fn wait_settled(root: &Path) -> Result<String> {
   let started = Instant::now();
   let limit = crate::limits::command();
   let config = load(root)?;
   let runs = config.as_ref().is_some_and(|c| c.auto && !c.checks.is_empty());
-  let mut started_runner = false;
+  let each = config.as_ref().is_some_and(|c| c.commit_each);
+  // When a runner this command started was seen to have finished without reaching the state.
+  let mut started_runner: Option<Instant> = None;
   loop {
     let watched = crate::watch::settle(root);
     let idle = runner_lock(root);
@@ -443,37 +468,63 @@ pub fn wait_settled(root: &Path) -> Result<String> {
     };
     let unrecorded = if watched { "" } else { " (no watcher is running: writes since the last snapshot are not in this)" };
     if idle.is_some() {
-      if head == base {
-        return Ok(format!("settled: what is recorded is committed{unrecorded}"));
-      }
+      let committed = head == base;
+      // What a run found on these files, by the state or by its tree.
       let said = head
         .and_then(|h| std::fs::read_to_string(runs_dir(root).join(hex(&h))).ok())
         .or_else(|| tree.and_then(|t| std::fs::read_to_string(runs_dir(root).join(format!("tree-{}", hex(&t)))).ok()));
-      if let Some(said) = said {
-        let failed: Vec<&str> = said.lines().filter(|l| !l.ends_with(" Passed")).filter_map(|l| l.split(' ').next()).collect();
-        return Ok(if failed.is_empty() && config.as_ref().is_some_and(|c| c.commit_each) {
-          format!(
+      let failed = said.as_ref().map(|said| -> Vec<String> {
+        said.lines().filter(|l| !l.ends_with(" Passed")).filter_map(|l| l.split(' ').next()).map(str::to_string).collect()
+      });
+      let passed = said.as_ref().map(|said| -> Vec<&str> { said.lines().filter_map(|l| l.strip_suffix(" Passed")).collect() });
+      match (committed, failed, &passed) {
+        (true, _, _) if !runs => return Ok(format!("settled: what is recorded is committed{unrecorded}")),
+        (true, Some(failed), _) if failed.is_empty() => {
+          let passed = passed.clone().unwrap_or_default().join(", ");
+          return Ok(format!("settled: what is recorded is committed, and passed {passed}{unrecorded}"));
+        }
+        (true, Some(failed), _) => {
+          return Ok(format!("settled: what is recorded is committed, and did not pass ({} did not){unrecorded}", failed.join(", ")));
+        }
+        (false, Some(failed), _) if failed.is_empty() && each => {
+          return Ok(format!(
             "settled: the conditions passed on what is recorded, and it was not committed: `nv checkpoint <dir>` says why{unrecorded}"
-          )
-        } else if failed.is_empty() {
-          format!("settled: the conditions passed on what is recorded, which is not committed ([commit] each is off){unrecorded}")
-        } else {
-          format!(
+          ));
+        }
+        (false, Some(failed), _) if failed.is_empty() => {
+          return Ok(format!(
+            "settled: the conditions passed on what is recorded, which is not committed ([commit] each is off){unrecorded}"
+          ));
+        }
+        (false, Some(failed), _) => {
+          return Ok(format!(
             "settled: what is recorded since the last commit did not pass ({} did not); it stays uncommitted{unrecorded}",
             failed.join(", ")
-          )
-        });
-      }
-      if !runs {
-        return Ok(format!(
-          "settled: changes are recorded that are not committed, and the conditions are not run on their own here (`auto`){unrecorded}"
-        ));
-      }
-      // Recorded, and no run has reached it: one is about to start, or none was started.
-      drop(idle);
-      if !started_runner && started.elapsed() > Duration::from_secs(1) {
-        start_behind(root);
-        started_runner = true;
+          ));
+        }
+        (false, None, _) if !runs => {
+          return Ok(format!(
+            "settled: changes are recorded that are not committed, and the conditions are not run on their own here (`auto`){unrecorded}"
+          ));
+        }
+        // No run has reached what is recorded: one is about to start, or none was started.
+        (_, None, _) => {
+          drop(idle);
+          match started_runner {
+            None if started.elapsed() > Duration::from_secs(1) => {
+              start_behind(root);
+              started_runner = Some(Instant::now());
+            }
+            // Started, and done, and it did not reach this state: it will not.
+            Some(at) if at.elapsed() > Duration::from_secs(2) => {
+              let what = if committed { "committed" } else { "not committed" };
+              return Ok(format!(
+                "settled: what is recorded is {what}, and the conditions could not be run on it (.nv/checks/runner.log says why){unrecorded}"
+              ));
+            }
+            _ => {}
+          }
+        }
       }
     }
     if limit.is_some_and(|limit| started.elapsed() >= limit) {

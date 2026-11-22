@@ -413,8 +413,11 @@ fn run(args: &[String]) -> Result<()> {
         given.cloned().unwrap_or_default()
       } else {
         workspace::snapshot(&mut store, &mut ws, AUTHOR, look(3))?;
+        // The files, not the state's id: the runner behind writes may have committed the state
+        // the conditions passed on, which moves the head and leaves the files as they were.
         if let (Some(passed), Some(now)) = (GATED.get(), ws.head)
           && *passed != now
+          && newvcs::commit::root_of(&mut store, passed)? != newvcs::commit::root_of(&mut store, &now)?
         {
           return Err("the files changed after the conditions passed on them: run `nv commit` again".into());
         }
@@ -455,6 +458,14 @@ fn run(args: &[String]) -> Result<()> {
           let _ = std::fs::remove_file(ws.root.join(".nv").join("git-staged"));
           newvcs::colocated::published(&mut store, &ws)?;
           println!("{} in {:.0} ms", hex(&id), ms(started));
+        }
+        // Committed already, by the runner behind writes (`[commit] each`): say so, and how to
+        // give that commit the message this one was given.
+        None if GATED.get().is_some() && based.is_some_and(|b| newvcs::checks::committed_by_runner(&ws.root, &b)) => {
+          println!(
+            "nothing to commit: these files were committed already, as {}, behind the writes (`[commit] each`); `nv rebuild <dir> <n> <message>` gives that commit this message",
+            &hex(&based.unwrap_or_default())[..12]
+          )
         }
         None => println!("nothing to commit"),
       }
@@ -670,6 +681,8 @@ fn run(args: &[String]) -> Result<()> {
         describe(&done.synced, &ws.root),
         ms(started)
       );
+      // And on what the push left: the ref's tip, where the server put the commits on it.
+      newvcs::checks::start_behind(&ws.root);
       if !done.synced.conflicts.is_empty() {
         std::process::exit(1);
       }
@@ -682,6 +695,8 @@ fn run(args: &[String]) -> Result<()> {
         eprintln!("nv: {done}");
       }
       println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
+      // Where the conditions run behind writes, they are run on what the sync made as well.
+      newvcs::checks::start_behind(&ws.root);
       // As `git pull` does: a sync that left something for a person does not look like one that did not.
       if !done.conflicts.is_empty() {
         std::process::exit(1);
