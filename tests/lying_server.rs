@@ -273,3 +273,66 @@ fn an_answer_larger_than_the_limit_is_not_read_to_its_end() {
   assert_eq!(code, 2, "{said}");
   assert!(said.contains("larger than 1 MB"), "{said}");
 }
+
+/// A lie that drops the answer to the next push, once: the push lands, and the client never hears.
+fn drop_next_push(lie: &Arc<Mutex<Lie>>) {
+  let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  *lie.lock().unwrap() = Box::new(move |method, path, status, _| {
+    let push = method == "POST" && path.contains("/push/") && status == 200;
+    (push && !once.swap(true, std::sync::atomic::Ordering::SeqCst)).then(|| (502, Vec::new()))
+  });
+}
+
+/// Found by the model in `formal/sync`: what a workspace does after a push of its own landed
+/// without it hearing so. Going back past that push, or amending what it carried, made the next
+/// sync a conflict between two versions of this workspace's own; amending a commit that is on
+/// the ref did the same with no lost answer at all.
+#[test]
+fn after_a_push_that_landed_unheard_nothing_goes_back_past_it() {
+  let Some((dir, real)) = setup("unheard") else { return };
+  let lie = Arc::new(Mutex::new(honest()));
+  let through = lying(real.split("/t/").next().unwrap().to_string(), lie.clone());
+  let url = format!("{through}/t/{}", real.split("/t/").nth(1).unwrap());
+  workspace(&dir, "a", &url);
+  ok(&dir, "for i in $(seq 1 20); do echo \"line $i\"; done > a/f && $NV commit a f >/dev/null && $NV push a >/dev/null");
+  let line1 = |to: &str| format!("sed -i.orig '1s/.*/{to}/' a/f && rm a/f.orig");
+  let conflict_free = |dir: &Path, what: &str| {
+    let (code, said) = code_of(dir, "$NV sync a 2>&1");
+    assert_eq!(code, 0, "{what}: {said}");
+    assert!(!ok(dir, "cat a/f").contains("<<<<<<<"), "{what}: {said}");
+  };
+  for (what, back) in [
+    ("restore pushed", "$NV restore a pushed"),
+    ("restore before-sync", "$NV restore a before-sync"),
+    ("amend", "cd a && $NV git commit -q -a --amend -m again"),
+  ] {
+    ok(&dir, "$NV sync a >/dev/null");
+    if what == "restore before-sync" {
+      // Something to undo: a sync that brought a commit of another writer's.
+      ok(&dir, "rm -rf b && true");
+      workspace(&dir, "b", &real);
+      ok(&dir, "echo b > b/other && $NV commit b other >/dev/null && $NV push b >/dev/null");
+      ok(&dir, &format!("{} && $NV commit a mine >/dev/null && $NV sync a >/dev/null", line1(&format!("{what} first"))));
+    } else {
+      ok(&dir, &format!("{} && $NV commit a mine >/dev/null", line1(&format!("{what} first"))));
+    }
+    drop_next_push(&lie);
+    let (code, said) = code_of(&dir, "$NV push a 2>&1");
+    assert_ne!(code, 0, "{what}: the answer was lost: {said}");
+    *lie.lock().unwrap() = honest();
+    // Going back past a push that may have landed is refused until the workspace knows.
+    let (code, said) = code_of(&dir, &format!("{} && {back} 2>&1", line1(&format!("{what} second"))));
+    assert_ne!(code, 0, "{what}: {said}");
+    assert!(said.contains("may have landed"), "{what}: {said}");
+    conflict_free(&dir, what);
+    assert_eq!(ok(&dir, "head -1 a/f"), format!("{what} second"), "{what}: the edit made since is kept");
+    ok(&dir, "$NV commit a second >/dev/null && $NV push a >/dev/null");
+  }
+  // A commit that is on the ref is not amended: the ref only goes forward.
+  ok(&dir, &format!("{} && $NV commit a pushed >/dev/null && $NV push a >/dev/null", line1("pushed")));
+  let (code, said) = code_of(&dir, &format!("{} && cd a && $NV git commit -q -a --amend -m amended 2>&1", line1("amended")));
+  assert_eq!(code, 128, "{said}");
+  assert!(said.contains("cannot amend"), "{said}");
+  conflict_free(&dir, "after a refused amend");
+  assert_eq!(ok(&dir, "head -1 a/f"), "amended");
+}

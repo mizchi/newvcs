@@ -57,6 +57,15 @@ to "What reviewers found" in the README when it is fixed. What was fixed is list
   (`roundtrip.rs` and `agent.rs` expect none, as on APFS). Linux has `FICLONE` on Btrfs and XFS;
   elsewhere a copy is a copy.
 
+## The model (`formal/sync`)
+
+- [ ] Bounds: two writers, one file of two lines, a ref of three commits. Grow it (three
+  writers, two files, a directory set whole) as idealis's search allows.
+- [ ] Not in it yet: a sync killed half-way and finished by the next (`arriving`), several
+  refs, partial views, links, Git beside nv, a push of a chain longer than two.
+- [ ] Drive the implementation from it (idealis's conformance driver): the counterexamples were
+  turned into nv commands by hand.
+
 ## Checkpoints
 
 - [ ] Have a fresh reviewer try checkpoints: none of round eleven saw them.

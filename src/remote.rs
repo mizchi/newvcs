@@ -413,20 +413,35 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     }
     done.contents_sent += 1;
   }
+  // From here until an answer is heard, the push may land without this workspace knowing.
+  let last = object_id(Kind::Commit, &chain.last().expect("a push carries a commit").encode());
+  crate::write_whole(&workspace::unheard(ws), format!("{} {}\n", chain.len(), hex(&last)))?;
   let (_, answer) = send(http().post(&format!("{url}/push/{name}?after={}&commits={}", ws.seq, chain.len())), Some(&body))?;
   let answer = json(&answer)?;
+  // Heard: refused, or landed and caught up with below. Known either way, unless catching up fails.
+  let note = workspace::unheard(ws);
+  let heard = || {
+    let _ = std::fs::remove_file(&note);
+  };
   match answer["status"].as_str() {
     Some("updated") => done.updated += chain.len(),
     Some("rebased") => done.rebased += chain.len(),
     Some("conflict") => {
+      heard();
       let paths: Vec<&str> = answer["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
       return Err(format!(
         "the ref has changes to the same paths: {}.\n`nv sync` brings them in and merges them with yours; then push again",
         paths.join(", ")
       ));
     }
-    Some("unknown-base") => return Err("the ref never was at this workspace's base commit".to_string()),
-    _ => return Err(format!("the server refused the push: {answer}")),
+    Some("unknown-base") => {
+      heard();
+      return Err("the ref never was at this workspace's base commit".to_string());
+    }
+    _ => {
+      heard();
+      return Err(format!("the server refused the push: {answer}"));
+    }
   }
   done.synced.commits += take_commits(store, &url, &answer)?;
   let landed = id_of(&answer["commit"])?;
@@ -460,6 +475,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     // Its own commits under the ids the ref gave them are the push itself, not commits dropped.
     done.synced.superseded = 0;
   }
+  heard();
   // What was pushed stands on what the last sync brought: there is no sync left to take back.
   workspace::Standing::forget(ws);
   Ok(done)
@@ -708,7 +724,12 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     // A change of this workspace's landed commits, as the ref still has it, is no change of theirs.
     theirs.retain(|change| !own_on_ref.contains(change));
   }
-  let mut published = diff_keeping(store, published_from.unwrap_or(from), base_root, &whole)?;
+  // And what it published since is merged on what those commits left, not on the old common
+  // point: a line it changed again (or back) after them is its change, not a match for theirs.
+  // Where they changed a file, nobody else did before they landed, or they would not have; where
+  // they did not, what they left is what the old common point had.
+  let merge_base = published_from.unwrap_or(from);
+  let mut published = diff_keeping(store, merge_base, base_root, &whole)?;
   let _ = mine_since;
   // What the files have become since the last commit made here: kept apart from that commit all
   // the way through. Merged with theirs as if it were committed, it would come out committed.
@@ -840,7 +861,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     match theirs.iter().find(|(other, _)| other == path) {
       Some((_, their)) => match (file(ours), file(their)) {
         (Some(ours), Some(their)) => {
-          let was = at(store, from, path)?;
+          let was = at(store, merge_base, path)?;
           match three_way(store, was, ours, their)? {
             Some((text, true, mode)) => {
               merged_published.insert(path.clone(), Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? });
@@ -926,7 +947,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // A file the two commits changed in the same lines: both versions, the workspace's being the
   // file as it is now.
   for path in &unsettled {
-    let (was, their) = (at(store, from, path)?, moved(path).flatten());
+    let (was, their) = (at(store, merge_base, path)?, moved(path).flatten());
     let ours = file(&at(store, head_root, path)?).or(file(&at(store, base_root, path)?));
     match (ours, their) {
       (Some(ours), Some(their)) => match three_way(store, was, ours, their)? {
@@ -1062,5 +1083,12 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   }
   done.conflicts.sort();
   workspace::set_unsettled(ws, &done.conflicts)?;
+  // A push that was not heard back from, found on the ref: the workspace knows now.
+  if let Some((sent, last)) = workspace::unheard_push(ws)
+    && let Some((own, _, count)) = own_landed
+    && (count >= sent || own == last)
+  {
+    let _ = std::fs::remove_file(workspace::unheard(ws));
+  }
   Ok(done)
 }

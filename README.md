@@ -1628,6 +1628,24 @@ failed first:
   `rm` of a tracked link, "Initial commit", `show` of a merge, and
   `reset --hard` before the first commit now do what Git does (case 33).
 
+**A model of pushing and syncing** (`formal/sync`, checked with
+[idealis](https://github.com/mizchi/idealis)) follows the client and the server as they are
+written, kills a workspace while it waits for an answer, and writes lines back to what they
+were. Its counterexamples, each then reproduced with nv against the server:
+
+- **Work after a push that landed unheard was merged on the wrong tree.** A line changed back
+  after that push was silently taken from the ref (the push's own version of it) when another
+  writer had changed the file elsewhere, and a line changed again was a conflict with itself.
+  It is merged now on what the workspace's landed commits left.
+- **Going back past a push that may have landed made its commits again**: `restore pushed`
+  set aside as "what the ref does not have" a commit the ref had, `restore before-sync` undid
+  a sync whose result was pushed, and an amend made the pushed commit again. Each made the
+  next sync a conflict between two versions of the workspace's own. A push leaves a note from
+  before it is sent until its answer is heard or a sync finds its commits on the ref, and
+  those three are refused while it is there.
+- Found beside it: **amending a commit that was pushed and heard** did the same. A ref only
+  goes forward, and the amend is refused.
+
 What the rounds agree on, measured three times by different hands on a
 machine busy with the other reviewers: recording is about three times
 quicker than Git's quickest commit; going back is five to six times
@@ -1713,6 +1731,12 @@ stops.
   own, a process of its own for the commit; six Git commands are run where
   `git commit` is one. `git status` with fsmonitor and the untracked cache
   is quicker than `nv status`, which has no equivalent of either.
+- After a push that was not heard back from, `restore pushed`, `restore before-sync` and
+  `nv git commit --amend` are refused until the workspace knows where it stands: a push that
+  is answered, or a sync that finds the push's commits on the ref. A push that never reached
+  the server is known only by pushing again.
+- The model in `formal/sync` is checked for two writers, one file of two lines and a ref of
+  three commits. A bug that needs more than that is not ruled out by it.
 - Two writers who each add a file whose names differ only in case both
   land; on a file system that does not tell the names apart, a workspace
   then has one file on disk for the two.

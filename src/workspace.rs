@@ -1739,6 +1739,32 @@ pub(crate) fn arriving(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("arriving")
 }
 
+/// The note a push leaves from before it is sent until its answer is heard: how many commits it
+/// carried, and the last of them. A push killed or timed out may have landed all the same, and
+/// until the workspace knows, nothing may go back past it or make its commits again.
+pub(crate) fn unheard(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("pushing")
+}
+
+/// The commits a push carried that the workspace has not heard about: `(how many, the last)`.
+pub fn unheard_push(ws: &Workspace) -> Option<(usize, Id)> {
+  let text = std::fs::read_to_string(unheard(ws)).ok()?;
+  let mut fields = text.split_whitespace();
+  let count = fields.next()?.parse().ok()?;
+  let last = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok())?;
+  Some((count, last))
+}
+
+/// Refused while a push of this workspace's may have landed unheard.
+pub fn not_unheard(ws: &Workspace, what: &str) -> Result<()> {
+  match unheard_push(ws) {
+    None => Ok(()),
+    Some(_) => Err(format!(
+      "{what} is refused: the last push from this workspace was not heard back from, and may have landed. `nv sync <dir>` finds out where the workspace stands, or `nv push <dir>` again. Nothing was touched."
+    )),
+  }
+}
+
 /// A sync that was killed while writing left files that are half the ref's and half the
 /// workspace's. Recorded as they are, they would be taken for the workspace's own changes.
 pub fn interrupted(ws: &Workspace) -> Result<()> {
@@ -2291,6 +2317,8 @@ impl Standing {
 /// since is again something the workspace has not seen. A push will be
 /// refused as it was before, and a sync will merge again.
 pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Restored> {
+  // A push of what the sync made may have landed: undoing the sync would make its commits again.
+  not_unheard(ws, "undoing the last sync")?;
   let Some(was) = Standing::kept(ws) else {
     return Err(
       "there is no catching-up to undo: this workspace has not synced since it was made, or has pushed since it last did".to_string(),
@@ -2334,6 +2362,8 @@ pub fn take_branch_along(store: &mut Store, ws: &Workspace, was: Option<Id>) -> 
 /// recorded first and its id handed back. For a workspace whose own work cannot go on top of
 /// what the ref has since.
 pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Restored> {
+  // What is set aside is what the ref does not have: not known while a push may have landed.
+  not_unheard(ws, "setting aside what was not pushed")?;
   // The ref as last seen; for a workspace that never saw it, the commit the workspace was made at.
   let pushed = ws.pushed.or(ws.start).ok_or("this workspace has not pushed to or synced with a server, and was not made at a commit")?;
   snapshot(store, ws, author, look)?;

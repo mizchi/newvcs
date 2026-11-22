@@ -1266,3 +1266,34 @@ fn what_an_eleventh_reviewer_found_in_syncing_stays_fixed() {
   let (code, said) = run("g", "$NV sync . >/dev/null 2>&1 && cat from-bob.txt && git status --porcelain");
   assert_eq!((code, said.as_str()), (0, "b\n"));
 }
+
+/// Found by the model in `formal/sync`: a push that landed unheard, then more work on the same
+/// lines, then a sync after another writer changed the file elsewhere.
+#[test]
+fn work_after_a_push_that_landed_unheard_is_merged_on_what_that_push_left() {
+  let Some((root, url)) = shared_file("model-landed") else { return };
+  let nv = env!("CARGO_BIN_EXE_nv");
+  let mut bob = Peer::new(&root, "bob", &[], &url);
+  bob.write("start", "s\n");
+  bob.commit("start");
+  bob.push().unwrap();
+  sh(&root, &format!("{nv} git clone -q repo a && {nv} remote a {url} main && {nv} sync a >/dev/null"));
+  let a = |script: &str| sh(&root, &format!("NV={nv}; cd a; {script}"));
+  let line = |n: usize, to: &str| format!("sed -i.orig '{n}s/.*/{to}/' shared.txt && rm shared.txt.orig");
+  // The push lands, and this workspace never hears so.
+  let unheard = "cp .nv/workspace ../a-before && $NV push . >/dev/null && cp ../a-before .nv/workspace";
+  for (round, (again, wanted)) in [("line 1", "line 1"), ("A again", "A again")].into_iter().enumerate() {
+    a(&format!("{} && $NV commit . c1 >/dev/null && {unheard}", line(1, &format!("A {round}"))));
+    a(&format!("{} && $NV commit . c2 >/dev/null", line(1, again)));
+    bob.sync().unwrap();
+    replace_line(&bob, "shared.txt", 20, &format!("bob {round}"));
+    bob.commit("bob");
+    bob.push().unwrap();
+    // Line 1 is what this workspace made it last, on top of its own push; nobody else touched it.
+    let said = a("($NV sync . 2>&1 || true); head -1 shared.txt; tail -1 shared.txt; cat .nv/conflicts 2>/dev/null || true");
+    assert!(said.ends_with(&format!("{wanted}\nbob {round}\n")), "round {round}: {said}");
+    a("$NV push . >/dev/null");
+    bob.sync().unwrap();
+    assert_eq!(bob.read("shared.txt").unwrap().lines().next(), Some(wanted), "round {round}");
+  }
+}

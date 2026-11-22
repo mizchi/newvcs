@@ -1551,17 +1551,17 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if merging.is_some() && amend {
     return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
   }
-  // A sync that could not merge leaves the workspace on the ref's commit, someone else's, with
-  // this workspace's work on top as changes to commit: the same as a merge that stopped. Amended,
-  // that commit would carry this workspace's resolution under another writer's name and parents.
-  if amend
-    && let Some(head) = repo.ws.head
-    && repo.ws.pushed == Some(head)
-    && !repo.ws.operations().iter().any(|(_, what, id)| what == "commit" && *id == hex(&head))
-  {
+  // A ref only goes forward: a commit it has is not made again. After a sync that could not
+  // merge, that is someone else's commit, with this workspace's work on top as changes to commit;
+  // after a push, this workspace's own, which the next push could not put anywhere.
+  if amend && repo.ws.head.is_some() && repo.ws.pushed == repo.ws.head {
+    return fatal(128, "fatal: HEAD is on the ref -- cannot amend: the ref only goes forward.\nCommit the change as a new commit on top.");
+  }
+  // And a commit a push carried may be on the ref without this workspace having heard.
+  if amend && workspace::unheard_push(&repo.ws).is_some() {
     return fatal(
       128,
-      "fatal: HEAD is the ref's commit, made by another workspace, as the last sync left it -- cannot amend.\nCommit without --amend: the commit goes on top of theirs.",
+      "fatal: the last push from this workspace was not heard back from, and may have landed with HEAD -- cannot amend.\n`nv sync` finds out where the workspace stands, or `nv push` again.",
     );
   }
   let before = repo.ws.head;
