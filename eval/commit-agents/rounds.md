@@ -124,24 +124,51 @@ The committers spent more than in round 3 (vcs tokens +10%, calls +6%) on the th
 looked at the merged file and ran the tests by hand, and all three looked into the author and
 the empty tip.
 
+## Round 5 (2026-11-22)
+
+The same tasks, prompts and seed, on nv at `353298e`: `nv rebuild` keeps the author, and the push
+names the tip after a merge on the server.
+
+**What the ref came to**: four commits after the start, each passing; nothing provisional, no
+markers, every function exported. No push was refused; the second and third landed merged on
+the server, `__init__.py` with all four imports and names. The rebuilt commits are by `eval`,
+the developer, and committed by whoever rebuilt them. One developer took out a line of the seed
+(the blank line under the comment) as it added its own; the union on the server took that in.
+
+The workers spent more than in round 4 (dev tokens +16%: 8, 8 and 5 tool calls against 5, 5 and
+5); none of it was version control, which none of them met.
+
+**The committers' findings**:
+
+| # | Finding | Met by | Done |
+| --- | --- | ---: | --- |
+| 29 | `nv rebuild` lists the new commits without the conditions they passed; `nv pending` does | 1 | Not done |
+| 30 | Nothing says whether the conditions passed on the tip the server made, short of `nv pending --wait` | 2 | Not done (they are run, behind the push) |
+| 31 | "caught up 2 commits" counts the workspace's own commit as it landed | 1 | Not done |
+| 32 | Which contents went "for the server to merge with" is not said; a push that caught up with nothing lists five zeros | 2 | Not done |
+| 33 | `nv help rebuild` does not say the author's date is kept with the author | 1 | Not done |
+| 34 | `nv git show <rev> -- <path>`, `nv git diff A B [--] <path>` are refused (as in round 4) | 1 | Not done |
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
 better. Tokens are above a baseline agent that does nothing (67,316 tokens).
 
-| | Round 1 | Round 2 | Round 3 | Round 4 |
-| --- | ---: | ---: | ---: | ---: |
-| makespan, s | 157.9 | 152.1 | 122.2 | 92.7 |
-| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 | 41.7 |
-| vcs tokens (committers) | 54,600 | 48,217 | 41,241 | 45,558 |
-| dev tokens (workers) | 18,404 | 18,966 | 19,269 | 18,378 |
-| vcs share | 74.8% | 71.8% | 68.2% | 71.3% |
-| vcs calls (committers' tool calls) | 47 | 37 | 32 | 34 |
-| refused pushes | 3 | 3 | 3 | 0 |
+| | Round 1 | Round 2 | Round 3 | Round 4 | Round 5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| makespan, s | 157.9 | 152.1 | 122.2 | 92.7 | 84.4 |
+| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 | 41.7 | 42.1 |
+| vcs tokens (committers) | 54,600 | 48,217 | 41,241 | 45,558 | 40,842 |
+| dev tokens (workers) | 18,404 | 18,966 | 19,269 | 18,378 | 21,361 |
+| vcs share | 74.8% | 71.8% | 68.2% | 71.3% | 65.7% |
+| vcs calls (committers' tool calls) | 47 | 37 | 32 | 34 | 32 |
+| refused pushes | 3 | 3 | 3 | 0 | 0 |
 
 Against round 1, round 3 took 23% less time to the last push, 45% less latency, 24% fewer
 committer tokens and 32% fewer committer calls, for the same work and the same number of
 refusals. Round 4, with no refusals, took 41% less time than round 1 to the last push and 59%
-less latency; its committers' tokens went back up on what they had to check (round 4 above). The workers' cost stayed flat (18.4k to 19.3k), as it should: version control does
+less latency; its committers' tokens went back up on what they had to check (round 4 above).
+Round 5, with those fixed, has the lowest committer tokens of any round: against round 1, 47%
+less time to the last push, 58% less latency, 25% fewer committer tokens and 32% fewer calls. The workers' cost stayed flat (18.4k to 19.3k), as it should: version control does
 not reach them. What a conflict costs a committer, from the committers of each round who met
 none, one and two: round 2, 12.4k, 15.9k and 19.9k tokens; round 3, 11.2k, 14.3k and 15.7k.
