@@ -7,9 +7,9 @@ a worker and a committer; every task adds a line to `textkit/__init__.py`, so pu
 first meet a conflict. nv at `9390a8d`.
 
 **What the ref came to** (`verify.sh`): four commits after the start, the tests passing on each;
-no provisional message pushed; no markers at the tip; all three pieces of work there. Two of the
-three pushes were refused, and the committers synced, settled the conflict in `__init__.py`
-(keeping every export) and pushed again. Each committer took about two minutes; every nv
+no provisional message pushed; no markers at the tip; all three pieces of work there. Three
+pushes were refused (one committer's twice, another's once), and the committers synced, settled
+the conflict in `__init__.py` (keeping every export) and pushed again. Each committer took about two minutes; every nv
 command took well under a second.
 
 **The workers** (3 of 3) noticed nothing: no file they did not write, nothing appearing or
@@ -72,3 +72,51 @@ what they were for; none ran a version control command.
 What worked without trial, by their reports: `--wait`; Git ids in `nv pending` and in
 `nv rebuild`; `nv git status` against the ref; the push's line naming the ref and tip; the
 refused push's count and next step.
+
+## Round 3 (2026-11-22)
+
+The same three tasks and prompts, on nv at `92c566a`, with a seed shaped for the conflict every
+round had: `textkit/__init__.py` is a list, one import and one name of `__all__` to a line, and
+`.gitattributes` gives it `merge=union`. `nv sync` honours that now, and the conditions are run
+on what a sync or a push made.
+
+Replayed first on round 2's own files, Git's union merged all three without a conflict and the
+tests passed, yet `__all__` named one function of four: each writer had written it on one line.
+So `verify.sh` now also checks that every public function is exported, and the seed says to put
+one entry to a line. All three workers did.
+
+**What the ref came to**: four commits after the start, each passing; nothing provisional, no
+markers, every function exported, and `__all__` with all four names. Three pushes were refused
+again, as in rounds 1 and 2; each sync merged `__init__.py` with no markers and exit 0, and the
+committers pushed again with nothing to settle.
+
+**The committers' findings**:
+
+| # | Finding | Met by | Done |
+| --- | --- | ---: | --- |
+| 18 | A union file still refuses the push: every writer after the first syncs and pushes again | 1 | The server merges it (`d703761`, round 4) |
+| 19 | Right after a sync, `nv pending` says "conditions not run" while the run behind it is under way | 2 | `--wait` says it; plain `pending` does not yet |
+| 20 | A sync that merged cleanly does not say the commit was made again on the new tip, as which | 1 | Not done |
+| 21 | `nv rebuild` cannot split a checkpoint by path | 1 | Not done |
+| 22 | `nv log` prints times as epoch milliseconds | 2 | Not done |
+
+## Scores
+
+`score.py` over each round: the gates first (all passed in every round), then, lower being
+better. Tokens are above a baseline agent that does nothing (67,316 tokens). Every round had
+three refused pushes.
+
+| | Round 1 | Round 2 | Round 3 |
+| --- | ---: | ---: | ---: |
+| makespan, s | 157.9 | 152.1 | 122.2 |
+| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 |
+| vcs tokens (committers) | 54,600 | 48,217 | 41,241 |
+| dev tokens (workers) | 18,404 | 18,966 | 19,269 |
+| vcs share | 74.8% | 71.8% | 68.2% |
+| vcs calls (committers' tool calls) | 47 | 37 | 32 |
+
+Against round 1, round 3 took 23% less time to the last push, 45% less latency, 24% fewer
+committer tokens and 32% fewer committer calls, for the same work and the same number of
+refusals. The workers' cost stayed flat (18.4k to 19.3k), as it should: version control does
+not reach them. What a conflict costs a committer, from the committers of each round who met
+none, one and two: round 2, 12.4k, 15.9k and 19.9k tokens; round 3, 11.2k, 14.3k and 15.7k.
