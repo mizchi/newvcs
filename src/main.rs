@@ -402,15 +402,8 @@ fn run(args: &[String]) -> Result<()> {
       if message.trim().is_empty() {
         return Err("a commit needs a message that says something".into());
       }
-      // A file holding both versions between a sync's markers, put back by a restore after the
-      // sync's own note was cleared, is not published either.
-      let marked = workspace::with_sync_markers(&mut store, &ws, look(3))?;
-      if !marked.is_empty() {
-        return Err(format!(
-          "these hold both versions between the markers a sync leaves (<<<<<<< yours ... >>>>>>> theirs): {}\nEdit them to what they should be, then commit.",
-          marked.join(", ")
-        ));
-      }
+      // A file holding both versions between a sync's markers is not published: refused by the
+      // commit once it has recorded what is on disk, from what it recorded.
       // Beside a Git repository it is Git that makes the commit, by its own rules.
       if newvcs::colocated::shared(&ws.root) {
         match newvcs::colocated::commit(&mut store, &mut ws, AUTHOR, message, look(3))? {

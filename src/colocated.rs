@@ -433,6 +433,7 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
       }
     }
   }
+  workspace::refuse_sync_markers(store, ws)?;
   let root = |store: &mut Store, id: Option<Id>| match id {
     Some(id) => root_of(store, &id),
     None => Ok(None),

@@ -753,36 +753,57 @@ fn untracked_in_the_way(store: &mut Store, root: &Path, from: Option<Id>, change
   Ok(found.into_iter().collect())
 }
 
-/// The files that differ from the last commit and hold the markers a sync writes where both
-/// sides changed the same lines, with this workspace's names for the two sides. What a commit
-/// with this look would publish: what is recorded, and what the look finds on disk.
-pub fn with_sync_markers(store: &mut Store, ws: &Workspace, look: Look) -> Result<Vec<String>> {
+/// Refused, before a commit is made of what is recorded: files holding the markers a sync writes
+/// where both sides changed the same lines (put back, say, by a restore after the sync's own note
+/// was cleared). Called once what is on disk is recorded, so only what is recorded is read: the
+/// files that differ from the last commit, as the commit would publish them.
+pub(crate) fn refuse_sync_markers(store: &mut Store, ws: &Workspace) -> Result<()> {
   let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
   let (from, to) = (tree(store, ws.base)?, tree(store, ws.head)?);
-  let mut changed: Vec<Vec<u8>> =
-    crate::manifest::diff(store, from, to)?.into_iter().filter(|(_, e)| e.is_some()).map(|(p, _)| p).collect();
-  changed.extend(status(ws, look)?.0.into_iter().filter(|(_, new, _)| new.is_some()).map(|(p, _, _)| p));
-  changed.sort();
-  changed.dedup();
   let mut found = Vec::new();
-  for path in changed {
-    // A link is a link, not what it leads to, and a pipe is nothing to read; neither holds markers.
-    if link_on_the_way(&ws.root, &path).is_some() {
-      continue;
-    }
-    let Some(bytes) = read_regular(&ws.root.join(to_path(&path))) else { continue };
+  // A file the index says is still what was recorded is read from the disk, which costs less
+  // than taking its content out of the store; what the index cannot vouch for is read from the store.
+  let index = ws.load_index();
+  let (noted, here) = noted_for(ws);
+  let ctimes = match std::fs::read_to_string(&noted).is_ok_and(|was| was == here) {
+    true => Ctimes::Noted,
+    false => Ctimes::CopiedBy(std::fs::symlink_metadata(&noted).map_or(0, |meta| ctime_of(&meta))),
+  };
+  for (path, entry) in crate::manifest::diff(store, from, to)? {
+    let Some(entry) = entry.filter(|e| !e.is_dir() && e.mode != crate::manifest::MODE_GITLINK && e.mode != MODE_LINK) else { continue };
+    let full = ws.root.join(to_path(&path));
+    let on_disk = index.get(&path).filter(|known| known.entry == entry).and_then(|known| {
+      let meta = std::fs::symlink_metadata(&full).ok().filter(|meta| meta.is_file())?;
+      if !unchanged(&known, &meta, ctimes) || link_on_the_way(&ws.root, &path).is_some() {
+        return None;
+      }
+      read_regular(&full).filter(|bytes| bytes.len() as u64 == meta.len())
+    });
+    let bytes = match on_disk {
+      Some(bytes) => std::sync::Arc::new(bytes),
+      None => match store.get(&entry.id)? {
+        Some(bytes) => bytes,
+        None => continue,
+      },
+    };
     let lines = || bytes.split(|&b| b == b'\n');
     if lines().any(|line| line == b"<<<<<<< yours") && lines().any(|line| line == b">>>>>>> theirs") {
       found.push(String::from_utf8_lossy(&path).into_owned());
     }
   }
-  Ok(found)
+  if found.is_empty() {
+    return Ok(());
+  }
+  Err(format!(
+    "these hold both versions between the markers a sync leaves (<<<<<<< yours ... >>>>>>> theirs): {}\nEdit them to what they should be, then commit.",
+    found.join(", ")
+  ))
 }
 
 /// The bytes of a regular file at `path` itself: `None` for a link (not followed), a pipe or a
 /// device (not waited on), or anything that cannot be read. What is opened is what is checked,
 /// so a file replaced by a pipe in between is not read either.
-pub(crate) fn read_regular(path: &Path) -> Option<Vec<u8>> {
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
   use std::io::Read;
   use std::os::unix::fs::OpenOptionsExt;
   let mut file = std::fs::File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
@@ -1215,14 +1236,16 @@ struct Compared {
   out: Vec<Difference>,
   refreshed: Refreshed,
   /// For each directory asked about: whether it, or one above it, is a symbolic link.
-  links: std::collections::HashMap<Vec<u8>, bool>,
+  links: crate::store::PathMap<bool>,
   /// The directory asked about last, and the answer.
   last_dir: (Vec<u8>, bool),
+  /// Where the whole path of the file being compared is put together.
+  full: PathBuf,
 }
 
 /// Whether a path lies beyond a symbolic link: one of the directories on the way to it is a
 /// link, and what is found there is somewhere else's file. Asked once for each directory.
-fn beyond_link(root: &Path, path: &[u8], known: &mut std::collections::HashMap<Vec<u8>, bool>) -> bool {
+fn beyond_link(root: &Path, path: &[u8], known: &mut crate::store::PathMap<bool>) -> bool {
   let Some(slash) = path.iter().rposition(|&b| b == b'/') else { return false };
   let dir = &path[..slash];
   if let Some(answer) = known.get(dir) {
@@ -1239,7 +1262,26 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     // A submodule's directory is not ours to track.
     return Ok(());
   }
-  let full = ws.root.join(to_path(path));
+  // The file's whole path, in a buffer the thread keeps from one file to the next: nothing is
+  // allocated for a file that turns out to be as the index has it.
+  let mut full = std::mem::take(&mut found.full);
+  full.as_mut_os_string().clear();
+  full.push(&ws.root);
+  full.push(to_path(path));
+  let done = compare_at(ws, path, known, found, eols, ctimes, &full);
+  found.full = full;
+  done
+}
+
+fn compare_at(
+  ws: &Workspace,
+  path: &[u8],
+  known: Option<&Indexed>,
+  found: &mut Compared,
+  eols: &mut Eols,
+  ctimes: Ctimes,
+  full: &Path,
+) -> Result<()> {
   found.looked.stats += 1;
   // Files come a directory at a time: the directory just asked about is the next one's, nearly always.
   let dir = path.iter().rposition(|&b| b == b'/').map_or(&path[..0], |slash| &path[..slash]);
@@ -1250,7 +1292,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     found.last_dir = (dir.to_vec(), answer);
     answer
   };
-  let there = if beyond { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) } else { std::fs::symlink_metadata(&full) };
+  let there = if beyond { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) } else { std::fs::symlink_metadata(full) };
   let meta = match there {
     // A pipe, a socket, a device: nothing a tree holds, and reading one could wait for ever.
     Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => meta,
@@ -1272,7 +1314,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
   }
   found.looked.reads += 1;
   // A link is read as a link, and what it leads to is never opened: a pipe there would wait for ever.
-  let opened = if meta.is_file() { std::fs::File::open(&full).map(drop) } else { Ok(()) };
+  let opened = if meta.is_file() { std::fs::File::open(full).map(drop) } else { Ok(()) };
   let (mode, mut bytes) = match opened {
     // One file that may not be read is not a reason to record nothing of the others.
     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1280,7 +1322,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
       found.looked.unreadable.push(path.to_vec());
       return Ok(());
     }
-    _ => read_content(&full, &meta)?,
+    _ => read_content(full, &meta)?,
   };
   // As it is first: most files are stored as they are on disk. Then as its rules say it is stored.
   let mut same = known.is_some_and(|k| k.entry.mode == mode && k.entry.id == object_id(Kind::Blob, &bytes));
@@ -1292,7 +1334,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     same = known.is_some_and(|k| k.entry.mode == mode && k.entry.id == object_id(Kind::Blob, &bytes));
   }
   if let Some(k) = known.filter(|_| same) {
-    let now = indexed(&full, k.entry);
+    let now = indexed(full, k.entry);
     if now.mtime != 0 {
       found.refreshed.push((path.to_vec(), now));
     }
@@ -1865,6 +1907,7 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
   if ws.head == ws.base {
     return Ok(None);
   }
+  refuse_sync_markers(store, ws)?;
   let from = match ws.base {
     Some(base) => root_of(store, &base)?,
     None => None,
