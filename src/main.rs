@@ -529,16 +529,12 @@ fn run(args: &[String]) -> Result<()> {
         let committer = signature(&ws, "COMMITTER")?;
         plan.push((id, format!("author {author}\ncommitter {committer}\n\n{}\n", pair[1].trim_end()).into_bytes()));
       }
+      let before = workspace::pending(&mut store, &ws)?.len();
       let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
       for id in &made {
         println!("{}", hex(id));
       }
-      println!(
-        "{} commits made again as {}, in {:.0} ms",
-        workspace::pending(&mut store, &ws)?.len().max(made.len()),
-        made.len(),
-        ms(started)
-      );
+      println!("{before} commits not pushed made again as {}, in {:.0} ms; `nv pending` lists them", made.len(), ms(started));
     }
     "restore" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
