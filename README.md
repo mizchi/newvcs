@@ -818,6 +818,16 @@ How the cost of one push grows (`server/test/bench.ts`, medians):
 | Commits the writer's base is behind the tip | 5.6 ms | 5.3 ms | 4.6 ms | 4.1 ms | 3.9 ms |
 | Paths changed by the commit, a content each | 4.3 ms | 4.7 ms | 11.3 ms | 74.3 ms | 328 ms |
 
+Since the server merges `merge=union` paths, it also keeps every change to
+every path (`path_index`, a row beside the one it had), to check what a push
+says a path was at its base. Measured on a 4-core Linux VM, the code before and
+after run back to back, twice each (the VM is far slower than the machine of
+the table above, for both): a push of 1,000 paths 653 to 732 ms before and 722
+to 724 after, of 10,000 paths 35.5 to 38.8 s before and 35.9 to 38.8 s after;
+64 writers on one repository 126 to 128 pushes a second before and 107 to 111
+after, which is the row. On 8 and 64 repositories, 124 to 128 before and 110 to
+128 after.
+
 How far behind a writer is does not matter: the server keeps, for each path,
 the position at which it last changed, and looks up the pushed paths. What a
 push costs is its own paths, each a row written and a content hashed.
@@ -884,6 +894,29 @@ before:
   writes (`auto`), they are run on what a sync or a push made, so that
   `nv pending` says whether the merged commit passes; a union that went
   wrong is caught there, when the conditions look at it.
+- **The server merges such a list itself, and the push lands.** A push
+  refused only over paths `merge=union` gives would cost its writer a sync
+  and a second push, every writer after the first, every time. So a push
+  says, of each such path it changes, what the path was at its base and
+  what the `.gitattributes` above it said there, and sends those contents
+  with it. Where the ref clashes only on such paths, the server merges each
+  one, commit by commit, on what the ref has, with the code a sync uses
+  (`src/union.rs`, compiled to WebAssembly in `server/merger`, so that the
+  bytes are the same), and the push lands with the merged contents. `nv
+  push` names the paths; the workspace is brought to what landed, and a
+  later sync knows the commits for its own though their contents differ.
+  What the pusher says is checked against the ref's own history wherever
+  it has one: what a path was at the base, the rules at the base. Where the
+  ref has none (the path is as it was before the ref began), it is taken
+  on the pusher's word. That gives a writer nothing it could not have by
+  syncing and pushing whatever it liked on top, and a union never drops a
+  line of anyone's. Not merged, and refused as before: rules that changed
+  on the ref since the base or change in the push, a path removed, a mode
+  changed, a binary file, a content the repository was not sent, a
+  directory moving above or below the path, and a ref that began before
+  the server indexed every change to every path (one row per path a commit
+  changes, beside the row it had). A merged push writes the bucket twice:
+  the contents it brought, then the merged ones.
 - **What a workspace pushed is its own work, not a change of someone
   else's.** A file committed, edited again and then pushed stays as
   edited, the edit an unpublished change on the commit; a file committed

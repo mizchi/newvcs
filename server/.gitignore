@@ -4,3 +4,4 @@
 /.wrangler
 /.dev.vars
 /hasher/target
+/merger/target

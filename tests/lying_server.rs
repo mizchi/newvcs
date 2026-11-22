@@ -336,3 +336,29 @@ fn after_a_push_that_landed_unheard_nothing_goes_back_past_it() {
   conflict_free(&dir, "after a refused amend");
   assert_eq!(ok(&dir, "head -1 a/f"), "amended");
 }
+
+/// A push the server merged (`merge=union`) whose answer was lost: the next sync knows the
+/// commit on the ref for the workspace's own though its list is not what was sent, takes the
+/// merged list as it is, and makes nothing of it twice.
+#[test]
+fn a_push_the_server_merged_and_whose_answer_was_lost_is_known_as_ones_own() {
+  let Some((dir, real)) = setup("union-unheard") else { return };
+  ok(&dir, "cd seed && printf 'start\\n' > list && printf 'list merge=union\\n' > .gitattributes && git add . && git commit -qm union");
+  let lie = Arc::new(Mutex::new(honest()));
+  let through = lying(real.split("/t/").next().unwrap().to_string(), lie.clone());
+  let url = format!("{through}/t/{}", real.split("/t/").nth(1).unwrap());
+  workspace(&dir, "a", &real);
+  workspace(&dir, "b", &url);
+  ok(&dir, "echo a >> a/list && $NV commit a 'a adds' >/dev/null && $NV push a >/dev/null");
+  ok(&dir, "echo b >> b/list && $NV commit b 'b adds' >/dev/null");
+  drop_next_push(&lie);
+  let (code, said) = code_of(&dir, "$NV push b 2>&1");
+  assert_ne!(code, 0, "the answer was lost: {said}");
+  *lie.lock().unwrap() = honest();
+  let (code, said) = code_of(&dir, "$NV sync b 2>&1");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(ok(&dir, "cat b/list"), "start\nb\na", "{said}");
+  assert!(ok(&dir, "$NV pending b").starts_with("nothing committed here that is not pushed"), "{said}");
+  ok(&dir, "$NV sync a >/dev/null");
+  assert_eq!(ok(&dir, "cat a/list"), "start\nb\na");
+}

@@ -309,7 +309,70 @@ pub struct Pushed {
   /// Contents of linked directories that the server took over from the repository they
   /// came from, or had already: named, and not sent.
   pub adopted: usize,
+  /// Paths `.gitattributes` merges by union that the ref had changed too: the server merged
+  /// them, as a sync would have, and the push landed.
+  pub merged_on_server: Vec<String>,
   pub synced: Synced,
+}
+
+/// What a push states of the paths it changes that `.gitattributes` merges by union, read from
+/// the tree of the chain's base (not the files on disk, which the server cannot know): as JSON
+/// for the server, and the contents it names. `None` where there are none.
+fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String>, Vec<Id>)> {
+  let Some(base) = chain.first().and_then(|c| c.parents.first().copied()) else { return Ok((None, Vec::new())) };
+  let Some(root) = root_of(store, &base)? else { return Ok((None, Vec::new())) };
+  let mut paths: Vec<Vec<u8>> = chain
+    .iter()
+    .flat_map(|c| &c.changes)
+    .filter(|(_, entry)| entry.is_some_and(|e| !e.is_dir() && e.mode != MODE_GITLINK && e.mode != 0o120000))
+    .map(|(path, _)| path.clone())
+    .collect();
+  paths.sort();
+  paths.dedup();
+  // A rules file read once, from the base tree.
+  let mut rules: std::collections::HashMap<Vec<u8>, Option<Entry>> = Default::default();
+  let mut rule_at = |store: &mut Store, dir: &[u8]| -> Result<Option<Entry>> {
+    if let Some(found) = rules.get(dir) {
+      return Ok(*found);
+    }
+    let file = if dir.is_empty() { b".gitattributes".to_vec() } else { [dir, b"/.gitattributes"].concat() };
+    let found = crate::manifest::lookup(store, root, &file)?.filter(|e| !e.is_dir());
+    rules.insert(dir.to_vec(), found);
+    Ok(found)
+  };
+  let entry_json = |entry: Option<Entry>| match entry {
+    Some(e) => serde_json::json!({ "mode": e.mode, "id": hex(&e.id) }),
+    None => serde_json::Value::Null,
+  };
+  let (mut union, mut attributes, mut named) = (Vec::new(), Vec::new(), Vec::new());
+  let mut stated_dirs: std::collections::HashSet<Vec<u8>> = Default::default();
+  for path in paths {
+    let dirs: Vec<Vec<u8>> = crate::union::attribute_dirs(&path).into_iter().map(<[u8]>::to_vec).collect();
+    let mut texts: std::collections::HashMap<Vec<u8>, Vec<u8>> = Default::default();
+    for dir in &dirs {
+      if let Some(entry) = rule_at(store, dir)? {
+        texts.insert(dir.clone(), store.get(&entry.id)?.map(|b| b.to_vec()).unwrap_or_default());
+      }
+    }
+    if !crate::union::is_union(|dir| texts.get(dir).cloned(), &path) {
+      continue;
+    }
+    let base_entry = crate::manifest::lookup(store, root, &path)?.filter(|e| !e.is_dir());
+    named.extend(base_entry.map(|e| e.id));
+    union.push(serde_json::json!({ "path": String::from_utf8_lossy(&path), "base": entry_json(base_entry) }));
+    for dir in dirs {
+      if stated_dirs.insert(dir.clone()) {
+        let entry = rule_at(store, &dir)?;
+        named.extend(entry.map(|e| e.id));
+        let file = if dir.is_empty() { ".gitattributes".to_string() } else { format!("{}/.gitattributes", String::from_utf8_lossy(&dir)) };
+        attributes.push(serde_json::json!({ "path": file, "entry": entry_json(entry) }));
+      }
+    }
+  }
+  if union.is_empty() {
+    return Ok((None, Vec::new()));
+  }
+  Ok((Some(serde_json::json!({ "union": union, "attributes": attributes }).to_string()), named))
 }
 
 /// Send the workspace's published commits that the ref has not seen, and
@@ -382,9 +445,15 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   for commit in &chain {
     frame(&mut body, &commit.encode());
   }
+  // Of the paths it changes that `.gitattributes` merges by union, as the chain's base has them:
+  // what each was there, and the rules above it, so that the server can merge them if the ref
+  // changed them too. Their contents go with the push.
+  let (stated, mut named) = union_statement(store, &chain)?;
+  if let Some(stated) = &stated {
+    frame(&mut body, stated.as_bytes());
+  }
   // What goes with the commits: the contents they name, and for a directory one sets
   // whole, the contents below it that the server could not find for itself.
-  let mut named: Vec<Id> = Vec::new();
   for (path, entry) in chain.iter().flat_map(|commit| &commit.changes) {
     match entry {
       Some(dir) if dir.is_dir() => {
@@ -416,7 +485,8 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   // From here until an answer is heard, the push may land without this workspace knowing.
   let last = object_id(Kind::Commit, &chain.last().expect("a push carries a commit").encode());
   crate::write_whole(&workspace::unheard(ws), format!("{} {}\n", chain.len(), hex(&last)))?;
-  let (_, answer) = send(http().post(&format!("{url}/push/{name}?after={}&commits={}", ws.seq, chain.len())), Some(&body))?;
+  let stated_flag = if stated.is_some() { "&stated=1" } else { "" };
+  let (_, answer) = send(http().post(&format!("{url}/push/{name}?after={}&commits={}{stated_flag}", ws.seq, chain.len())), Some(&body))?;
   let answer = json(&answer)?;
   // Heard: refused, or landed and caught up with below. Known either way, unless catching up fails.
   let note = workspace::unheard(ws);
@@ -425,7 +495,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   };
   match answer["status"].as_str() {
     Some("updated") => done.updated += chain.len(),
-    Some("rebased") => done.rebased += chain.len(),
+    Some("rebased") => {
+      done.rebased += chain.len();
+      done.merged_on_server = answer["merged"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_string)).collect();
+    }
     Some("conflict") => {
       heard();
       let paths: Vec<&str> = answer["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
@@ -650,6 +723,17 @@ fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &s
 const MODE_KIND: u32 = 0o170000;
 const MODE_FILE: u32 = 0o100000;
 
+/// Whether two commits' changes are the same but for the contents of paths `.gitattributes`
+/// merges by union: a commit of this workspace's own as it landed where the server merged such
+/// a path (`merged_on_server`), which is still the workspace's own.
+fn differ_only_by_union(root: &std::path::Path, a: &[Change], b: &[Change]) -> bool {
+  let file = |e: &Option<Entry>| e.is_some_and(|e| !e.is_dir() && e.mode != MODE_GITLINK && e.mode != 0o120000);
+  a.len() == b.len()
+    && a.iter().zip(b).all(|((pa, ea), (pb, eb))| {
+      pa == pb && (ea == eb || (file(ea) && file(eb) && ea.map(|e| e.mode) == eb.map(|e| e.mode) && crate::eol::merges_by_union(root, pa)))
+    })
+}
+
 fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str, resuming: bool) -> Result<Synced> {
   let mut done = Synced::default();
   let Tip { id: tip, seq } = tip;
@@ -701,7 +785,10 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
       while from_ref < refs.len() {
         let candidate = refs[from_ref];
         from_ref += 1;
-        if candidate == *own || key(store, &candidate)? == wanted {
+        if candidate == *own || {
+          let (rest, changes) = key(store, &candidate)?;
+          rest == wanted.0 && (changes == wanted.1 || differ_only_by_union(&ws.root, &changes, &wanted.1))
+        } {
           their_copies.extend(wanted.1.iter().cloned());
           matched = Some((*own, candidate));
           count += 1;
@@ -843,7 +930,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     }
   };
   // `merge=union` paths, as `.gitattributes` on disk says: both sides' lines, and merged.
-  let root = ws.root.clone();
+  let ws_root = ws.root.clone();
   let three_way =
     |store: &mut Store, path: &[u8], was: Option<Entry>, ours: Entry, theirs: Entry| -> Result<Option<(Vec<u8>, bool, u32)>> {
       // The mode is merged as the text is: whoever changed it from what both had, has it.
@@ -856,7 +943,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
         return Ok(None);
       }
       let (text, clean) =
-        crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs", crate::eol::merges_by_union(&root, path));
+        crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs", crate::eol::merges_by_union(&ws_root, path));
       Ok(Some((text, clean, mode)))
     };
   let mut clash: Vec<String> = Vec::new();

@@ -1,0 +1,26 @@
+[package]
+name = "newvcs-merger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Git's union merge and the rule that asks for it, for the Worker: nv's own src/union.rs, compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bstr = { version = "1", default-features = false, features = ["std"] }
+gix-attributes = "0.37"
+gix-glob = "0.29"
+gix-merge = { version = "0.23", default-features = false, features = ["sha1"] }
+imara-diff = { package = "gix-imara-diff", version = "0.3" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Not part of the nv package above it.
+[workspace]

@@ -280,4 +280,51 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
   }
   assert.ok(refused, "a tree built too deep over several adopts was taken");
 }
+
+// ---------------------------------------------------------------- what a push states of its union paths
+// The server merges a list `.gitattributes` gives `merge=union` from what the pusher says the
+// list was at its base. Where the ref's own history says otherwise, the pusher is not believed.
+{
+  const file = (s: string) => ({ bytes: text(s), id: blobIdOf(text(s)) });
+  const rules = file("list merge=union\n");
+  const start = file("start\n");
+  const plain = file("plain\n");
+  const entry = (f: { id: Uint8Array }) => ({ mode: 0o100644, id: f.id });
+  const stated = (union: [string, { id: Uint8Array } | null][], attributes: [string, { id: Uint8Array } | null][]) =>
+    text(JSON.stringify({ union: union.map(([path, f]) => ({ path, base: f && { mode: 0o100644, id: hex(f.id) } })), attributes: attributes.map(([path, f]) => ({ path, entry: f && { mode: 0o100644, id: hex(f.id) } })) }));
+  const pushStated = (statement: Uint8Array, c: Uint8Array, ...contents: Uint8Array[]) =>
+    fetch(`${server}/${repo}/push/union?commits=1&stated=1`, { method: "POST", body: frame(c, statement, ...contents) });
+  const begun = (await (await push("union", commit(null, [
+    { path: text(".gitattributes"), entry: entry(rules) },
+    { path: text("list"), entry: entry(start) },
+    { path: text("plain"), entry: entry(plain) },
+  ]), rules.bytes, start.bytes, plain.bytes)).json()) as { commit: string };
+  const unionTip = async () => ((await (await fetch(`${server}/${repo}/refs/union`)).json()) as { tip: string }).tip;
+  const a = file("start\na\n");
+  assert.equal((await push("union", commit(begun.commit, [{ path: text("list"), entry: entry(a) }]), a.bytes)).status, 200);
+  const m = file("start\nm\n");
+  const mine = commit(begun.commit, [{ path: text("list"), entry: entry(m) }]);
+  // The list at the base is not what the ref's history says it was.
+  let said = await pushStated(stated([["list", a]], [[".gitattributes", rules]]), mine, m.bytes, a.bytes, rules.bytes);
+  assert.equal(said.status, 409, "a push that lied about what a path was at its base was merged");
+  // Nor are the rules.
+  const other = file("* merge=union\n");
+  said = await pushStated(stated([["list", start]], [[".gitattributes", other]]), mine, m.bytes, start.bytes, other.bytes);
+  assert.equal(said.status, 409, "a push that lied about the rules at its base was merged");
+  // A path the rules do not make union is not merged, whatever the push says of it.
+  const b = file("plain\nb\n");
+  assert.equal((await push("union", commit(await unionTip(), [{ path: text("plain"), entry: entry(b) }]), b.bytes)).status, 200);
+  const p2 = file("plain\np\n");
+  said = await pushStated(stated([["plain", plain]], [[".gitattributes", rules]]), commit(begun.commit, [{ path: text("plain"), entry: entry(p2) }]), p2.bytes, plain.bytes, rules.bytes);
+  assert.equal(said.status, 409, "a path the rules do not merge by union was merged");
+  // A statement that is not one: refused as a request, before anything.
+  for (const bad of [text("not json"), text("{}"), text('{"union":[{"path":"list","base":{"mode":1,"id":"zz"}}],"attributes":[]}')]) {
+    assert.equal((await pushStated(bad, mine, m.bytes)).status, 400, `a statement ${new TextDecoder().decode(bad)} was taken`);
+  }
+  // Said truly, the list is merged here, and the push lands on the tip with both entries.
+  said = await pushStated(stated([["list", start]], [[".gitattributes", rules]]), mine, m.bytes, start.bytes, rules.bytes);
+  const landed = (await said.json()) as { status: string; merged?: string[] };
+  assert.equal(said.status, 200, JSON.stringify(landed));
+  assert.deepEqual(landed.merged, ["list"]);
+}
 console.log("ok");

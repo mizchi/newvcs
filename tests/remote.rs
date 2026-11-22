@@ -1375,8 +1375,8 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
 }
 
 /// Two writers who each add an entry to a list `.gitattributes` gives `merge=union` do not leave
-/// each other a conflict: the sync keeps both, and the conditions are run on what it made, so the
-/// committer knows whether to push without running anything (round 2 of `eval/commit-agents`).
+/// each other a conflict, nor a sync to make: the server merges the list as `nv sync` would, the
+/// push lands, and the conditions are run on what it made (rounds 2 and 3 of `eval/commit-agents`).
 #[test]
 fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
   let Ok(server) = std::env::var("NV_SERVER") else {
@@ -1397,8 +1397,7 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
       printf 'start\n' > list && printf 'start\n' > plain && printf 'list merge=union\n' > .gitattributes
       printf 'auto = true\n[checks.unit]\nrun = "test $(grep -c . list) -ge 2 && ! grep -q \\"<<<<<<<\\" list"\n\n[commit]\neach = true\n' > nv.toml
       git add -A && git commit -q -m seed && cd ..
-      {nv} git clone -q src ann && {nv} git clone -q src bob
-      {nv} remote ann {url} main && {nv} remote bob {url} main
+      for w in ann bob cat dan; do {nv} git clone -q src $w && {nv} remote $w {url} main; done
       "##
     ),
   );
@@ -1417,25 +1416,50 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
     );
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
   };
+  let read = |dir: &str, path: &str| std::fs::read_to_string(root.join(dir).join(path)).unwrap();
   let (code, said) = run("ann", "echo ann >> list && $NV commit . 'Ann adds an entry' >/dev/null && $NV push .");
   assert_eq!(code, 0, "{said}");
+  // Bob added to the list too, and never looked: the server keeps both entries, Bob's first, as
+  // the sync would have, and Bob's commit lands on Ann's.
   let (code, said) = run("bob", "echo bob >> list && $NV commit . 'Bob adds an entry' >/dev/null && $NV push .");
+  assert_eq!(code, 0, "{said}");
+  assert!(
+    said.contains("pushed 1 commit: 0 as they were, 1 put on a newer tip") && said.contains("merged on the server (merge=union): list"),
+    "{said}"
+  );
+  assert_eq!(read("bob", "list"), "start\nbob\nann\n", "the workspace has what landed");
+  let (_, said) = run("bob", "$NV pending . --wait");
+  assert!(said.starts_with("nothing committed here that is not pushed"), "its own commit is known as landed: {said}");
+  assert!(said.ends_with("settled: what is recorded is committed, and passed unit\n"), "what the server made is run on: {said}");
+  assert_eq!(run("bob", "$NV git log --format=%s -2").1, "Bob adds an entry\nAnn adds an entry\n");
+  // Cat's chain of two, one of which adds to the list, the other to a file nobody else changed.
+  let (code, said) = run(
+    "cat",
+    "echo cat >> list && $NV commit . 'Cat adds an entry' >/dev/null && echo more >> plain && $NV commit . 'Cat edits plain' >/dev/null && $NV push .",
+  );
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(read("cat", "list"), "start\ncat\nbob\nann\n");
+  assert_eq!(run("cat", "$NV git log --format=%s -3").1, "Cat edits plain\nCat adds an entry\nBob adds an entry\n");
+  // Everyone who syncs gets the same list, and the same ids.
+  let (code, said) = run("ann", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(read("ann", "list"), "start\ncat\nbob\nann\n");
+  assert_eq!(run("ann", "$NV git log -1 --format=%H").1, run("cat", "$NV git log -1 --format=%H").1);
+  // A file without the attribute still clashes, and the push is refused as before.
+  run("ann", "echo a2 >> plain && $NV commit . 'Ann edits plain' >/dev/null && $NV push .");
+  let (code, said) = run("bob", "echo b2 >> plain && $NV commit . 'Bob edits plain' >/dev/null && $NV push .");
   assert_eq!(code, 2, "{said}");
-  // The sync merges the list, both entries kept, and nothing is left for a person.
   let (code, said) = run("bob", "$NV sync .");
-  assert_eq!(code, 0, "{said}");
-  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "start\nbob\nann\n");
-  // What the sync made is run on: the committer is told it passed, and pushes it as it is.
-  let (code, said) = run("bob", "$NV pending . --wait");
-  assert_eq!(code, 0, "{said}");
-  assert!(said.contains("Bob adds an entry  (passed unit)"), "{said}");
-  assert!(said.ends_with("settled: what is recorded is committed, and passed unit\n"), "{said}");
-  let (code, said) = run("bob", "$NV push .");
-  assert_eq!(code, 0, "{said}");
-  // A file without the attribute still clashes as text.
-  let (code, said) = run("ann", "$NV sync . >/dev/null; echo a2 >> plain && $NV commit . 'Ann edits plain' && $NV push .");
-  assert_eq!(code, 0, "{said}");
-  let (code, said) = run("bob", "echo b2 >> plain && $NV commit . 'Bob edits plain' >/dev/null && ($NV push . || $NV sync .)");
   assert_eq!(code, 1, "{said}");
   assert!(said.contains("both sides changed the same lines of: plain"), "{said}");
+  // Rules that changed under the pusher are not taken on its word: Dan's list was union when he
+  // started, the ref's is not any more, and his push is refused.
+  let (code, said) = run(
+    "ann",
+    "$NV sync . >/dev/null; : > .gitattributes && echo ann2 >> list && $NV commit . 'Ann ends the union' >/dev/null && $NV push .",
+  );
+  assert_eq!(code, 0, "{said}");
+  let (code, said) = run("dan", "echo dan >> list && $NV commit . 'Dan adds an entry' >/dev/null && $NV push .");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("has changes to the same paths: list"), "{said}");
 }

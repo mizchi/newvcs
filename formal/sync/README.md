@@ -25,6 +25,10 @@ It is checked with [idealis](https://github.com/mizchi/idealis), a TLA+ checker 
 - An arrival is worked out in four steps (`Begin`, `Sides`, `Commits`, `Files`), each from what
   the one before stored. Nothing else happens meanwhile: it reads only its own workspace and a
   part of the ref that does not change.
+- Not in it: the server merging a path `merge=union` gives (a push refused only over such paths
+  lands merged), nor the client knowing such a commit for its own when its contents differ.
+  That is newer than the model and is checked by `tests/remote.rs` and `tests/lying_server.rs`
+  only.
 
 ## What must hold
 

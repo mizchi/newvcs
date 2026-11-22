@@ -674,6 +674,9 @@ fn run(args: &[String]) -> Result<()> {
           tip.unwrap_or_default()
         );
       }
+      if !done.merged_on_server.is_empty() {
+        println!("merged on the server (merge=union): {}", done.merged_on_server.join(", "));
+      }
       println!(
         "{} file contents sent, {} of linked directories not sent; {} in {:.0} ms",
         done.contents_sent,

@@ -25,6 +25,7 @@ pub mod manifest;
 pub mod remote;
 pub mod store;
 pub mod textdiff;
+pub mod union;
 pub mod watch;
 pub mod workspace;
 

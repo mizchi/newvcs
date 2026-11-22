@@ -2911,21 +2911,9 @@ fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8], their_name: &str, union: 
   merge_text_named(base, ours, theirs, "HEAD", their_name, union)
 }
 
-/// Git's three-way merge of a text file. `false` when the two sides changed the
-/// same lines: the text then holds both, between Git's markers. With `union`
-/// (`merge=union` in `.gitattributes`), it holds both without markers, ours first,
-/// and is merged.
+/// Git's three-way merge of a text file: `crate::union::merge_text`, which the server runs too.
 pub(crate) fn merge_text_named(base: &[u8], ours: &[u8], theirs: &[u8], our_name: &str, their_name: &str, union: bool) -> (Vec<u8>, bool) {
-  use gix_merge::blob::{Resolution, builtin_driver::text};
-  let mut merged = Vec::new();
-  let mut input = imara_diff::InternedInput::default();
-  let labels = text::Labels { ancestor: None, current: Some(our_name.into()), other: Some(their_name.into()) };
-  let mut options = text::Options::default();
-  if union {
-    options.conflict = text::Conflict::ResolveWithUnion;
-  }
-  let how = text(&mut merged, &mut input, labels, ours, base, theirs, options);
-  (merged, how != Resolution::Conflict)
+  crate::union::merge_text(base, ours, theirs, our_name, their_name, union)
 }
 
 fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {

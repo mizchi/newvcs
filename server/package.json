@@ -6,9 +6,10 @@
   "scripts": {
     "dev": "cf dev",
     "typecheck": "cf workers types && tsc",
-    "test": "node --test test/commit.test.ts test/hasher.test.ts",
+    "test": "node --test test/commit.test.ts test/hasher.test.ts test/merger.test.ts",
     "build:hasher": "cd hasher && RUSTFLAGS='-C target-feature=+simd128' cargo build --release --target wasm32-unknown-unknown && wasm-opt -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --strip-debug --strip-producers target/wasm32-unknown-unknown/release/newvcs_hasher.wasm -o ../src/blake3.wasm",
-    "test:e2e": "node test/e2e.ts"
+    "test:e2e": "node test/e2e.ts",
+    "build:merger": "cd merger && cargo build --release --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/newvcs_merger.wasm ../src/merger.wasm"
   },
   "dependencies": {
     "@noble/hashes": "^2.0.0"
