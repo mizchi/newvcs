@@ -61,6 +61,10 @@ pub struct Config {
   pub message: Option<Hook>,
   /// Whether a recorded write starts a run behind it.
   pub auto: bool,
+  /// Whether each state that passes every condition is committed then and there (`[commit]
+  /// each = true`), under its drafted message or a provisional one: commits made to be made
+  /// again, fewer and better said, before they are pushed (`nv rebuild`).
+  pub commit_each: bool,
 }
 
 /// What became of one condition on one state.
@@ -164,7 +168,14 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
     }),
   };
   let auto = doc.get("auto").and_then(|auto| auto.as_bool()).unwrap_or(false);
-  Ok(Some(Config { checks: in_order(checks)?, message, auto }))
+  let commit_each = match doc.get("commit") {
+    None => false,
+    Some(item) => match item.get("each") {
+      None => false,
+      Some(each) => each.as_bool().ok_or_else(|| format!("{FILE}: `each` of `commit` is true or false"))?,
+    },
+  };
+  Ok(Some(Config { checks: in_order(checks)?, message, auto, commit_each }))
 }
 
 /// Each condition after those it waits for, in the order declared otherwise.
@@ -249,9 +260,35 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
       }
     }
     let line = |(name, outcome, _): &(String, Outcome, Duration)| format!("{name} {outcome:?}\n");
-    crate::write_whole(&dir.join(hex(&state)), run.results.iter().map(line).collect::<String>())?;
+    let said: String = run.results.iter().map(line).collect();
+    crate::write_whole(&dir.join(hex(&state)), &said)?;
+    // And under its files: a commit of the same files, made again, passed as well.
+    let mut store = Store::open(&ws.store)?;
+    if let Some(tree) = root_of(&mut store, &state)? {
+      crate::write_whole(&dir.join(format!("tree-{}", hex(&tree))), said)?;
+    }
   }
   Ok(run)
+}
+
+/// The conditions that passed on these files, by the id of their tree.
+pub fn passed_on_tree(root: &Path, tree: &Id) -> Vec<String> {
+  let text = std::fs::read_to_string(runs_dir(root).join(format!("tree-{}", hex(tree)))).unwrap_or_default();
+  text.lines().filter_map(|line| line.strip_suffix(" Passed")).map(str::to_string).collect()
+}
+
+/// Commit a state every condition passed on, as `[commit] each` asks: under the message drafted
+/// for it, or a provisional one that says what passed. The writer may have gone on writing; what
+/// it wrote since stays recorded on top.
+pub fn commit_checkpoint(root: &Path, config: &Config, state: &Id, author: &str) -> Result<Option<Id>> {
+  let names: Vec<&str> = config.checks.iter().map(|c| c.name.as_str()).collect();
+  let message = draft(root, state).unwrap_or_else(|| format!("checkpoint: {} passed", names.join(", ")));
+  let _held = workspace::lock(root)?;
+  let mut ws = Workspace::open(root)?;
+  let mut store = Store::open(&ws.store)?;
+  workspace::unfold(&mut store, &mut ws)?;
+  let rest = workspace::commit_rest(author, &message);
+  workspace::commit_state(&mut store, &mut ws, *state, rest, author)
 }
 
 /// Whether the conditions are known to have passed on this state.
@@ -362,6 +399,13 @@ pub fn run_until_still(root: &Path, config: &Config, author: &str) -> Result<Opt
       && draft(root, &run.state).is_none()
     {
       let _ = write_draft(root, hook, &run.state);
+    }
+    if run.passed() && config.commit_each {
+      match commit_checkpoint(root, config, &run.state, author) {
+        Ok(Some(id)) => println!("{} passed every condition, and is committed as {}", hex(&run.state), hex(&id)),
+        Ok(None) => {}
+        Err(why) => eprintln!("nv: {} passed every condition, and was not committed: {why}", hex(&run.state)),
+      }
     }
     last = Some(run);
     if !moved {

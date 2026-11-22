@@ -248,15 +248,24 @@ pub fn watch(root: &Path, author: &str) -> Result<()> {
       return Ok(());
     }
     if !paths.is_empty() || missed.get() {
-      // Someone else may be at the workspace: a hook, a commit, a restore.
-      let _lock = workspace::lock(&root)?;
-      let mut ws = Workspace::open(&root)?;
-      let mut store = Store::open(&ws.store)?;
-      workspace::unfold(&mut store, &mut ws)?;
-      let reported = workspace::record_events(&ws, &std::mem::take(&mut paths))?;
-      let look = if missed.replace(false) { Look::Everywhere } else { Look::Recorded };
-      if let Some(id) = workspace::snapshot(&mut store, &mut ws, author, look)? {
-        say(format!("{} from {reported} paths", hex(&id)));
+      let recorded = {
+        // Someone else may be at the workspace: a hook, a commit, a restore.
+        let _lock = workspace::lock(&root)?;
+        let mut ws = Workspace::open(&root)?;
+        let mut store = Store::open(&ws.store)?;
+        workspace::unfold(&mut store, &mut ws)?;
+        let reported = workspace::record_events(&ws, &std::mem::take(&mut paths))?;
+        let look = if missed.replace(false) { Look::Everywhere } else { Look::Recorded };
+        let id = workspace::snapshot(&mut store, &mut ws, author, look)?;
+        if let Some(id) = id {
+          say(format!("{} from {reported} paths", hex(&id)));
+        }
+        id.is_some()
+      };
+      // Where the repository asks for it, the conditions are run behind the write, as behind a
+      // hook's: the writer need not know there is a watcher, nor conditions.
+      if recorded {
+        crate::checks::start_behind(&root);
       }
     }
     // A question is answered when the events have stopped coming, not when a burst was cut to

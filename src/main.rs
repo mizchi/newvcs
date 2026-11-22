@@ -31,7 +31,19 @@ nv: an experiment in keeping Git's object ids without Git's storage
   nv checkpoint <dir>
         Record what is on disk and run the conditions nv.toml declares on
         it, in order: the state is then `checkpoint-<name>` for each that
-        passed. Exits 1 where one did not, or the files changed meanwhile
+        passed. Exits 1 where one did not, or the files changed meanwhile.
+        With `[commit] each = true` in nv.toml a state that passed them all
+        is committed, there and then, under its drafted message or a
+        provisional one, to be made again with `nv rebuild` before a push
+  nv pending <dir>
+        The commits made here and not pushed, oldest first: each with its
+        number, id, message, the conditions its files passed, and its paths
+  nv rebuild <dir> <commit> <message> [<commit> <message>]...
+        Make the commits not pushed again, as fewer: one new commit for each
+        pair, of what the commits up to and including <commit> changed since
+        the one before, under <message>. Commits after the last one named are
+        made again as they were. Where each <commit> passed the conditions,
+        each new commit does. The files are not touched
   nv watch <dir> [--start | --stop | --status]
         Stay, and snapshot whatever is written there by whatever writes it:
         the operating system reports the writes, so nothing has to. With
@@ -163,6 +175,25 @@ fn opened(dir: &str) -> Result<(Workspace, Store)> {
     eprintln!("nv: {done}");
   }
   Ok((ws, store))
+}
+
+/// A commit not pushed, by its number in `nv pending` or the start of its id.
+fn commit_named(store: &mut Store, ws: &Workspace, name: &str) -> Result<newvcs::Id> {
+  let chain = workspace::pending(store, ws)?;
+  if let Ok(n) = name.parse::<usize>()
+    && name.len() < 6
+  {
+    return chain
+      .get(n.wrapping_sub(1))
+      .map(|(id, _)| *id)
+      .ok_or_else(|| format!("there is no commit {n} not pushed: `nv pending` lists them"));
+  }
+  let found: Vec<&newvcs::Id> = chain.iter().map(|(id, _)| id).filter(|id| hex(*id).starts_with(&name.to_ascii_lowercase())).collect();
+  match found[..] {
+    [one] if name.len() >= 6 => Ok(*one),
+    [] => Err(format!("`{name}` is not a commit here that is not pushed: `nv pending` lists them")),
+    _ => Err(format!("`{name}` names more than one commit, or is too short: give six characters or more")),
+  }
 }
 
 /// Who a commit made here is by, and when, as Git would say it: the
@@ -449,7 +480,65 @@ fn run(args: &[String]) -> Result<()> {
       {
         eprintln!("nv: {why}");
       }
+      if config.commit_each {
+        match newvcs::checks::commit_checkpoint(&root, &config, &run.state, AUTHOR)? {
+          Some(id) => println!("{} passed every condition, and is committed as {}, in {:.1} ms", hex(&run.state), hex(&id), ms(started)),
+          None => println!("{} passed every condition, and is what is committed already, in {:.1} ms", hex(&run.state), ms(started)),
+        }
+        return Ok(());
+      }
       println!("{} passed every condition, in {:.1} ms", hex(&run.state), ms(started));
+    }
+    "pending" => {
+      let (ws, mut store) = opened(arg(1)?)?;
+      let chain = workspace::pending(&mut store, &ws)?;
+      if chain.is_empty() {
+        println!("nothing committed here that is not pushed");
+      }
+      if ws.pushed.or(ws.start).is_none() && !chain.is_empty() {
+        println!("(this workspace has no ref it pushes to, nor a commit it was made at: all of its history is listed)");
+      }
+      for (n, (id, commit)) in chain.iter().enumerate() {
+        let said = String::from_utf8_lossy(&commit.rest).into_owned();
+        let message = said.split_once("\n\n").map_or("", |(_, m)| m).trim();
+        let first = message.lines().next().unwrap_or_default();
+        let passed = match newvcs::commit::root_of(&mut store, id)? {
+          Some(tree) => newvcs::checks::passed_on_tree(&ws.root, &tree),
+          None => Vec::new(),
+        };
+        let passed = if passed.is_empty() { "conditions not run on it".to_string() } else { format!("passed {}", passed.join(", ")) };
+        println!("{:>3}  {}  {first}  ({passed})", n + 1, &hex(id)[..12]);
+        for (path, entry) in &commit.changes {
+          println!("       {} {}", if entry.is_some() { "M" } else { "D" }, String::from_utf8_lossy(path));
+        }
+      }
+    }
+    "rebuild" => {
+      let (mut ws, mut store) = opened(arg(1)?)?;
+      let rest = &args[2..];
+      if !rest.len().is_multiple_of(2) {
+        return Err("`nv rebuild` takes pairs: a commit, and the message of the commit that ends with it".to_string());
+      }
+      let mut plan = Vec::new();
+      for pair in rest.chunks(2) {
+        let id = commit_named(&mut store, &ws, &pair[0])?;
+        if pair[1].trim().is_empty() {
+          return Err(format!("the commit ending with {} needs a message that says something", pair[0]));
+        }
+        let author = signature(&ws, "AUTHOR")?;
+        let committer = signature(&ws, "COMMITTER")?;
+        plan.push((id, format!("author {author}\ncommitter {committer}\n\n{}\n", pair[1].trim_end()).into_bytes()));
+      }
+      let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
+      for id in &made {
+        println!("{}", hex(id));
+      }
+      println!(
+        "{} commits made again as {}, in {:.0} ms",
+        workspace::pending(&mut store, &ws)?.len().max(made.len()),
+        made.len(),
+        ms(started)
+      );
     }
     "restore" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -695,6 +784,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("snapshot", 1, 1, &["--recorded", "--tracked"]),
   ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
   ("checkpoint", 1, 1, &["--until-still"]),
+  ("pending", 1, 1, &[]),
+  ("rebuild", 3, usize::MAX, &[]),
   ("watch", 1, 1, &["--start", "--stop", "--status"]),
   ("log", 1, 1, &[]),
   ("restore", 2, 2, &["--recorded", "--tracked"]),

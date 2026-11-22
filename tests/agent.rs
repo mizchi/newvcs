@@ -1182,3 +1182,92 @@ fn what_an_eleventh_reviewer_found_in_recording_stays_fixed() {
   ok(&dir, "rm .nv/exclude && $NV record . .nv/exclude && $NV snapshot . --recorded >/dev/null");
   assert_eq!(ok(&dir, "$NV since . base | grep log; true"), "A x.log");
 }
+
+/// A writer that never commits: each state its conditions pass on is committed by nv, under a
+/// provisional message, and the commits are made again, fewer and better said, before a push.
+#[test]
+fn each_checkpoint_is_committed_and_the_commits_are_made_again_fewer() {
+  // Made from a commit, as a clone is: what is not pushed is what came after it.
+  let top = fresh("each-checkpoint");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"test ! -e broken\"\\n\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  assert!(code_of(&dir, "$NV rebuild . 1 x 2>&1").1.contains("not pushed"), "nothing to make again yet");
+  // Three states that pass, one that does not between them.
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  ok(&dir, "echo x > broken && ($NV checkpoint . >/dev/null 2>&1; true) && rm broken && echo 2 > two && $NV checkpoint . >/dev/null 2>&1");
+  ok(&dir, "echo 3 > three && $NV checkpoint . >/dev/null 2>&1");
+  let pending = ok(&dir, "$NV pending .");
+  assert_eq!(pending.lines().filter(|l| l.contains("checkpoint: unit passed")).count(), 3, "{pending}");
+  assert_eq!(pending.matches("(passed unit)").count(), 3, "{pending}");
+  assert!(!pending.contains("broken"), "a state the conditions did not pass is not committed: {pending}");
+  // Made again as two: what came to pass first, then the rest.
+  let said = ok(&dir, "$NV rebuild . 2 'Add one and two' 3 'Add three' && $NV pending .");
+  assert!(said.contains("1  ") && said.contains("Add one and two") && said.contains("Add three"), "{said}");
+  assert_eq!(said.matches("(passed unit)").count(), 2, "each new commit ends where the conditions passed: {said}");
+  assert_eq!(ok(&dir, "$NV git log --format=%s | head -3"), "Add three\nAdd one and two\nconditions");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD~1"), "one\ntwo");
+  // A workspace with no end to what is not pushed makes nothing again.
+  let plain = workspace("each-checkpoint-plain");
+  let (code, said) = code_of(&plain, "$NV rebuild . 1 x 2>&1");
+  assert!(code != 0 && said.contains("nothing was changed") || said.contains("Nothing was changed"), "{said}");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null; cat one two three"), "1\n2\n3", "the files are as they were");
+  // Refused, and nothing changed: a commit that is not one of them, the plan out of order.
+  for plan in ["0123456789ab 'x'", "2 'b' 1 'a'", "1"] {
+    let (code, said) = code_of(&dir, &format!("$NV rebuild . {plan} 2>&1"));
+    assert_ne!(code, 0, "{plan}: {said}");
+  }
+  assert_eq!(ok(&dir, "$NV git log --format=%s | head -2"), "Add three\nAdd one and two");
+}
+
+/// The state the conditions passed on is committed though the files moved on since: what came
+/// after stays recorded, as changes not committed.
+#[test]
+fn a_state_the_files_have_moved_on_from_is_committed_as_it_was() {
+  use newvcs::store::Store;
+  use newvcs::workspace::{self, Look, Workspace};
+  let dir = workspace("commit-state");
+  ok(&dir, "echo passed > a.txt");
+  let state = {
+    let mut ws = Workspace::open(&dir).unwrap();
+    let mut store = Store::open(&ws.store).unwrap();
+    workspace::snapshot(&mut store, &mut ws, "t <t@example.com>", Look::Everywhere).unwrap().unwrap()
+  };
+  ok(&dir, "echo later > c.txt && $NV snapshot . >/dev/null && echo 'not even recorded' > d/x.txt");
+  {
+    let mut ws = Workspace::open(&dir).unwrap();
+    let mut store = Store::open(&ws.store).unwrap();
+    let rest = b"author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nwhat passed\n".to_vec();
+    assert!(workspace::commit_state(&mut store, &mut ws, state, rest, "t <t@example.com>").unwrap().is_some());
+  }
+  assert_eq!(ok(&dir, "$NV git show --name-only --format=%s HEAD"), "what passed\n\na.txt");
+  assert_eq!(ok(&dir, "$NV since . base"), "A c.txt\nM d/x.txt");
+  assert_eq!(ok(&dir, "cat a.txt c.txt d/x.txt"), "passed\nlater\nnot even recorded");
+  // A state from before the last commit is not one to commit again.
+  let mut ws = Workspace::open(&dir).unwrap();
+  let mut store = Store::open(&ws.store).unwrap();
+  let rest = b"author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nagain\n".to_vec();
+  let refused = workspace::commit_state(&mut store, &mut ws, state, rest, "t").unwrap_err();
+  assert!(refused.contains("not a state recorded here since the last commit"), "{refused}");
+}
+
+/// With `auto`, a watcher's snapshot starts the conditions as a hook's does, and with `[commit]
+/// each` what passes is committed: a writer that only writes files gets commits.
+#[test]
+fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
+  let dir = workspace("watched-each");
+  ok(
+    &dir,
+    "printf 'auto = true\\n[checks.unit]\\nrun = \"test ! -e broken\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "$NV watch . --start >/dev/null");
+  ok(&dir, "echo 1 > one");
+  let waited = ok(
+    &dir,
+    "i=0; until $NV pending . 2>/dev/null | grep -q 'passed unit'; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done; $NV pending .",
+  );
+  ok(&dir, "$NV watch . --stop >/dev/null");
+  assert!(waited.contains("checkpoint: unit passed") && waited.contains("M one"), "{waited}");
+}

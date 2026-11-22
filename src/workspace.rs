@@ -767,8 +767,13 @@ fn untracked_in_the_way(store: &mut Store, root: &Path, from: Option<Id>, change
 /// was cleared). Called once what is on disk is recorded, so only what is recorded is read: the
 /// files that differ from the last commit, as the commit would publish them.
 pub(crate) fn refuse_sync_markers(store: &mut Store, ws: &Workspace) -> Result<()> {
+  refuse_sync_markers_in(store, ws, ws.head)
+}
+
+/// `refuse_sync_markers`, for the change from the last commit to `state`.
+fn refuse_sync_markers_in(store: &mut Store, ws: &Workspace, state: Option<Id>) -> Result<()> {
   let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
-  let (from, to) = (tree(store, ws.base)?, tree(store, ws.head)?);
+  let (from, to) = (tree(store, ws.base)?, tree(store, state)?);
   let mut found = Vec::new();
   // A file the index says is still what was recorded is read from the disk, which costs less
   // than taking its content out of the store; what the index cannot vouch for is read from the store.
@@ -1941,6 +1946,181 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
   (ws.base, ws.head) = (Some(id), Some(id));
   ws.save()?;
   Ok(Some(id))
+}
+
+/// The header a commit made by nv itself carries: who, when, and the message.
+pub(crate) fn commit_rest(author: &str, message: &str) -> Vec<u8> {
+  rest_of(author, message)
+}
+
+/// Publish a state recorded since the last commit, though the files have moved on: one commit on
+/// the last, of what that state changed. What was recorded after it stays recorded, on top of the
+/// new commit, as changes not committed. `None` when the state is the last commit's files.
+///
+/// For a writer that does not commit: what its conditions passed on is committed as it was, while
+/// it goes on writing. Not beside Git, where a commit is made by Git, from the files.
+pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<u8>, author: &str) -> Result<Option<Id>> {
+  if crate::colocated::shared(&ws.root) {
+    return Err("committing a state the files have moved on from is not done beside Git, where Git commits the files".to_string());
+  }
+  // A state of this workspace's since its last commit: on the way back from where it is now.
+  let mut at = ws.head;
+  let mut found = false;
+  while let Some(id) = at.filter(|id| Some(*id) != ws.base) {
+    if id == state {
+      found = true;
+      break;
+    }
+    at = Commit::load(store, &id)?.parents.first().copied();
+  }
+  if !found {
+    if Some(state) == ws.base {
+      return Ok(None);
+    }
+    return Err(format!("{} is not a state recorded here since the last commit", &hex(&state)[..12]));
+  }
+  refuse_sync_markers_in(store, ws, Some(state))?;
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let (from, to, now) = (tree(store, ws.base)?, tree(store, Some(state))?, tree(store, ws.head)?);
+  let whole = whole_since(store, Some(state), ws.base)?;
+  let changes = crate::manifest::diff_keeping(store, from, to, &whole)?;
+  if changes.is_empty() {
+    return Ok(None);
+  }
+  let id = Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?;
+  root_of(store, &id)?;
+  // What came after the state, recorded again on the new commit.
+  let head = if Some(state) == ws.head {
+    id
+  } else {
+    let whole = whole_since(store, ws.head, Some(state))?;
+    let later = crate::manifest::diff_keeping(store, to, now, &whole)?;
+    if later.is_empty() { id } else { carry(store, id, later, author)? }
+  };
+  store.flush()?;
+  ws.log("commit", &id)?;
+  if head != id {
+    ws.log("snapshot", &head)?;
+  }
+  let based = ws.base;
+  (ws.base, ws.head) = (Some(id), Some(head));
+  ws.save()?;
+  take_branch_along(store, ws, based)?;
+  Ok(Some(id))
+}
+
+/// The commits published here and not pushed, oldest first: since the ref's tip as this workspace
+/// last saw it, or, for one that never saw it, since the commit it was made at.
+pub fn pending(store: &mut Store, ws: &Workspace) -> Result<Vec<(Id, Commit)>> {
+  let until = ws.pushed.or(ws.start);
+  let mut chain = Vec::new();
+  let mut at = ws.base;
+  while let Some(id) = at.filter(|id| Some(*id) != until) {
+    let commit = Commit::load(store, &id)?;
+    at = commit.parents.first().copied();
+    chain.push((id, commit));
+    if chain.len() > 100_000 {
+      return Err("more than 100,000 commits since the ref: this workspace does not stand on it".to_string());
+    }
+  }
+  chain.reverse();
+  Ok(chain)
+}
+
+/// Make the commits not pushed again, as fewer: one new commit for each `(to, rest)`, of all that
+/// the commits up to and including `to` changed since the one before. Where each `to` is a
+/// checkpoint, each new commit is a state the conditions passed on. Commits after the last `to`
+/// are made again as they were, on top; what is recorded and not committed stays so. The files
+/// are not touched: the last commit has the same files as before.
+pub fn rebuild(store: &mut Store, ws: &mut Workspace, plan: &[(Id, Vec<u8>)], author: &str) -> Result<Vec<Id>> {
+  not_unheard(ws, "rebuilding the commits not pushed")?;
+  if crate::colocated::shared(&ws.root) {
+    return Err("rebuilding commits is not done beside Git: there, Git's own commands do it".to_string());
+  }
+  // What is not pushed has to have an end: the ref as last seen, or the commit the workspace was
+  // made at. Without either it is the whole history, and nothing is made again of that.
+  if ws.pushed.or(ws.start).is_none() {
+    return Err(
+      "this workspace has no ref it pushes to (`nv remote`), nor a commit it was made at: every commit it has would be made again. Nothing was changed".to_string(),
+    );
+  }
+  let chain = pending(store, ws)?;
+  if chain.is_empty() {
+    return Err("there are no commits here that are not pushed".to_string());
+  }
+  if let Some((id, _)) = chain.iter().find(|(_, c)| c.parents.len() > 1) {
+    return Err(format!("{} is a merge: a ref holds one line of commits, and so does a rebuild", &hex(id)[..12]));
+  }
+  // Each `to` among them, in order.
+  let mut ends = Vec::new();
+  let mut from = 0;
+  for (to, _) in plan {
+    let Some(at) = chain[from..].iter().position(|(id, _)| id == to) else {
+      return Err(if chain.iter().any(|(id, _)| id == to) {
+        format!("{} comes before the commit named before it: name them oldest first", &hex(to)[..12])
+      } else {
+        format!("{} is not one of the commits here that are not pushed (`nv pending` lists them)", &hex(to)[..12])
+      });
+    };
+    ends.push(from + at);
+    from += at + 1;
+  }
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let bottom = chain[0].1.parents.first().copied();
+  let mut on = bottom;
+  let mut made = Vec::new();
+  let next = |store: &mut Store, on: Option<Id>, upto: Id, rest: Vec<u8>| -> Result<Option<Id>> {
+    let whole = whole_since(store, Some(upto), bottom)?;
+    let (a, b) = (tree(store, on)?, tree(store, Some(upto))?);
+    let changes = crate::manifest::diff_keeping(store, a, b, &whole)?;
+    if changes.is_empty() {
+      return Ok(None);
+    }
+    let id = Commit { parents: on.into_iter().collect(), rest, changes }.store(store)?;
+    root_of(store, &id)?;
+    Ok(Some(id))
+  };
+  for ((_, rest), end) in plan.iter().zip(&ends) {
+    if let Some(id) = next(store, on, chain[*end].0, rest.clone())? {
+      made.push(id);
+      on = Some(id);
+    }
+  }
+  // After the last one named, the commits as they were.
+  for (id, commit) in &chain[ends.last().map_or(0, |e| e + 1)..] {
+    if let Some(again) = next(store, on, *id, commit.rest.clone())? {
+      made.push(again);
+      on = Some(again);
+    }
+  }
+  if tree(store, on)? != tree(store, ws.base)? {
+    return Err("the commits made again do not come to the same files: nothing was changed".to_string());
+  }
+  let head = if ws.head == ws.base {
+    on
+  } else {
+    let whole = whole_since(store, ws.head, ws.base)?;
+    let (a, b) = (tree(store, ws.base)?, tree(store, ws.head)?);
+    let later = crate::manifest::diff_keeping(store, a, b, &whole)?;
+    match (on, later.is_empty()) {
+      (Some(on), false) => Some(carry(store, on, later, author)?),
+      _ => on,
+    }
+  };
+  store.flush()?;
+  for id in &made {
+    ws.log("commit", id)?;
+  }
+  if head != on
+    && let Some(head) = head
+  {
+    ws.log("snapshot", &head)?;
+  }
+  let based = ws.base;
+  (ws.base, ws.head) = (on, head);
+  ws.save()?;
+  take_branch_along(store, ws, based)?;
+  Ok(made)
 }
 
 /// The directories set whole by the commits from `from` back to, and not
