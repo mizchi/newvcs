@@ -227,39 +227,8 @@ fn commit_named(store: &mut Store, ws: &Workspace, name: &str) -> Result<newvcs:
   }
 }
 
-/// Who a commit made here is by, and when, as Git would say it: the
-/// environment first, then the workspace's own `user.name` and `user.email`,
-/// then the user's Git configuration; the time now, in the zone this
-/// machine is in, unless the environment gives one.
 fn signature(ws: &Workspace, role: &str) -> Result<String> {
-  let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
-  let own =
-    |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
-  let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
-  let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| git::config_value(&ws.root, "user", "name"));
-  let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| git::config_value(&ws.root, "user", "email"));
-  // A commit is published under somebody's name. Git refuses to make one up, and so does this.
-  let (Some(name), Some(email)) = (name, email) else {
-    return Err(format!(
-      "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
-    ));
-  };
-  let when = match from_env("DATE") {
-    Some(date) => git::stamp(&date)
-      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
-    None => {
-      let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
-      let east = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let at: libc::time_t = now as libc::time_t;
-        libc::localtime_r(&at, &mut tm);
-        tm.tm_gmtoff
-      };
-      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
-    }
-  };
-  Ok(format!("{name} <{email}> {when}"))
+  workspace::signature(ws, role)
 }
 
 /// A path for a line of output: as it is, or, where it holds a newline, a quote or bytes
@@ -553,6 +522,13 @@ fn run(args: &[String]) -> Result<()> {
           println!("       {what} {}", String::from_utf8_lossy(path));
         }
       }
+      let unsettled = workspace::unsettled(&ws);
+      if !unsettled.is_empty() {
+        println!(
+          "still holding both versions, and so in none of the commits above: {}. Settled, they are committed as a checkpoint of their own; make it one with the commit it completes with `nv rebuild`",
+          unsettled.join(", ")
+        );
+      }
       if let Some(settled) = SETTLED.get() {
         println!("{settled}");
       }
@@ -586,7 +562,7 @@ fn run(args: &[String]) -> Result<()> {
           eprintln!("nv: commit {} ({git}) is of files the conditions have not passed on", n + 1);
         }
       }
-      println!("{before} commits not pushed made again as {}, in {:.0} ms; `nv pending` lists them", made.len(), ms(started));
+      println!("{} not pushed made again as {}, in {:.0} ms; `nv pending` lists them", counted(before, "commit"), made.len(), ms(started));
     }
     "restore" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
@@ -778,10 +754,19 @@ fn run(args: &[String]) -> Result<()> {
   Ok(())
 }
 
+/// `1 commit`, `2 commits`.
+fn counted(n: usize, what: &str) -> String {
+  if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
+}
+
 fn describe(s: &remote::Synced, root: &Path) -> String {
   let mut text = format!(
-    "caught up {} commits: {} files written, {} removed, {} contents fetched, {} changes outside the view left alone",
-    s.commits, s.written, s.removed, s.contents_fetched, s.outside_view
+    "caught up {}: {} files written, {} removed, {} contents fetched, {} changes outside the view left alone",
+    counted(s.commits, "commit"),
+    s.written,
+    s.removed,
+    s.contents_fetched,
+    s.outside_view
   );
   if s.merged > 0 {
     text.push_str(&format!("; {} files both sides changed were merged", s.merged));

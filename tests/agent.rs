@@ -1278,3 +1278,26 @@ fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
   assert_eq!(waited.matches("checkpoint: unit passed").count(), 1, "{waited}");
   ok(&dir, "$NV watch . --stop >/dev/null");
 }
+
+/// A checkpoint commit is signed as any commit made here is, and not under a name nv made up;
+/// with nobody to sign as, the state is not committed and the reason is said (round 2 of
+/// `eval/commit-agents`).
+#[test]
+fn a_checkpoint_commit_is_signed_by_whoever_the_workspace_says() {
+  let dir = workspace("checkpoint-signed");
+  ok(
+    &dir,
+    "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>|%cn <%ce>|%s'"), "A <a@example.com>|C <c@example.com>|checkpoint: unit passed");
+  let (code, said) = code_of(
+    &dir,
+    "echo 2 > two && env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL $NV checkpoint . 2>&1",
+  );
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("nobody to sign the commit as"), "{said}");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed", "nothing was committed");
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.ends_with("it was not committed: `nv checkpoint <dir>` says why"), "{waited}");
+}

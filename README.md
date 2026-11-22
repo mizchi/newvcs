@@ -541,7 +541,10 @@ each = true                 # commit every state all the conditions pass on
 
 With `each`, a state every condition passed on is committed there and
 then, under the drafted message or a provisional one (`checkpoint: unit
-passed`). The writer may have gone on writing while the conditions ran;
+passed`), signed as any commit made here is (the environment, the
+workspace's `user.name` and `user.email`, then Git's configuration; with
+none, the state is not committed and `nv checkpoint` says why). The writer
+may have gone on writing while the conditions ran;
 the commit is of the state they passed on, and what was written since stays
 recorded on top of it, uncommitted. These commits are meant to be made
 again before anyone else sees them:

@@ -1364,6 +1364,10 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 1, "{said}");
   assert!(said.contains("once the conditions pass on them they are committed") && said.contains("`nv rebuild`"), "{said}");
+  assert!(said.contains("caught up 1 commit:"), "{said}");
+  // Until it is settled, `nv pending` says the file is in none of the commits it lists.
+  let (_, said) = run("bob", "$NV pending .");
+  assert!(said.contains("still holding both versions, and so in none of the commits above: f.txt"), "{said}");
   // A range is refused in words that say what to use instead.
   let (code, said) = run("ann", "$NV git log HEAD~1..HEAD");
   assert_eq!(code, 125, "{said}");

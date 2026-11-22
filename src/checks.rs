@@ -287,7 +287,9 @@ pub fn commit_checkpoint(root: &Path, config: &Config, state: &Id, author: &str)
   let mut ws = Workspace::open(root)?;
   let mut store = Store::open(&ws.store)?;
   workspace::unfold(&mut store, &mut ws)?;
-  let rest = workspace::commit_rest(author, &message);
+  // Signed as any commit made here is: nv does not make a name up.
+  let signed = |role: &str| workspace::signature(&ws, role).map_err(|why| format!("not committed: {why}"));
+  let rest = format!("author {}\ncommitter {}\n\n{}\n", signed("AUTHOR")?, signed("COMMITTER")?, message.trim_end()).into_bytes();
   workspace::commit_state(&mut store, &mut ws, *state, rest, author)
 }
 
@@ -428,8 +430,11 @@ pub fn wait_settled(root: &Path) -> Result<String> {
     let watched = crate::watch::settle(root);
     let idle = runner_lock(root);
     let (head, base, tree) = {
-      let ws = Workspace::open(root)?;
+      // Held for the look only: snapshots `nv git` set aside are taken up again first.
+      let _held = workspace::lock(root)?;
+      let mut ws = Workspace::open(root)?;
       let mut store = Store::open(&ws.store)?;
+      workspace::unfold(&mut store, &mut ws)?;
       let tree = match ws.head {
         Some(head) => root_of(&mut store, &head)?,
         None => None,
@@ -441,17 +446,16 @@ pub fn wait_settled(root: &Path) -> Result<String> {
       if head == base {
         return Ok(format!("settled: what is recorded is committed{unrecorded}"));
       }
-      if !runs {
-        return Ok(format!(
-          "settled: changes are recorded that are not committed, and the conditions are not run on their own here (`auto`){unrecorded}"
-        ));
-      }
       let said = head
         .and_then(|h| std::fs::read_to_string(runs_dir(root).join(hex(&h))).ok())
         .or_else(|| tree.and_then(|t| std::fs::read_to_string(runs_dir(root).join(format!("tree-{}", hex(&t)))).ok()));
       if let Some(said) = said {
         let failed: Vec<&str> = said.lines().filter(|l| !l.ends_with(" Passed")).filter_map(|l| l.split(' ').next()).collect();
-        return Ok(if failed.is_empty() {
+        return Ok(if failed.is_empty() && config.as_ref().is_some_and(|c| c.commit_each) {
+          format!(
+            "settled: the conditions passed on what is recorded, and it was not committed: `nv checkpoint <dir>` says why{unrecorded}"
+          )
+        } else if failed.is_empty() {
           format!("settled: the conditions passed on what is recorded, which is not committed ([commit] each is off){unrecorded}")
         } else {
           format!(
@@ -459,6 +463,11 @@ pub fn wait_settled(root: &Path) -> Result<String> {
             failed.join(", ")
           )
         });
+      }
+      if !runs {
+        return Ok(format!(
+          "settled: changes are recorded that are not committed, and the conditions are not run on their own here (`auto`){unrecorded}"
+        ));
       }
       // Recorded, and no run has reached it: one is about to start, or none was started.
       drop(idle);

@@ -1948,9 +1948,39 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
   Ok(Some(id))
 }
 
-/// The header a commit made by nv itself carries: who, when, and the message.
-pub(crate) fn commit_rest(author: &str, message: &str) -> Vec<u8> {
-  rest_of(author, message)
+/// Who a commit made here is by, and when, as Git would say it: the
+/// environment first, then the workspace's own `user.name` and `user.email`,
+/// then the user's Git configuration; the time now, in the zone this
+/// machine is in, unless the environment gives one.
+pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
+  let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
+  let own =
+    |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
+  let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
+  let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| crate::git::config_value(&ws.root, "user", "name"));
+  let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| crate::git::config_value(&ws.root, "user", "email"));
+  // A commit is published under somebody's name. Git refuses to make one up, and so does this.
+  let (Some(name), Some(email)) = (name, email) else {
+    return Err(format!(
+      "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
+    ));
+  };
+  let when = match from_env("DATE") {
+    Some(date) => crate::git::stamp(&date)
+      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
+    None => {
+      let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
+      let east = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let at: libc::time_t = now as libc::time_t;
+        libc::localtime_r(&at, &mut tm);
+        tm.tm_gmtoff
+      };
+      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
+    }
+  };
+  Ok(format!("{name} <{email}> {when}"))
 }
 
 /// Publish a state recorded since the last commit, though the files have moved on: one commit on
