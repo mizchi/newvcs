@@ -415,6 +415,68 @@ pub fn run_until_still(root: &Path, config: &Config, author: &str) -> Result<Opt
   Ok(last)
 }
 
+/// Wait until nothing more is coming: the watcher has recorded every write made before this
+/// call, no run of the conditions is under way, and what is recorded is either committed or
+/// known not to have passed. Says which, in a line. Gives up at `limits::command()`.
+pub fn wait_settled(root: &Path) -> Result<String> {
+  let started = Instant::now();
+  let limit = crate::limits::command();
+  let config = load(root)?;
+  let runs = config.as_ref().is_some_and(|c| c.auto && !c.checks.is_empty());
+  let mut started_runner = false;
+  loop {
+    let watched = crate::watch::settle(root);
+    let idle = runner_lock(root);
+    let (head, base, tree) = {
+      let ws = Workspace::open(root)?;
+      let mut store = Store::open(&ws.store)?;
+      let tree = match ws.head {
+        Some(head) => root_of(&mut store, &head)?,
+        None => None,
+      };
+      (ws.head, ws.base, tree)
+    };
+    let unrecorded = if watched { "" } else { " (no watcher is running: writes since the last snapshot are not in this)" };
+    if idle.is_some() {
+      if head == base {
+        return Ok(format!("settled: what is recorded is committed{unrecorded}"));
+      }
+      if !runs {
+        return Ok(format!(
+          "settled: changes are recorded that are not committed, and the conditions are not run on their own here (`auto`){unrecorded}"
+        ));
+      }
+      let said = head
+        .and_then(|h| std::fs::read_to_string(runs_dir(root).join(hex(&h))).ok())
+        .or_else(|| tree.and_then(|t| std::fs::read_to_string(runs_dir(root).join(format!("tree-{}", hex(&t)))).ok()));
+      if let Some(said) = said {
+        let failed: Vec<&str> = said.lines().filter(|l| !l.ends_with(" Passed")).filter_map(|l| l.split(' ').next()).collect();
+        return Ok(if failed.is_empty() {
+          format!("settled: the conditions passed on what is recorded, which is not committed ([commit] each is off){unrecorded}")
+        } else {
+          format!(
+            "settled: what is recorded since the last commit did not pass ({} did not); it stays uncommitted{unrecorded}",
+            failed.join(", ")
+          )
+        });
+      }
+      // Recorded, and no run has reached it: one is about to start, or none was started.
+      drop(idle);
+      if !started_runner && started.elapsed() > Duration::from_secs(1) {
+        start_behind(root);
+        started_runner = true;
+      }
+    }
+    if limit.is_some_and(|limit| started.elapsed() >= limit) {
+      return Err(format!(
+        "waited {} s for the conditions to finish on what is recorded, and gave up (NV_TIMEOUT sets how long)",
+        started.elapsed().as_secs()
+      ));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
 /// Start a runner behind this command, if the workspace asks for one and none is running.
 pub fn start_behind(root: &Path) {
   use std::os::unix::process::CommandExt;

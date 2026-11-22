@@ -392,7 +392,12 @@ impl Repo {
       || Fail { code: 128, message: format!("fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.") };
     // Two dots between two names is a range; after a colon they are part of a path.
     if spec.split(':').next().is_some_and(|rev| rev.contains("..")) {
-      return unsupported(format_args!("{spec}` (a range of commits)"));
+      return Err(Fail {
+        code: UNSUPPORTED,
+        message: format!(
+          "nv: a range of commits (`{spec}`) is not supported here: name one commit, or see `nv pending` for what is not pushed"
+        ),
+      });
     }
     if spec.contains("@{") {
       return unsupported(format_args!("rev-parse {spec}` (where a ref was before)"));
@@ -1743,13 +1748,30 @@ fn long_status(repo: &mut Repo, lines: &[Line], untracked: &[Vec<u8>]) -> Res<St
   if unborn {
     text.push_str("\nNo commits yet\n\n");
   }
-  // Where the branch stands against the one it was cloned from.
-  if let (Some(branch), Some(ours)) = (repo.branch(), repo.ws.head)
+  // Where the branch stands against what it publishes to: the ref `nv remote` set, as this
+  // workspace last saw it, or else the branch it was cloned from.
+  let commits = |n: usize| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
+  if let (Some(ours), Some(url), Some(name)) = (repo.ws.base, repo.ws.remote.clone(), repo.ws.remote_ref.clone()) {
+    let theirs = repo.ws.pushed;
+    let (ahead, behind) = match theirs {
+      Some(theirs) => apart(&mut repo.store, ours, theirs)?,
+      None => (crate::workspace::pending(&mut repo.store, &repo.ws)?.len(), 0),
+    };
+    let there = format!("'{name}' at {url}");
+    text.push_str(&match (ahead, behind) {
+      (0, 0) => format!("Your branch is up to date with {there}, as last seen.\n"),
+      (ahead, 0) => format!("Your branch is ahead of {there} by {}, as last seen.\n  (use \"nv push\" to publish your local commits)\n", commits(ahead)),
+      (0, behind) => format!("Your branch is behind {there} by {}, as last seen.\n  (use \"nv sync\" to update your local branch)\n", commits(behind)),
+      (ahead, behind) => format!(
+        "Your branch and {there} have diverged, as last seen,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"nv sync\" to integrate the remote branch with yours)\n"
+      ),
+    });
+    text.push('\n');
+  } else if let (Some(branch), Some(ours)) = (repo.branch(), repo.ws.head)
     && repo.follows(&branch)
     && let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{branch}"))
   {
     let (ahead, behind) = apart(&mut repo.store, ours, theirs)?;
-    let commits = |n: usize| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
     text.push_str(&match (ahead, behind) {
       (0, 0) => format!("Your branch is up to date with 'origin/{branch}'.\n"),
       (ahead, 0) => format!("Your branch is ahead of 'origin/{branch}' by {}.\n  (use \"git push\" to publish your local commits)\n", commits(ahead)),

@@ -528,9 +528,48 @@ it prove nothing. Then nothing is named and nothing is kept, and the
 runner goes again. The workspace is held only to record and to name,
 never while a condition runs.
 
-Not done: the watcher does not start runs, only the hook does. A write
+With `auto = true` a watcher starts the runs too, after each snapshot that
+recorded something: a writer that only writes files needs neither a hook
+nor a command.
+
+#### A commit at every state that passes, made again before it is pushed
+
+```toml
+[commit]
+each = true                 # commit every state all the conditions pass on
+```
+
+With `each`, a state every condition passed on is committed there and
+then, under the drafted message or a provisional one (`checkpoint: unit
+passed`). The writer may have gone on writing while the conditions ran;
+the commit is of the state they passed on, and what was written since stays
+recorded on top of it, uncommitted. These commits are meant to be made
+again before anyone else sees them:
+
+- `nv pending <dir>` lists the commits not pushed, oldest first: number,
+  Git id and nv's, message, the conditions the files passed, and each path
+  as `A`, `M` or `D`. `--wait` first waits until nothing more is coming
+  (the watcher has recorded every write, no run is under way) and says
+  whether what is on disk is committed or did not pass.
+- `nv rebuild <dir> <commit> <message> [<commit> <message>...]` makes them
+  again as fewer commits: each new one ends at a `<commit>` (its number, or
+  the start of either id) and holds everything since the one before.
+  Where each `<commit>` passed, each new commit did, as results are kept by
+  the files' tree as well as by the state. The files are not touched. It
+  refuses where there is no end to what is not pushed (no ref and no commit
+  the workspace was made at), and while a push is unheard.
+
+`eval/commit-agents` runs this the way it is meant for: in each of several
+forks, a developer agent that never runs a version control command, and
+beside it a committer agent that waits for the work, remakes the commits
+and pushes, all to one ref. `rounds.md` there has what each round found.
+
+Not done: a write
 that lands after a runner's last look and before it ends waits for the
-next write to be run on. Conditions do not run in a copy, so a slow test
+next write to be run on. A sync's own commit on the ref's tip is not run
+on, and leaves out a file it left with both versions; the settling is
+committed after it as a checkpoint of its own, and the two are made into
+one with `nv rebuild`. Conditions do not run in a copy, so a slow test
 suite and a busy writer may never agree on a state. Nothing is shared
 with other workspaces yet: taking another writer's checkpoint in early,
 and running one's own conditions on the two together, is the next step.

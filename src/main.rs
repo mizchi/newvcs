@@ -35,15 +35,21 @@ nv: an experiment in keeping Git's object ids without Git's storage
         With `[commit] each = true` in nv.toml a state that passed them all
         is committed, there and then, under its drafted message or a
         provisional one, to be made again with `nv rebuild` before a push
-  nv pending <dir>
+  nv pending <dir> [--wait]
         The commits made here and not pushed, oldest first: each with its
-        number, id, message, the conditions its files passed, and its paths
+        number, its Git id and nv's, message, the conditions its files
+        passed, and its paths. With --wait, first wait until nothing more is
+        coming: the watcher has recorded every write, no run of the
+        conditions is under way, and what is on disk is committed or did not
+        pass; the last line says which
   nv rebuild <dir> <commit> <message> [<commit> <message>]...
         Make the commits not pushed again, as fewer: one new commit for each
         pair, of what the commits up to and including <commit> changed since
-        the one before, under <message>. Commits after the last one named are
-        made again as they were. Where each <commit> passed the conditions,
-        each new commit does. The files are not touched
+        the one before, under <message>. <commit> is its number in
+        `nv pending`, or the start of its Git id or nv's. Commits after the
+        last one named are made again as they were. Where each <commit>
+        passed the conditions, each new commit does; it is said where one
+        did not. The files are not touched
   nv watch <dir> [--start | --stop | --status]
         Stay, and snapshot whatever is written there by whatever writes it:
         the operating system reports the writes, so nothing has to. With
@@ -109,12 +115,20 @@ A <dir> may be the top of a workspace or any directory inside one. After
 `--` nothing is an option: nv commit <dir> -- '-a message that begins so'
   nv git <command> [<args>]
         The everyday Git commands, on an nv store (see tools/git-shim)
+
+Exit codes: 0 done; 1 done, and something is left to a person (a sync or a
+push that left files with both versions, conditions that did not pass for
+`nv commit` or `nv checkpoint`); 2 refused or failed, as the message says (a
+push the ref refused because it took changes to the same files: `nv sync`,
+then push again); 125 `nv git` does not speak what it was given.
 ";
 
 const AUTHOR: &str = "nv <nv@localhost>";
 
 /// The state the conditions passed on, when `nv commit` ran them before taking the workspace.
 static GATED: std::sync::OnceLock<newvcs::Id> = std::sync::OnceLock::new();
+/// What `nv pending --wait` found once it had waited, before taking the workspace.
+static SETTLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// What to put in `.claude/settings.json` so that every write a tool makes is recorded.
 const CLAUDE_HOOKS: &str = r#"{
@@ -177,6 +191,16 @@ fn opened(dir: &str) -> Result<(Workspace, Store)> {
   Ok((ws, store))
 }
 
+/// A commit's short Git id, and the conditions its files passed.
+fn described(store: &mut Store, root: &Path, id: &newvcs::Id) -> Result<(String, Vec<String>)> {
+  let git = newvcs::git::git_id_of(store, id).map(|oid| hex(&oid)[..7].to_string()).unwrap_or_else(|_| "-".repeat(7));
+  let passed = match newvcs::commit::root_of(store, id)? {
+    Some(tree) => newvcs::checks::passed_on_tree(root, &tree),
+    None => Vec::new(),
+  };
+  Ok((git, passed))
+}
+
 /// A commit not pushed, by its number in `nv pending` or the start of its id.
 fn commit_named(store: &mut Store, ws: &Workspace, name: &str) -> Result<newvcs::Id> {
   let chain = workspace::pending(store, ws)?;
@@ -188,7 +212,14 @@ fn commit_named(store: &mut Store, ws: &Workspace, name: &str) -> Result<newvcs:
       .map(|(id, _)| *id)
       .ok_or_else(|| format!("there is no commit {n} not pushed: `nv pending` lists them"));
   }
-  let found: Vec<&newvcs::Id> = chain.iter().map(|(id, _)| id).filter(|id| hex(*id).starts_with(&name.to_ascii_lowercase())).collect();
+  let wanted = name.to_ascii_lowercase();
+  let mut found: Vec<&newvcs::Id> = chain.iter().map(|(id, _)| id).filter(|id| hex(*id).starts_with(&wanted)).collect();
+  // Or by its Git id, as `nv git log` and `nv pending` show it.
+  for (id, _) in &chain {
+    if newvcs::git::git_id_of(store, id).is_ok_and(|oid| hex(&oid).starts_with(&wanted)) && !found.contains(&id) {
+      found.push(id);
+    }
+  }
   match found[..] {
     [one] if name.len() >= 6 => Ok(*one),
     [] => Err(format!("`{name}` is not a commit here that is not pushed: `nv pending` lists them")),
@@ -502,15 +533,28 @@ fn run(args: &[String]) -> Result<()> {
         let said = String::from_utf8_lossy(&commit.rest).into_owned();
         let message = said.split_once("\n\n").map_or("", |(_, m)| m).trim();
         let first = message.lines().next().unwrap_or_default();
-        let passed = match newvcs::commit::root_of(&mut store, id)? {
-          Some(tree) => newvcs::checks::passed_on_tree(&ws.root, &tree),
-          None => Vec::new(),
-        };
+        let (git, passed) = described(&mut store, &ws.root, id)?;
         let passed = if passed.is_empty() { "conditions not run on it".to_string() } else { format!("passed {}", passed.join(", ")) };
-        println!("{:>3}  {}  {first}  ({passed})", n + 1, &hex(id)[..12]);
+        println!("{:>3}  git {git}  nv {}  {first}  ({passed})", n + 1, &hex(id)[..12]);
+        let before = match commit.parents.first() {
+          Some(parent) => newvcs::commit::root_of(&mut store, parent)?,
+          None => None,
+        };
         for (path, entry) in &commit.changes {
-          println!("       {} {}", if entry.is_some() { "M" } else { "D" }, String::from_utf8_lossy(path));
+          let was = match before {
+            Some(root) => newvcs::manifest::lookup(&mut store, root, path)?.is_some(),
+            None => false,
+          };
+          let what = match (entry.is_some(), was) {
+            (true, false) => "A",
+            (true, true) => "M",
+            (false, _) => "D",
+          };
+          println!("       {what} {}", String::from_utf8_lossy(path));
         }
+      }
+      if let Some(settled) = SETTLED.get() {
+        println!("{settled}");
       }
     }
     "rebuild" => {
@@ -531,8 +575,16 @@ fn run(args: &[String]) -> Result<()> {
       }
       let before = workspace::pending(&mut store, &ws)?.len();
       let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
-      for id in &made {
-        println!("{}", hex(id));
+      let declared = newvcs::checks::load(&ws.root).ok().flatten().is_some_and(|c| !c.checks.is_empty());
+      for (n, id) in made.iter().enumerate() {
+        let (git, passed) = described(&mut store, &ws.root, id)?;
+        let first = String::from_utf8_lossy(&newvcs::commit::Commit::load(&mut store, id)?.rest)
+          .split_once("\n\n")
+          .map_or(String::new(), |(_, m)| m.lines().next().unwrap_or_default().to_string());
+        println!("{:>3}  git {git}  nv {}  {first}", n + 1, &hex(id)[..12]);
+        if declared && passed.is_empty() {
+          eprintln!("nv: commit {} ({git}) is of files the conditions have not passed on", n + 1);
+        }
       }
       println!("{before} commits not pushed made again as {}, in {:.0} ms; `nv pending` lists them", made.len(), ms(started));
     }
@@ -622,13 +674,24 @@ fn run(args: &[String]) -> Result<()> {
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
       }
+      let landed = done.updated + done.rebased;
+      if landed > 0 {
+        let tip = ws.pushed.map(|id| newvcs::git::git_id_of(&mut store, &id).map(|oid| hex(&oid)[..7].to_string()).unwrap_or_default());
+        println!(
+          "pushed {landed} {}: {} as they were, {} put on a newer tip; `{}` on {} is now at {}",
+          if landed == 1 { "commit" } else { "commits" },
+          done.updated,
+          done.rebased,
+          ws.remote_ref.as_deref().unwrap_or("?"),
+          ws.remote.as_deref().unwrap_or("?"),
+          tip.unwrap_or_default()
+        );
+      }
       println!(
-        "{} commits taken as they were, {} moved onto a newer tip, {} file contents sent, {} of linked directories not sent; {} in {:.0} ms",
-        done.updated,
-        done.rebased,
+        "{} file contents sent, {} of linked directories not sent; {} in {:.0} ms",
         done.contents_sent,
         done.adopted,
-        describe(&done.synced),
+        describe(&done.synced, &ws.root),
         ms(started)
       );
       if !done.synced.conflicts.is_empty() {
@@ -642,7 +705,7 @@ fn run(args: &[String]) -> Result<()> {
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
       }
-      println!("{} in {:.0} ms", describe(&done), ms(started));
+      println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
       // As `git pull` does: a sync that left something for a person does not look like one that did not.
       if !done.conflicts.is_empty() {
         std::process::exit(1);
@@ -715,7 +778,7 @@ fn run(args: &[String]) -> Result<()> {
   Ok(())
 }
 
-fn describe(s: &remote::Synced) -> String {
+fn describe(s: &remote::Synced, root: &Path) -> String {
   let mut text = format!(
     "caught up {} commits: {} files written, {} removed, {} contents fetched, {} changes outside the view left alone",
     s.commits, s.written, s.removed, s.contents_fetched, s.outside_view
@@ -725,8 +788,13 @@ fn describe(s: &remote::Synced) -> String {
   }
   if !s.conflicts.is_empty() {
     text.push_str(&format!(
-      "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers. Edit them, then `nv commit` and `nv push`.",
-      s.conflicts.join(", ")
+      "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers, and is left out of the commit put on the ref's tip. {}",
+      s.conflicts.join(", "),
+      if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
+        "Edit them: once the conditions pass on them they are committed, as a checkpoint. Make that part of your commit with `nv rebuild` (`nv pending` lists both), then `nv push`."
+      } else {
+        "Edit them, then `nv commit` and `nv push`."
+      }
     ));
   }
   if s.cancelled > 0 {
@@ -780,7 +848,7 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("snapshot", 1, 1, &["--recorded", "--tracked"]),
   ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
   ("checkpoint", 1, 1, &["--until-still"]),
-  ("pending", 1, 1, &[]),
+  ("pending", 1, 1, &["--wait"]),
   ("rebuild", 3, usize::MAX, &[]),
   ("watch", 1, 1, &["--start", "--stop", "--status"]),
   ("log", 1, 1, &[]),
@@ -973,6 +1041,22 @@ fn main() -> ExitCode {
         }
       },
       Ok(_) => {}
+    }
+  }
+  // Waiting for the watcher and the conditions is done before the workspace is held: both
+  // take it to record and to commit.
+  if args[0] == "pending"
+    && args.iter().any(|a| a == "--wait")
+    && let Some(top) = workspace::top_of(Path::new(&args[1]))
+  {
+    match newvcs::checks::wait_settled(&top) {
+      Ok(line) => {
+        let _ = SETTLED.set(line);
+      }
+      Err(why) => {
+        eprintln!("{why}");
+        return ExitCode::from(2);
+      }
     }
   }
   // One writer at a time in a workspace. A watcher takes the lock for each snapshot instead, not for as long as it runs.

@@ -1203,8 +1203,11 @@ fn each_checkpoint_is_committed_and_the_commits_are_made_again_fewer() {
   assert_eq!(pending.lines().filter(|l| l.contains("checkpoint: unit passed")).count(), 3, "{pending}");
   assert_eq!(pending.matches("(passed unit)").count(), 3, "{pending}");
   assert!(!pending.contains("broken"), "a state the conditions did not pass is not committed: {pending}");
-  // Made again as two: what came to pass first, then the rest.
-  let said = ok(&dir, "$NV rebuild . 2 'Add one and two' 3 'Add three' && $NV pending .");
+  assert!(pending.contains("A one") && !pending.contains("M one"), "a new file is added: {pending}");
+  // Each with the id `nv git` takes, and `nv rebuild` takes that as well.
+  let third = ok(&dir, "$NV git log -1 --format=%h");
+  assert!(pending.contains(&format!("git {third}")), "{third}: {pending}");
+  let said = ok(&dir, &format!("$NV rebuild . 2 'Add one and two' {third} 'Add three' && $NV pending ."));
   assert!(said.contains("1  ") && said.contains("Add one and two") && said.contains("Add three"), "{said}");
   assert_eq!(said.matches("(passed unit)").count(), 2, "each new commit ends where the conditions passed: {said}");
   assert_eq!(ok(&dir, "$NV git log --format=%s | head -3"), "Add three\nAdd one and two\nconditions");
@@ -1264,10 +1267,14 @@ fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
   );
   ok(&dir, "$NV watch . --start >/dev/null");
   ok(&dir, "echo 1 > one");
-  let waited = ok(
-    &dir,
-    "i=0; until $NV pending . 2>/dev/null | grep -q 'passed unit'; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done; $NV pending .",
-  );
+  // Waited for, the write is committed once it is said to be settled.
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.contains("checkpoint: unit passed") && waited.contains("A one"), "{waited}");
+  assert!(waited.ends_with("settled: what is recorded is committed"), "{waited}");
+  // A state that does not pass is settled as well, and said not to have passed.
+  ok(&dir, "echo x > broken");
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.contains("did not pass (unit did not)"), "{waited}");
+  assert_eq!(waited.matches("checkpoint: unit passed").count(), 1, "{waited}");
   ok(&dir, "$NV watch . --stop >/dev/null");
-  assert!(waited.contains("checkpoint: unit passed") && waited.contains("M one"), "{waited}");
 }

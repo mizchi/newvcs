@@ -429,8 +429,12 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     Some("conflict") => {
       heard();
       let paths: Vec<&str> = answer["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
+      let behind = answer["behind"]
+        .as_u64()
+        .map(|n| format!(" took {n} {} since this workspace last saw it, and", if n == 1 { "commit" } else { "commits" }))
+        .unwrap_or_default();
       return Err(format!(
-        "the ref has changes to the same paths: {}.\n`nv sync` brings them in and merges them with yours; then push again",
+        "the push was refused: the ref{behind} has changes to the same paths: {}.\n`nv sync` brings them in and merges them with yours; then push again",
         paths.join(", ")
       ));
     }

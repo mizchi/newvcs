@@ -1297,3 +1297,75 @@ fn work_after_a_push_that_landed_unheard_is_merged_on_what_that_push_left() {
     assert_eq!(bob.read("shared.txt").unwrap().lines().next(), Some(wanted), "round {round}");
   }
 }
+
+/// What a committer reads at each step says where the ref is and what to do next, in the words
+/// of the commands it is to use: round 1 of `eval/commit-agents` found each of these missing.
+#[test]
+fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-words");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/words-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src
+      printf 'one\ntwo\nthree\n' > f.txt
+      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} git clone -q src bob
+      {nv} remote ann {url} main && {nv} remote bob {url} main
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  // Ann starts the ref: the push says how many commits, which ref, and where it is now.
+  let (_, said) = run("ann", "sed -i 's/one/ann one/' f.txt && $NV commit . 'Ann edits one' >/dev/null && $NV push .");
+  let tip = run("ann", "$NV git log -1 --format=%h").1;
+  assert!(
+    said.contains(&format!("pushed 1 commit: 1 as they were, 0 put on a newer tip; `main` on {url} is now at {}", tip.trim())),
+    "{said}"
+  );
+  // Git's status speaks of the ref nv pushes to, not of the repository it was cloned from.
+  let (_, said) = run("ann", "$NV git status");
+  assert!(said.contains(&format!("Your branch is up to date with 'main' at {url}, as last seen.")), "{said}");
+  let (_, said) = run("ann", "echo four >> f.txt && $NV commit . 'Ann adds four' >/dev/null && $NV git status");
+  assert!(said.contains(&format!("Your branch is ahead of 'main' at {url} by 1 commit, as last seen.\n  (use \"nv push\"")), "{said}");
+  // Bob changed the same line: refused, with how far the ref went and what to do.
+  let (code, said) = run("bob", "sed -i 's/one/bob one/' f.txt && $NV commit . 'Bob edits one' >/dev/null && $NV push .");
+  assert_eq!(code, 2, "{said}");
+  assert!(
+    said.contains("the ref took 1 commit since this workspace last saw it") && said.contains("f.txt") && said.contains("`nv sync`"),
+    "{said}"
+  );
+  // The sync leaves both versions, and says how the settling becomes a commit where each
+  // passing state is committed by itself.
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("once the conditions pass on them they are committed") && said.contains("`nv rebuild`"), "{said}");
+  // A range is refused in words that say what to use instead.
+  let (code, said) = run("ann", "$NV git log HEAD~1..HEAD");
+  assert_eq!(code, 125, "{said}");
+  assert!(said.contains("a range of commits (`HEAD~1..HEAD`)") && said.contains("`nv pending`"), "{said}");
+}
