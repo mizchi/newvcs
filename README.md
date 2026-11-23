@@ -107,8 +107,8 @@ against the table before any of it runs:
 | `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
 | `status` | the long form, `--porcelain`, `--short` |
 | `log` | `--oneline` `--format=` `--pretty=format:` `--pretty=tformat:` `-n`, a revision; the default format. Placeholders: `%H %h %T %t %P %p %s %b %B %an %ae %at %cn %ce %ct %n %%` |
-| `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>` |
-| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, the working tree against the index, `--cached` |
+| `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>`; a commit kept to paths after `--` |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, the working tree against the index, `--cached`; each kept to paths after `--` |
 | `rev-parse` | a revision, `<rev>^{tree}`, `<rev>:<path>`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
 | `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags, by revision or `<rev>:<path>` |
 | `ls-tree` | `-r` `--name-only`, a revision or `<rev>:<path>`, one path (`dir/` lists what is in it) |
@@ -287,6 +287,11 @@ all of Git has it by keeping Git in the directory.
 - A merge stops for someone only where lines of text met. Where one side
   deleted a file the other changed, both added one of the same name, or the
   file is binary, it refuses and touches nothing.
+- Paths after `--` are names of files and directories, from where the
+  command is run. Git's patterns and magic (`'*.txt'`, `:(exclude)...`,
+  `:/`) are refused, as are paths given to `show` of a merge or a tag. As
+  in Git, `show` of a commit that changes nothing under them prints
+  nothing, and a move with one end outside them is the other end alone.
 - `diff` while a merge has conflicts is refused: Git shows both sides
   against the result, which is not spoken.
 - `.gitattributes` is read for line endings (`text`, `text=auto`,

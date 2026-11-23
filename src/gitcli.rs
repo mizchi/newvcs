@@ -647,8 +647,8 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
   ("commit", &["-q", "--quiet", "-a", "--all", "--allow-empty", "--amend", "--no-edit", "-m=", "-am=", "-qm=", "-qam=", "-aqm="]),
   ("status", &["--porcelain", "--short", "-s"]),
   ("log", &["--oneline", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "-n=", "-n#", "-#"]),
-  ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*", "--pretty=tformat:*"]),
-  ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged"]),
+  ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "--"]),
+  ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged", "--"]),
   ("rev-parse", &["--short", "--abbrev-ref", "--show-toplevel"]),
   ("cat-file", &["-t", "-p", "-e"]),
   ("ls-tree", &["-r", "--name-only"]),
@@ -2122,8 +2122,17 @@ fn pair_renames(mut changes: Vec<FileChange>) -> Vec<FileChange> {
 
 /// What changed between two commits' trees.
 fn between(repo: &mut Repo, from: Option<Id>, to: Option<Id>) -> Res<Vec<FileChange>> {
+  between_within(repo, from, to, None)
+}
+
+/// `between`, kept to the paths at or below `within` where it is given. As in Git, the paths
+/// are applied before moves are paired: a move with one end outside them is the other end alone.
+fn between_within(repo: &mut Repo, from: Option<Id>, to: Option<Id>, within: Option<&[Vec<u8>]>) -> Res<Vec<FileChange>> {
   let mut changes = Vec::new();
   for (path, entry) in diff(&mut repo.store, from, to)? {
+    if within.is_some_and(|within| !is_within(&path, within)) {
+      continue;
+    }
     let before = match from {
       Some(root) => lookup(&mut repo.store, root, &path)?.filter(|e| !e.is_dir()),
       None => None,
@@ -2136,12 +2145,21 @@ fn between(repo: &mut Repo, from: Option<Id>, to: Option<Id>) -> Res<Vec<FileCha
   Ok(pair_renames(changes))
 }
 
-/// The index against the last commit (`cached`), or the working tree against the index.
-fn on_disk(repo: &mut Repo, cached: bool) -> Res<Vec<FileChange>> {
+/// The index against the last commit (`cached`), or the working tree against the index; kept to
+/// the paths at or below `within` where it is given, and then looking at nothing but them.
+fn on_disk(repo: &mut Repo, cached: bool, within: Option<&[Vec<u8>]>) -> Res<Vec<FileChange>> {
   let mut changes = Vec::new();
-  // What is staged is in the index and needs no look at the files; what is not is among the files Git tracks.
-  let states = if cached { repo.states_at(false, &[])? } else { repo.states_of_tracked()? };
+  // What is staged is in the index and needs no look at the files; what is not is among the files
+  // Git tracks, or, given paths, among the files at them.
+  let states = match within {
+    _ if cached => repo.states_at(false, &[])?,
+    Some(within) => repo.states_at(false, within)?,
+    None => repo.states_of_tracked()?,
+  };
   for (path, state) in states {
+    if within.is_some_and(|within| !is_within(&path, within)) {
+      continue;
+    }
     let (old, new) = if cached {
       if state.staged().is_none() {
         continue;
@@ -2407,25 +2425,50 @@ fn rendered(args: &[&str], changes: &[FileChange]) -> Res<Vec<u8>> {
   })
 }
 
+/// Paths from the top of the tree, each a file or a directory.
+type Paths = Vec<Vec<u8>>;
+
+/// Whether `path` is one of `within` or below one (the empty path is everything).
+fn is_within(path: &[u8], within: &[Vec<u8>]) -> bool {
+  within.iter().any(|at| at.is_empty() || path == at.as_slice() || (path.starts_with(at) && path.get(at.len()) == Some(&b'/')))
+}
+
+/// What comes before `--` (the revisions) and, where there is one, the paths after it, from the
+/// top of the tree. A path is a name, of a file or a directory: Git's patterns and its magic
+/// (`*.txt`, `:(exclude)...`) are not spoken.
+fn revisions_and_paths<'a>(repo: &Repo, command: &str, args: &[&'a str]) -> Res<(Vec<&'a str>, Option<Paths>)> {
+  let Some(at) = args.iter().position(|a| *a == "--") else { return Ok((positional(command, args), None)) };
+  let mut paths = Vec::new();
+  for path in &args[at + 1..] {
+    if path.starts_with(':') || path.contains(['*', '?', '[']) {
+      return unsupported(format_args!("{command} -- {path}` (a pattern: paths here are names of files and directories"));
+    }
+    paths.push(repo.rooted(path));
+  }
+  Ok((positional(command, &args[..at]), Some(paths)))
+}
+
 fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let cached = has(args, "--cached") || has(args, "--staged");
   let root = |repo: &mut Repo, spec: &str| -> Res<Option<Id>> {
     let id = repo.resolve(spec)?;
     Ok(root_of(&mut repo.store, &id)?)
   };
-  let changes = match positional("diff", args)[..] {
+  let (revisions, within) = revisions_and_paths(&repo, "diff", args)?;
+  let within = within.as_deref();
+  let changes = match revisions[..] {
     [a, b] if !cached => {
       for named in [a, b] {
-        if repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(named))).exists() {
+        if within.is_none() && repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(named))).exists() {
           return unsupported(format_args!("diff {named}` (a name that is a revision and a file)"));
         }
       }
       let (from, to) = (root(&mut repo, a)?, root(&mut repo, b)?);
-      between(&mut repo, from, to)?
+      between_within(&mut repo, from, to, within)?
     }
     // With conflicts in the tree Git shows both sides against the result, which is not spoken.
     [] if !repo.unmerged().is_empty() => return unsupported("diff` while a merge has conflicts"),
-    [] => on_disk(&mut repo, cached)?,
+    [] => on_disk(&mut repo, cached, within)?,
     _ => return unsupported("diff` with this combination of revisions and paths"),
   };
   out(&rendered(args, &changes)?);
@@ -2433,11 +2476,15 @@ fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
 }
 
 fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
-  let spec = match positional("show", args)[..] {
+  let (revisions, within) = revisions_and_paths(&repo, "show", args)?;
+  let spec = match revisions[..] {
     [] => "HEAD",
     [spec] => spec,
     _ => return unsupported("show` of more than one thing"),
   };
+  if within.is_some() && (spec.contains(':') || spec.ends_with("^{tree}")) {
+    return unsupported("show` of a file or directory, kept to paths");
+  }
   // `<rev>:<path>` is the file as that commit has it.
   if spec.contains(':') {
     let id = repo.resolve_any(spec)?;
@@ -2453,7 +2500,28 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
     return unsupported("show` of a directory");
   }
   let named = repo.resolve_any(spec)?;
-  if repo.store.kind_of(&named)? == Some(Kind::Tag) {
+  let tag = repo.store.kind_of(&named)? == Some(Kind::Tag);
+  if within.is_some() && tag {
+    return unsupported("show` of a tag, kept to paths");
+  }
+  // Kept to paths, a commit that changes none of them is not shown at all, as Git leaves out a
+  // commit its paths prune.
+  let mut limited = None;
+  if let Some(within) = within.as_deref() {
+    let id = crate::git::peel(&mut repo.store, named)?;
+    let commit = Commit::load(&mut repo.store, &id)?;
+    if commit.parents.len() > 1 {
+      return unsupported("show` of a merge, kept to paths");
+    }
+    let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+    let (from, to) = (root(&mut repo.store, commit.parents.first().copied())?, root(&mut repo.store, Some(id))?);
+    let changes = between_within(&mut repo, from, to, Some(within))?;
+    if changes.is_empty() {
+      return Ok(0);
+    }
+    limited = Some(changes);
+  }
+  if tag {
     // The tag first, as Git writes one, then the commit it names.
     let bytes = repo.store.get(&named)?.ok_or_else(|| "a tag is missing from the store".to_string())?;
     let text = String::from_utf8_lossy(crate::git::tag_parts(&bytes)?.1).into_owned();
@@ -2495,9 +2563,14 @@ fn show(mut repo: Repo, args: &[&str]) -> Res<i32> {
     None => true,
     Some(format) => !format.is_empty() && !format_separates(args),
   };
-  let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
-  let (from, to) = (root(&mut repo.store, commit.parents.first().copied())?, root(&mut repo.store, Some(id))?);
-  let changes = between(&mut repo, from, to)?;
+  let changes = match limited {
+    Some(changes) => changes,
+    None => {
+      let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+      let (from, to) = (root(&mut repo.store, commit.parents.first().copied())?, root(&mut repo.store, Some(id))?);
+      between(&mut repo, from, to)?
+    }
+  };
   if !changes.is_empty() {
     if spaced {
       println!();

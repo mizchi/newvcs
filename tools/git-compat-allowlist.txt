@@ -34,3 +34,4 @@
 32-a-tenth-round.sh
 33-an-eleventh-round.sh
 34-merge-attributes.sh
+35-paths-of-show-and-diff.sh
