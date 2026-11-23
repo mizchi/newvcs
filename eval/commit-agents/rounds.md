@@ -149,20 +149,43 @@ The workers spent more than in round 4 (dev tokens +16%: 8, 8 and 5 tool calls a
 | 33 | `nv help rebuild` does not say the author's date is kept with the author | 1 | Not done |
 | 34 | `nv git show <rev> -- <path>`, `nv git diff A B [--] <path>` are refused (as in round 4) | 1 | Not done |
 
+## Round 6 (2026-11-23)
+
+The same tasks and seed, on nv at `df9750b` (the push and rebuild say more), and one question more
+in the committer's report: whether any commit seemed wrong to it.
+
+**What the ref came to**: four commits after the start, each passing; nothing provisional, no
+markers, every function exported; no push refused, two merged on the server. All three
+committers answered "none" to the new question. One developer put its imports above the comment
+in `__init__.py`; the union kept them there, the others' below it.
+
+**Slower than round 5** (makespan +18%, latency +23%, vcs tokens +10%). The committers looked at
+more: each read the diff of what landed, two ran the tests by hand after the push although the
+push said the conditions were running, and the new question asks them to judge every commit,
+which takes reading. Three pairs a round is also few: rounds 4 to 6 ran the same work at 85 to
+100 s.
+
+| # | Finding | Met by | Done |
+| --- | --- | ---: | --- |
+| 35 | `nv git show <rev> -- <path>`, `nv git diff A B [--] <path>` are refused, and they are how one checks what the server merged | 3 | Not done |
+| 36 | "for the server to merge … with" is printed where the server merged nothing: the contents go in case | 1 | Not done |
+| 37 | `--format=fuller`, `%ad`, `%cn`, `%cd` are refused, so a rebuild's committer cannot be checked; the refusal of `show --format=fuller` names `git log` | 1 | Not done |
+| 38 | "(yours: …)" does not say outright that the id pushed is gone | 2 | Not done |
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
 better. Tokens are above a baseline agent that does nothing (67,316 tokens).
 
-| | Round 1 | Round 2 | Round 3 | Round 4 | Round 5 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| makespan, s | 157.9 | 152.1 | 122.2 | 92.7 | 84.4 |
-| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 | 41.7 | 42.1 |
-| vcs tokens (committers) | 54,600 | 48,217 | 41,241 | 45,558 | 40,842 |
-| dev tokens (workers) | 18,404 | 18,966 | 19,269 | 18,378 | 21,361 |
-| vcs share | 74.8% | 71.8% | 68.2% | 71.3% | 65.7% |
-| vcs calls (committers' tool calls) | 47 | 37 | 32 | 34 | 32 |
-| refused pushes | 3 | 3 | 3 | 0 | 0 |
+| | Round 1 | Round 2 | Round 3 | Round 4 | Round 5 | Round 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| makespan, s | 157.9 | 152.1 | 122.2 | 92.7 | 84.4 | 99.9 |
+| latency (median, developer done to work on the ref), s | 101.1 | 74.0 | 55.5 | 41.7 | 42.1 | 52.0 |
+| vcs tokens (committers) | 54,600 | 48,217 | 41,241 | 45,558 | 40,842 | 44,931 |
+| dev tokens (workers) | 18,404 | 18,966 | 19,269 | 18,378 | 21,361 | 19,533 |
+| vcs share | 74.8% | 71.8% | 68.2% | 71.3% | 65.7% | 69.7% |
+| vcs calls (committers' tool calls) | 47 | 37 | 32 | 34 | 32 | 34 |
+| refused pushes | 3 | 3 | 3 | 0 | 0 | 0 |
 
 Against round 1, round 3 took 23% less time to the last push, 45% less latency, 24% fewer
 committer tokens and 32% fewer committer calls, for the same work and the same number of
