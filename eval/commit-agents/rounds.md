@@ -222,6 +222,25 @@ an agent where developers really clash (round 9), and its notes are only as good
 idea of a step. A committing agent still earns its place where the history needs judging: a review,
 not a restatement.
 
+## Round 11 (2026-11-23): round 10 again
+
+The same as round 10, on nv at `42378e3` with body.sh dropping trailers: was its tie with A one
+round's luck? No clash; no resolver; one note a task (task 3 as one commit with its README
+section).
+
+| | A (round 5) | round 11 |
+| --- | ---: | ---: |
+| makespan, s | 84.4 | 34.9 |
+| latency, s | 42.1 | 7.2 |
+| total tokens | 466,099 | 233,274 |
+| version control's tool calls | 32 | 3 hook calls (9,578 tokens) |
+| judge, boundary / message | 5.0 / 5.0 | 5.0 / 5.0 |
+
+The judge (X round 11, Y round 5) checked every test and README example against the code by hand,
+found no claim wrong in either, and preferred neither. Two rounds of C+D in its last form, judged
+against two different rounds of A with the labels both ways round, came out level with A each
+time, at half the tokens and a sixth of the latency.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
