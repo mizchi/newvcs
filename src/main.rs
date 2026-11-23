@@ -580,10 +580,12 @@ fn run(args: &[String]) -> Result<()> {
           let commit = newvcs::commit::Commit::load(&mut store, id)?;
           let said = String::from_utf8_lossy(&commit.rest).into_owned();
           let (head, message) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
+          // The summary line is the note; what follows it is written afresh each time, so that a
+          // publish run again (after a clash) does not give a commit its body twice.
           let subject = message.lines().next().unwrap_or_default().to_string();
           let change = newvcs::checks::change_between(&mut store, parent, id)?;
           let message = match newvcs::checks::write_body(&ws.root, &hook, id, &subject, &change) {
-            Ok(body) => format!("{}\n\n{body}", message.trim_end()),
+            Ok(body) => format!("{subject}\n\n{body}"),
             Err(why) => {
               eprintln!("nv: \"{subject}\" goes without a body: {why}");
               message.trim_end().to_string()
@@ -602,8 +604,22 @@ fn run(args: &[String]) -> Result<()> {
         match remote::push(&mut store, &mut ws, AUTHOR) {
           Ok(done) => break done,
           Err(why) if why.contains("has changes to the same paths") && tries < 3 => {
+            let subjects: Vec<String> = made
+              .iter()
+              .map(|id| newvcs::commit::Commit::load(&mut store, id).map(|c| message_of(&c).lines().next().unwrap_or_default().to_string()))
+              .collect::<Result<_>>()?;
             let synced = remote::sync(&mut store, &mut ws, AUTHOR)?;
             if !synced.conflicts.is_empty() {
+              // A commit that held nothing but files the sync left unsettled is gone from the
+              // tip: its line waits for the settling, as a note, not to be lost with it.
+              let left: Vec<String> = workspace::pending(&mut store, &ws)?
+                .iter()
+                .map(|(_, c)| message_of(c).lines().next().unwrap_or_default().to_string())
+                .collect();
+              let lost: Vec<&String> = subjects.iter().filter(|s| !left.contains(s)).collect();
+              if !lost.is_empty() {
+                newvcs::checks::note(&ws.root, &lost.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; "), AUTHOR)?;
+              }
               println!("{}", describe(&synced, &ws.root));
               eprintln!("nv: the commits are made, and not pushed: settle those files, then `nv publish` again");
               std::process::exit(1);

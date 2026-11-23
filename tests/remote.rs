@@ -1539,4 +1539,19 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   let (code, said) = run("$NV publish .");
   assert_eq!(code, 0, "{said}");
   assert!(said.contains("nothing to publish"), "{said}");
+  // A publish that stopped over a clash, and is run again once it is settled: the commit gets
+  // one body, about what it is now, not the one it got the first time as well.
+  sh(
+    &root,
+    &format!(
+      "{nv} git clone -q src other && {nv} remote other {url} main && cd other && {nv} sync . >/dev/null && echo theirs > a && {nv} commit . 'Theirs' >/dev/null && {nv} push . >/dev/null"
+    ),
+  );
+  run("echo mine > a && $NV note . 'Change a' && $NV checkpoint . >/dev/null");
+  let (code, said) = run("$NV publish .");
+  assert_eq!(code, 1, "{said}");
+  run("echo 'mine and theirs' > a && $NV checkpoint . >/dev/null");
+  let (code, said) = run("$NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("$NV git log -1 --format=%B").1, "Change a\n\nwhy Change a\n1\n\n", "{said}");
 }
