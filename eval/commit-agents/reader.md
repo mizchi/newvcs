@@ -1,6 +1,6 @@
 You are joining a project and have only its history: `{{REPO}}`, a bare Git repository. There
 is no working tree and nobody to ask. Use `git -C {{REPO}} ...` (log, show, diff, blame, grep on a
-revision); read as little as answers the questions, and say for each answer which commits it
+revision) and nothing outside it; read as little as answers the questions, and say for each answer which commits it
 rests on.
 
 Answer each question in a line or two. Where the history does not say, write "not recorded" and

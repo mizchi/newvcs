@@ -711,7 +711,7 @@ fn run(args: &[String]) -> Result<()> {
         }
         if let Some((_, under)) = workspace::moved_under(&ws).filter(|(moved, _)| moved == id) {
           println!(
-            "       its message was written before it was put on top of: {} (they change files it changes); what it says of them may not hold",
+            "       its message was written before it was put on top of: {} (they change files it changes); what it says of them may not hold. Read it: `nv rebuild` writes it again, or, given the same message, keeps it and says no more of it; a push does not wait on it",
             under.join("; ")
           );
         }
@@ -896,10 +896,14 @@ fn run(args: &[String]) -> Result<()> {
         (n, false) => format!(" (and {n} the server merged {} with)", done.merged_on_server.join(", ")),
         (n, true) => format!(" (and {n} in case the server had to merge {}: it did not)", done.stated_paths.join(", ")),
       };
+      // Contents of linked directories the server had already are said only where there are any.
+      let linked = match done.adopted {
+        0 => String::new(),
+        n => format!(", {n} of linked directories not sent"),
+      };
       println!(
-        "{} sent{for_merge}, {} of linked directories not sent; {} in {:.0} ms",
+        "{} sent{for_merge}{linked}; {} in {:.0} ms",
         counted(done.contents_sent, "file content"),
-        done.adopted,
         describe(&done.synced, &ws.root),
         ms(started)
       );
@@ -920,8 +924,17 @@ fn run(args: &[String]) -> Result<()> {
         eprintln!("nv: {done}");
       }
       println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
-      // Where the conditions run behind writes, they are run on what the sync made as well.
+      // Where the conditions run behind writes, they are run on what the sync made as well: where
+      // that is a commit of this workspace's put on a newer tip, the committer is told where to
+      // hear how they end, so as not to push what nothing ran on.
       newvcs::checks::start_behind(&ws.root);
+      if done.conflicts.is_empty() && done.commits > 0 && !workspace::pending(&mut store, &ws)?.is_empty() {
+        match newvcs::checks::load(&ws.root).ok().flatten().filter(|c| !c.checks.is_empty()) {
+          Some(c) if c.auto => println!("the conditions are run on what the sync made: `nv pending <dir> --wait` says how they end"),
+          Some(_) => println!("the conditions have not run on what the sync made: `nv checkpoint <dir>` runs them"),
+          None => {}
+        }
+      }
       // As `git pull` does: a sync that left something for a person does not look like one that did not.
       if !done.conflicts.is_empty() {
         std::process::exit(1);

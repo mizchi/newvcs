@@ -919,7 +919,9 @@ before:
   lines, and the second assignment wins. Where the conditions run behind
   writes (`auto`), they are run on what a sync or a push made, so that
   `nv pending` says whether the merged commit passes; a union that went
-  wrong is caught there, when the conditions look at it.
+  wrong is caught there, when the conditions look at it. A sync that put
+  a commit of the workspace's own on a newer tip says so, and where to hear
+  how they end; without `auto`, it says they have not run on it.
 - **The server merges such a list itself, and the push lands.** A push
   refused only over paths `merge=union` gives would cost its writer a sync
   and a second push, every writer after the first, every time. So a push

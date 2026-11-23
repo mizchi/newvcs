@@ -311,6 +311,47 @@ says the settling goes into the commit; `nv git -C <dir>` from outside a workspa
 the directory one is in; "for the server to merge … with" reads as if a merge happened where none
 did (three rounds now).
 
+## Round 15 (2026-11-23): made to clash, the moved message flagged
+
+Round 14 again (pattern A, `CONFLICT=1`), on nv at `879afb0`: a sync or push that puts a commit on
+top of other writers' commits changing the same files says so, and `nv pending` says it under the
+commit until a rebuild writes the message again. Two committers met the README clash (one twice)
+and settled it; both read the warning, judged that their message spoke only of their own change,
+and pushed without rebuilding.
+
+| | 14 (before) | 15 (after) |
+| --- | ---: | ---: |
+| makespan, s | 161.3 | 142.7 |
+| latency, s | 74.4 | 51.5 |
+| committers' tokens above the start | 56,815 | 50,794 |
+| committers' tool calls | 42 | 37 |
+| refused pushes | 3 | 3 |
+| judge, boundary | 5.0 | 4.67 |
+| judge, message | 4.67 | 5.0 |
+| judge prefers | 14, "the same would be nearly as fair" | |
+
+(Judged X round 14, Y round 15.) No message in round 15 said anything of what was there that was
+no longer so; the judge again took one point off round 14's "exported next to slugify". What it
+took off round 15 was code, not a message: the union merge had put the stats imports straight
+under the comment of `textkit/__init__.py` and left a blank line between them and wrap's, which a
+committer saw and left alone ("reordering lines in a union-merged file could make the next
+writer's merge messier"). The times are within what three pairs move.
+
+What the committers found:
+
+- The warning did not say whether it stops a push or how to be done with it; two wished to accept a
+  message as still true without a rebuild. It now says to read it, that `nv rebuild` writes the
+  message again (given the same one, keeps it and says no more), and that a push does not wait on
+  it.
+- After a clean sync, `nv pending` said "conditions not run on it", and one committer ran the tests
+  by hand before pushing. A sync that puts one's own commit on a newer tip now says that the
+  conditions are run on it and that `nv pending <dir> --wait` says how they end (without `auto`,
+  that they have not run).
+- "0 of linked directories not sent" in a push from a workspace with no links: said now only where
+  there are some.
+- Not done: `nv git show <rev> -- <path>`, `nv git diff <rev>` against the files, `nv since` that
+  prints nothing when nothing differs.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being

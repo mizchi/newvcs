@@ -1344,8 +1344,8 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   let (_, said) = run("ann", "sed -i 's/one/ann one/' f.txt && $NV commit . 'Ann edits one' >/dev/null && $NV push .");
   let tip = run("ann", "$NV git log -1 --format=%h").1;
   assert!(
-    said.contains("nothing else came from the ref") && !said.contains("0 files written"),
-    "a push that brought nothing says so: {said}"
+    said.contains("nothing else came from the ref") && !said.contains("0 files written") && !said.contains("linked directories"),
+    "a push that brought nothing, from a workspace of no links, says so and no more: {said}"
   );
   assert!(
     said.contains(&format!("pushed 1 commit: 1 as they were, 0 put on a newer tip; `main` on {url} is now at {}", tip.trim())),
@@ -1458,6 +1458,14 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
   assert_eq!(code, 0, "{said}");
   assert_eq!(read("ann", "list"), "start\ncat\nbob\nann\n");
   assert_eq!(run("ann", "$NV git log -1 --format=%H").1, run("cat", "$NV git log -1 --format=%H").1);
+  // Where the conditions run behind writes, a sync that puts a commit of one's own on a newer
+  // tip says that they are run on it, and where to hear how they end.
+  run("cat", "echo c > cat-only && $NV commit . 'Cat adds a file' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run("ann", "echo a > ann-only && $NV commit . 'Ann adds a file' >/dev/null && $NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("the conditions are run on what the sync made: `nv pending <dir> --wait` says how they end"), "{said}");
+  let (code, said) = run("ann", "$NV pending . --wait");
+  assert!(code == 0 && said.ends_with("passed unit\n"), "{said}");
   // A file without the attribute still clashes, and the push is refused as before.
   run("ann", "echo a2 >> plain && $NV commit . 'Ann edits plain' >/dev/null && $NV push .");
   let (code, said) = run("bob", "echo b2 >> plain && $NV commit . 'Bob edits plain' >/dev/null && $NV push .");
@@ -1631,7 +1639,9 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   // changes: what it says may not hold any more, and that is said until it is written again.
   assert!(said.contains("now on top of commits that change the same files: Add a"), "{said}");
   let moved = "its message was written before it was put on top of: Add a";
-  assert!(run("bob", "$NV pending .").1.contains(moved));
+  let said = run("bob", "$NV pending .").1;
+  // It is for the committer to read, not a stop: what to do of it is said, and that a push goes.
+  assert!(said.contains(moved) && said.contains("a push does not wait on it"), "{said}");
   // Settled, and committed as the conditions pass: one commit, whole, under its own message.
   let (code, said) = run("bob", "printf '# list\\n- ann\\n- bob\\n' > README.md && $NV checkpoint . >/dev/null && $NV pending .");
   assert_eq!(code, 0, "{said}");
@@ -1640,6 +1650,12 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   assert!(said.contains(moved), "the settling does not answer for the message: {said}");
   let (_, said) = run("bob", "$NV rebuild . 1 'Add b' >/dev/null && $NV pending .");
   assert!(!said.contains(moved), "a message written again is written on the new base: {said}");
+  // A sync that puts Bob's commit on a newer tip cleanly says that the conditions now run on it.
+  let (code, _) = run("ann", "echo z > z.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add z' >/dev/null && $NV push .");
+  assert_eq!(code, 0);
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("the conditions have not run on what the sync made: `nv checkpoint <dir>` runs them"), "{said}");
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("bob", "$NV git show --name-only --format=%s HEAD").1, "Add b\n\nREADME.md\nb.py\n");
