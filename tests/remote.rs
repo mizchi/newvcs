@@ -1432,7 +1432,7 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
     "{said}"
   );
   assert!(
-    said.contains("1 file content sent (and 2 for the server to merge list with)"),
+    said.contains("1 file content sent (and 2 the server merged list with)"),
     "what the base was, and the rules, are counted apart: {said}"
   );
   assert!(said.contains("caught up 1 commit:"), "Ann's, not Bob's own as it landed: {said}");

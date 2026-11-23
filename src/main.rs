@@ -380,9 +380,14 @@ fn run(args: &[String]) -> Result<()> {
         let (from, to) = (root(ws.base)?, root(ws.head)?);
         let unpublished = newvcs::manifest::diff(&mut store, from, to)?.len();
         if unpublished > 0 {
-          eprintln!(
-            "nv: {unpublished} paths are recorded and not yet published: `nv since <dir> base` lists them, `nv commit` publishes them"
-          );
+          // Where each state that passes is committed, that is what commits these, not a command.
+          let each = newvcs::checks::load(&ws.root).ok().flatten().is_some_and(|c| c.commit_each && !c.checks.is_empty());
+          let then = if each {
+            "they are committed as the conditions pass on them (`nv pending <dir> --wait` says when)"
+          } else {
+            "`nv commit` publishes them"
+          };
+          eprintln!("nv: {unpublished} paths are recorded and not yet published: `nv since <dir> base` lists them, {then}");
         }
       }
     }
@@ -861,10 +866,11 @@ fn run(args: &[String]) -> Result<()> {
       if !done.merged_on_server.is_empty() {
         println!("merged on the server (merge=union): {}", done.merged_on_server.join(", "));
       }
-      let for_merge = if done.sent_for_merge > 0 {
-        format!(" (and {} for the server to merge {} with)", done.sent_for_merge, done.stated_paths.join(", "))
-      } else {
-        String::new()
+      // Said as what came of them: merged with, or sent in case and not needed.
+      let for_merge = match (done.sent_for_merge, done.merged_on_server.is_empty()) {
+        (0, _) => String::new(),
+        (n, false) => format!(" (and {n} the server merged {} with)", done.merged_on_server.join(", ")),
+        (n, true) => format!(" (and {n} in case the server had to merge {}: it did not)", done.stated_paths.join(", ")),
       };
       println!(
         "{} sent{for_merge}, {} of linked directories not sent; {} in {:.0} ms",

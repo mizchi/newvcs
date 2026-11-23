@@ -1357,3 +1357,15 @@ fn a_note_names_the_next_commit_the_conditions_pass_on() {
   // A note is a line that says something.
   assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
 }
+
+/// Where every state that passes is committed (`[commit] each`), `nv status` says that is what
+/// commits what is recorded, not to run `nv commit` (round 14 of `eval/commit-agents`).
+#[test]
+fn status_says_what_commits_what_is_recorded() {
+  let dir = workspace("status-each");
+  let said = ok(&dir, "echo 1 >> a.txt && $NV snapshot . >/dev/null && $NV status . 2>&1");
+  assert!(said.contains("`nv commit` publishes them"), "{said}");
+  ok(&dir, "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml");
+  let said = ok(&dir, "$NV snapshot . >/dev/null && $NV status . 2>&1");
+  assert!(said.contains("committed as the conditions pass on them") && !said.contains("`nv commit` publishes them"), "{said}");
+}
