@@ -40,7 +40,9 @@ nv: an experiment in keeping Git's object ids without Git's storage
         one at each `nv note`, of everything since the one before (what
         came after the last note under --message, or with it), and push
         them. Where the ref took changes to the same files, catch up and
-        push again; where that leaves files with both versions, stop
+        push again; where that leaves files with both versions, stop.
+        With a `[body]` hook in nv.toml, each commit's body is what it
+        prints, given the change on stdin and the note in NV_SUBJECT
   nv note <dir> <line>
         Say in a line what was just done: the next commit the conditions
         pass on (`[commit] each`), of these files or later ones, is made
@@ -568,7 +570,30 @@ fn run(args: &[String]) -> Result<()> {
         }
         let _ = last_commit;
       }
-      let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
+      let mut made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
+      // A body for each from the `[body]` hook, given its summary line and its change; where the
+      // hook gives none, the commit goes without one, and that is said.
+      if let Some(hook) = newvcs::checks::load(&ws.root)?.and_then(|c| c.body) {
+        let mut again = Vec::new();
+        let mut parent = workspace::pending(&mut store, &ws)?.first().and_then(|(_, c)| c.parents.first().copied());
+        for id in &made {
+          let commit = newvcs::commit::Commit::load(&mut store, id)?;
+          let said = String::from_utf8_lossy(&commit.rest).into_owned();
+          let (head, message) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
+          let subject = message.lines().next().unwrap_or_default().to_string();
+          let change = newvcs::checks::change_between(&mut store, parent, id)?;
+          let message = match newvcs::checks::write_body(&ws.root, &hook, id, &subject, &change) {
+            Ok(body) => format!("{}\n\n{body}", message.trim_end()),
+            Err(why) => {
+              eprintln!("nv: \"{subject}\" goes without a body: {why}");
+              message.trim_end().to_string()
+            }
+          };
+          again.push((*id, format!("{head}\n\n{message}\n").into_bytes()));
+          parent = Some(*id);
+        }
+        made = workspace::rebuild(&mut store, &mut ws, &again, AUTHOR)?;
+      }
       // Pushed, and where the ref took changes to the same files meanwhile, caught up with and
       // pushed again, as long as catching up leaves nothing for a person.
       let mut tries = 0;

@@ -5,7 +5,7 @@ Your task: {{TASK}}
 How this project works:
 - Every file you write is recorded on its own, and the tests are run in the background after each
   write. You do no version control, with one exception: when you have finished a step that makes
-  sense by itself (a function together with its tests, a section of documentation), say what the
+  sense by itself (a function together with its tests, its export and what documents it), say what the
   step does in one line, as a commit's summary line would (imperative, under 70 characters):
   `{{BIN}}/nv note {{DIR}} "Add slugify for URL slugs"`. Run no other `nv` or `git` command.
 - Run the tests yourself whenever you like: `cd {{DIR}} && python3 -m unittest discover -q -s tests -t .`

@@ -59,6 +59,9 @@ pub struct Config {
   /// In the order they are run: each after those it waits for.
   pub checks: Vec<Check>,
   pub message: Option<Hook>,
+  /// What `nv publish` asks for the body of each commit it makes (`[body]`): the change on
+  /// stdin, the commit's summary line (its note) in `NV_SUBJECT`, the body on stdout.
+  pub body: Option<Hook>,
   /// Whether a recorded write starts a run behind it.
   pub auto: bool,
   /// Whether each state that passes every condition is committed then and there (`[commit]
@@ -167,6 +170,13 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
       timeout: seconds(item.get("timeout"), 120)?,
     }),
   };
+  let body = match doc.get("body") {
+    None => None,
+    Some(item) => Some(Hook {
+      run: item.get("run").and_then(|run| run.as_str()).ok_or_else(|| format!("{FILE}: `body` has no `run`"))?.to_string(),
+      timeout: seconds(item.get("timeout"), 120)?,
+    }),
+  };
   let auto = doc.get("auto").and_then(|auto| auto.as_bool()).unwrap_or(false);
   let commit_each = match doc.get("commit") {
     None => false,
@@ -175,7 +185,7 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
       Some(each) => each.as_bool().ok_or_else(|| format!("{FILE}: `each` of `commit` is true or false"))?,
     },
   };
-  Ok(Some(Config { checks: in_order(checks)?, message, auto, commit_each }))
+  Ok(Some(Config { checks: in_order(checks)?, message, body, auto, commit_each }))
 }
 
 /// Each condition after those it waits for, in the order declared otherwise.
@@ -428,8 +438,13 @@ pub fn passed_on(root: &Path, config: &Config, state: &Id) -> bool {
 /// The change from the workspace's last commit to `state`, as `git diff` writes one: what the
 /// message hook reads.
 pub fn change(store: &mut Store, ws: &Workspace, state: &Id) -> Result<Vec<u8>> {
+  change_between(store, ws.base, state)
+}
+
+/// The change from one commit or state to another, as `git diff` writes one.
+pub fn change_between(store: &mut Store, from: Option<Id>, state: &Id) -> Result<Vec<u8>> {
   let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
-  let (from, to) = (tree(store, ws.base)?, tree(store, Some(*state))?);
+  let (from, to) = (tree(store, from)?, tree(store, Some(*state))?);
   let mut out = Vec::new();
   let changes = crate::manifest::diff(store, from, to)?;
   for (path, entry) in crate::manifest::expand(store, from, &changes)? {
@@ -477,30 +492,43 @@ pub fn write_draft(root: &Path, hook: &Hook, state: &Id) -> Result<String> {
     let mut store = Store::open(&ws.store)?;
     change(&mut store, &ws, state)?
   };
+  let message = run_hook(root, hook, &hex(state), &change, &[("NV_STATE", &hex(state))], "message")?;
+  crate::write_whole(&draft_file(root, state), format!("{message}\n"))?;
+  Ok(message)
+}
+
+/// Have the body hook write the body of a commit `nv publish` makes: `change` on its stdin, the
+/// summary line in `NV_SUBJECT`.
+pub fn write_body(root: &Path, hook: &Hook, commit: &Id, subject: &str, change: &[u8]) -> Result<String> {
+  run_hook(root, hook, &hex(commit), change, &[("NV_SUBJECT", subject)], "body")
+}
+
+/// Run a hook on `input`, in the workspace, within its limit: what it printed, trimmed.
+fn run_hook(root: &Path, hook: &Hook, name: &str, input: &[u8], env: &[(&str, &str)], what: &str) -> Result<String> {
   let dir = runs_dir(root);
   std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-  let input = dir.join(format!("{}.change", hex(state)));
-  std::fs::write(&input, &change).map_err(|e| e.to_string())?;
-  let output = dir.join(format!("{}.drafting", hex(state)));
+  let (given, output) = (dir.join(format!("{name}.{what}-in")), dir.join(format!("{name}.{what}-out")));
+  std::fs::write(&given, input).map_err(|e| e.to_string())?;
   let mut command = std::process::Command::new("sh");
   command
     .arg("-c")
     .arg(&hook.run)
     .current_dir(root)
-    .env("NV_STATE", hex(state))
-    .stdin(std::fs::File::open(&input).map_err(|e| e.to_string())?)
+    .stdin(std::fs::File::open(&given).map_err(|e| e.to_string())?)
     .stdout(std::fs::File::create(&output).map_err(|e| e.to_string())?)
     .stderr(std::process::Stdio::null());
-  let status = crate::limits::run(&mut command, Some(hook.timeout), "the message hook");
-  let _ = std::fs::remove_file(&input);
-  let status = status?;
-  let message = std::fs::read_to_string(&output).unwrap_or_default().trim().to_string();
-  let _ = std::fs::remove_file(&output);
-  if !status.success() || message.is_empty() {
-    return Err(format!("the message hook gave no message (exit {})", status.code().unwrap_or(-1)));
+  for (key, value) in env {
+    command.env(key, value);
   }
-  crate::write_whole(&draft_file(root, state), format!("{message}\n"))?;
-  Ok(message)
+  let status = crate::limits::run(&mut command, Some(hook.timeout), &format!("the {what} hook"));
+  let _ = std::fs::remove_file(&given);
+  let status = status?;
+  let said = std::fs::read_to_string(&output).unwrap_or_default().trim().to_string();
+  let _ = std::fs::remove_file(&output);
+  if !status.success() || said.is_empty() {
+    return Err(format!("the {what} hook gave nothing (exit {})", status.code().unwrap_or(-1)));
+  }
+  Ok(said)
 }
 
 /// The lock the one runner of a workspace holds while it lives.

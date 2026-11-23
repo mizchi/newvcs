@@ -12,7 +12,7 @@ The tasks were: (1) add `textkit.slugify` in `textkit/slug.py`; (2) add `textkit
 textkit is for") were given; judge only the commits after them.
 
 In each history, read every commit after those two, with its full message and its diff
-(`cd <dir> && nv git log --reverse -p`, or `nv git show <id>`). Judge each commit as a reviewer
+(`cd <dir> && nv git log --oneline`, then `nv git show <id>` for each). Judge each commit as a reviewer
 who will maintain this code would:
 
 - **boundary** (1 to 5): it holds one change that makes sense by itself, with nothing of it

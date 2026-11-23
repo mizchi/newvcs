@@ -5,7 +5,8 @@
 #   eval/commit-agents/setup.sh /tmp/round1 http://localhost:8799 3
 set -eu
 work=$1; server=$2; tasks=$3
-nv=${NV:-$(cd "$(dirname "$0")/../.." && pwd)/target/fast/nv}
+here=$(cd "$(dirname "$0")" && pwd)
+nv=${NV:-$here/../../target/fast/nv}
 [ -x "$nv" ] || { echo "no nv at $nv (build with cargo build --profile fast)"; exit 2; }
 rm -rf "$work"; mkdir -p "$work/bin"
 # A copy: a build made while the round runs does not change what its agents use.
@@ -58,6 +59,10 @@ timeout = 60
 [commit]
 each = true                              # commit each state that passes; made again before a push
 TOML
+# BODY=1: `nv publish` asks a `claude -p` of no tools for each commit's body (pattern C+D).
+if [ -n "${BODY:-}" ]; then
+  printf '\n[body]\nrun = "NV_BODY_LOG=%s/body.log sh %s/body.sh"\ntimeout = 120\n' "$work" "$here" >> nv.toml
+fi
 printf '# textkit\n\nSmall text utilities.\n' > README.md
 git init -q -b main && git add -A && git commit -qm "Start textkit"
 cd ..

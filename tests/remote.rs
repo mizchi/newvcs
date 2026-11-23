@@ -1497,7 +1497,7 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
     &format!(
       r##"
       git init -q -b main src && cd src && echo start > a
-      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n' > nv.toml
+      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n\n[body]\nrun = "echo \\"why $NV_SUBJECT\\"; grep -c ^diff"\n' > nv.toml
       git add -A && git commit -q -m seed && cd ..
       {nv} git clone -q src ws && {nv} remote ws {url} main
       "##
@@ -1526,6 +1526,8 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("$NV git log --format=%s -3").1, "Add d\nAdd b and c\nseed\n", "{said}");
   assert_eq!(run("$NV git show --name-only --format= HEAD~1").1, "b\nc\n");
+  // A body for each, from the `[body]` hook, given the note and the change.
+  assert_eq!(run("$NV git log -1 --format=%B HEAD~1").1, "Add b and c\n\nwhy Add b and c\n2\n\n");
   assert!(run("$NV pending .").1.starts_with("nothing committed here that is not pushed"));
   // Without a message for what came after the last note, it goes with the note's commit.
   run("echo 4 > e && $NV note . 'Add e' && $NV checkpoint . >/dev/null && echo 5 > f && $NV checkpoint . >/dev/null");
