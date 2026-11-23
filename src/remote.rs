@@ -1198,6 +1198,10 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   }
   done.conflicts.sort();
   workspace::set_unsettled(ws, &done.conflicts)?;
+  // The commit of this workspace's own that the sync put on the tip without those files, if it
+  // has one: their settling goes into it (`commit_state`).
+  let own = Some(base) != Some(tip) && !done.conflicts.is_empty();
+  workspace::set_incomplete(ws, own.then_some(base), &done.conflicts)?;
   // A push that was not heard back from, found on the ref: the workspace knows now.
   if let Some((sent, last)) = workspace::unheard_push(ws)
     && let Some((own, _, count)) = own_landed

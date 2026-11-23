@@ -1367,7 +1367,7 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   // passing state is committed by itself.
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 1, "{said}");
-  assert!(said.contains("once the conditions pass on them they are committed") && said.contains("`nv rebuild`"), "{said}");
+  assert!(said.contains("once the conditions pass on them, they go into the commit of yours put on the tip"), "{said}");
   assert!(said.contains("caught up 1 commit:"), "{said}");
   // Until it is settled, `nv pending` says the file is in none of the commits it lists.
   let (_, said) = run("bob", "$NV pending .");
@@ -1554,4 +1554,77 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   let (code, said) = run("$NV publish .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("$NV git log -1 --format=%B").1, "Change a\n\nwhy Change a\n1\n\n", "{said}");
+}
+
+/// A sync leaves out of the workspace's own commit a file it leaves holding both versions; the
+/// settling, committed as a checkpoint, used to be a commit of its own, and the commit put on the
+/// tip stayed short of its change, under a message that said otherwise, and untested (round 12
+/// of `eval/commit-agents`). The settling goes into that commit now, while it is not pushed: the
+/// commit is whole again, under its message. Never into a commit that is not the workspace's.
+#[test]
+fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-into");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      printf '[checks.unit]\nrun = "! grep -q none README.md"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      for w in ann bob cat; do {nv} git clone -q src $w && {nv} remote $w {url} main; done
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  let (code, said) = run(
+    "ann",
+    "printf '# list\\n- ann\\n' > README.md && echo a > a.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add a' >/dev/null && $NV push .",
+  );
+  assert_eq!(code, 0, "{said}");
+  // Bob's commit holds b.py and his line of the list; the list clashes with Ann's.
+  let (code, said) = run(
+    "bob",
+    "printf '# list\\n- bob\\n' > README.md && echo b > b.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add b' >/dev/null && $NV push .",
+  );
+  assert_eq!(code, 2, "{said}");
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  // Settled, and committed as the conditions pass: one commit, whole, under its own message.
+  let (code, said) = run("bob", "printf '# list\\n- ann\\n- bob\\n' > README.md && $NV checkpoint . >/dev/null && $NV pending .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(said.matches("  git ").count(), 1, "the settling went into Bob's commit: {said}");
+  assert!(said.contains("Add b  (passed unit)") && said.contains("M README.md") && said.contains("A b.py"), "{said}");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format=%s HEAD").1, "Add b\n\nREADME.md\nb.py\n");
+  // Cat clashes with nothing of his own committed: what he settles is a commit of his, on the
+  // ref's tip, never a change to Bob's.
+  let (code, said) = run("cat", "printf '# list\\n- cat\\n' > README.md && $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  run("cat", "printf '# list\\n- ann\\n- bob\\n- cat\\n' > README.md && $NV checkpoint . >/dev/null");
+  assert_eq!(run("cat", "$NV git log --format=%s -2").1, "checkpoint: unit passed\nAdd b\n");
+  assert_eq!(run("cat", "$NV git show --name-only --format= HEAD~1").1, "README.md\nb.py\n", "Bob's commit is as he pushed it");
 }

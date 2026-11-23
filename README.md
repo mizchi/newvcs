@@ -575,9 +575,13 @@ and pushes, all to one ref. `rounds.md` there has what each round found.
 Not done: a write
 that lands after a runner's last look and before it ends waits for the
 next write to be run on. A sync's own commit on the ref's tip leaves out
-a file the sync left with both versions; the settling is committed after
-it as a checkpoint of its own, and the two are made into one with `nv
-rebuild`. Conditions do not run in a copy, so a slow test
+a file the sync left with both versions. Its settling, when the
+conditions pass on it and it changes nothing but those files, goes into
+that commit as long as it is the last made here and not pushed: the
+commit is whole again under its own message (a checkpoint's settling;
+`nv commit` of it is a commit of its own). Where the workspace had no
+commit of its own, the settling is one, on the ref's tip, never a change
+to another writer's. Conditions do not run in a copy, so a slow test
 suite and a busy writer may never agree on a state. Nothing is shared
 with other workspaces yet: taking another writer's checkpoint in early,
 and running one's own conditions on the two together, is the next step.

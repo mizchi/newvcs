@@ -23,8 +23,9 @@ Your job:
 4. Push with `nv push {{DIR}}`. If another developer pushed changes to the same files first,
    the push is refused: `nv sync {{DIR}}` merges theirs in. If the sync leaves a file with both
    versions between `<<<<<<<` and `>>>>>>>` markers, settle it (keep what both sides meant),
-   run the tests (`python3 -m unittest discover -q -s tests -t .` in `{{DIR}}`), commit the
-   result with a message saying it is a merge, and push again.
+   run the tests (`python3 -m unittest discover -q -s tests -t .` in `{{DIR}}`), and push again
+   once the settling is committed. The ref is one line of commits: your commit is put on top of
+   theirs, not merged with it, so its message says what it does, as before.
 5. Stop once your commits are on the ref (`nv git log` after a push shows them).
 
 End your answer with a report on using nv for this, as concrete as you can make it:

@@ -690,7 +690,7 @@ fn run(args: &[String]) -> Result<()> {
       let unsettled = workspace::unsettled(&ws);
       if !unsettled.is_empty() {
         println!(
-          "still holding both versions, and so in none of the commits above: {}. Settled, they are committed as a checkpoint of their own; make it one with the commit it completes with `nv rebuild`",
+          "still holding both versions, and so in none of the commits above: {}. Once they are settled and the conditions pass, they go into the last commit above, which they complete",
           unsettled.join(", ")
         );
       }
@@ -990,7 +990,7 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
       "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers, and is left out of the commit put on the ref's tip. {}",
       s.conflicts.join(", "),
       if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
-        "Edit them: once the conditions pass on them they are committed, as a checkpoint. Make that part of your commit with `nv rebuild` (`nv pending` lists both), then `nv push`."
+        "Edit them: once the conditions pass on them, they go into the commit of yours put on the tip, which they complete (where you have none, they are a commit of their own). Then `nv push`."
       } else {
         "Edit them, then `nv commit` and `nv push`."
       }

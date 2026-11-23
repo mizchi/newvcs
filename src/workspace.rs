@@ -2017,7 +2017,24 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
   if changes.is_empty() {
     return Ok(None);
   }
-  let id = Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?;
+  // The settling of files a sync left out of this workspace's own commit completes that commit,
+  // under its message: not a commit of its own after one that falls short of what it says.
+  let id = match incomplete(store, ws)? {
+    Some((short, paths)) if changes.iter().all(|(path, _)| paths.contains(path)) => {
+      let was = Commit::load(store, &short)?;
+      let mut whole = was.changes.clone();
+      for (path, entry) in changes {
+        match whole.iter_mut().find(|(p, _)| *p == path) {
+          Some(change) => change.1 = entry,
+          None => whole.push((path, entry)),
+        }
+      }
+      whole.sort_by(|a, b| a.0.cmp(&b.0));
+      let _ = std::fs::remove_file(incomplete_file(ws));
+      Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?
+    }
+    _ => Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?,
+  };
   root_of(store, &id)?;
   // What came after the state, recorded again on the new commit.
   let head = if Some(state) == ws.head {
@@ -2645,6 +2662,34 @@ pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look
 
 fn unsettled_file(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("conflicts")
+}
+
+fn incomplete_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("incomplete")
+}
+
+/// Note the commit of this workspace's own that a sync put on the ref's tip without the files it
+/// left holding both versions, and which they are: the commit their settling completes.
+pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String]) -> Result<()> {
+  match commit.filter(|_| !paths.is_empty()) {
+    Some(id) => crate::write_whole(&incomplete_file(ws), format!("{}\n{}\n", hex(&id), paths.join("\n"))),
+    None => {
+      let _ = std::fs::remove_file(incomplete_file(ws));
+      Ok(())
+    }
+  }
+}
+
+/// The commit a settling completes, and the paths it was left without, while that commit is
+/// still the last made here, not pushed, and no push of it may have landed unheard.
+fn incomplete(store: &mut Store, ws: &Workspace) -> Result<Option<(Id, Vec<Vec<u8>>)>> {
+  let Ok(text) = std::fs::read_to_string(incomplete_file(ws)) else { return Ok(None) };
+  let mut lines = text.lines();
+  let Some(id) = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok()) else { return Ok(None) };
+  if ws.base != Some(id) || unheard(ws).exists() || pending(store, ws)?.last().map(|(c, _)| *c) != Some(id) {
+    return Ok(None);
+  }
+  Ok(Some((id, lines.map(|l| l.as_bytes().to_vec()).collect())))
 }
 
 /// Note the files a sync left holding both versions between markers.
