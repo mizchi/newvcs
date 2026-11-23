@@ -108,7 +108,7 @@ against the table before any of it runs:
 | `status` | the long form, `--porcelain`, `--short` |
 | `log` | `--oneline` `--format=` `--pretty=format:` `--pretty=tformat:` `-n`, a revision; the default format. Placeholders: `%H %h %T %t %P %p %s %b %B %an %ae %at %cn %ce %ct %n %%` |
 | `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>`; a commit kept to paths after `--` |
-| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, the working tree against the index, `--cached`; each kept to paths after `--` |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--` |
 | `rev-parse` | a revision, `<rev>^{tree}`, `<rev>:<path>`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
 | `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags, by revision or `<rev>:<path>` |
 | `ls-tree` | `-r` `--name-only`, a revision or `<rev>:<path>`, one path (`dir/` lists what is in it) |
@@ -822,6 +822,14 @@ processor time: 205 ms of it for the 40 ms `status`, where one thread used
 62. Git's `status` here is with its defaults; with its untracked cache
 turned on a reviewer measured it at 21.5 ms, which nv does not match and
 has no equivalent of. `git diff` is level, not ahead.
+
+`git diff <rev>`, a commit against the files, looks at what `git diff`
+does and at the paths that differ between that commit and the last one.
+On oxc of 17,002 files on a Linux VM of four threads, one file edited,
+means of 20 runs: `diff HEAD` 20.4 ms, Git 16.3; `diff --stat HEAD~5`
+22.3 ms, Git 16.7; kept to `-- crates/oxc_parser`, 7.6 ms, Git 7.5. On
+that machine plain `git diff` is 23.2 ms against Git's 16.2: the gap is
+that of `git diff`, which the table above measured on another.
 
 ## Pushing at once
 

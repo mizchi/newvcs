@@ -84,7 +84,6 @@ fsck --lost-found
 checkout HEAD~1
 commit -m one -m two
 config core.editor vim
-diff HEAD
 log main side
 
 # Paths given to show and diff are names, a file or a directory: Git's patterns and magic are not.

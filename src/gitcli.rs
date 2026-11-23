@@ -2428,6 +2428,52 @@ fn rendered(args: &[&str], changes: &[FileChange]) -> Res<Vec<u8>> {
 /// Paths from the top of the tree, each a file or a directory.
 type Paths = Vec<Vec<u8>>;
 
+/// A commit's tree (`rev`) against the files as Git tracks them: what the index has, and where
+/// the file on disk is not that, the file (`cached`: the index alone). A file the index does not
+/// have is not among them, whatever is on disk. Only what differs from the last commit, and what
+/// differs between it and `rev`, is looked at; kept to `within` where it is given.
+fn against_files(repo: &mut Repo, rev: Option<Id>, cached: bool, within: Option<&[Vec<u8>]>) -> Res<Vec<FileChange>> {
+  let head = match repo.ws.head {
+    Some(head) => root_of(&mut repo.store, &head)?,
+    None => None,
+  };
+  let states = match within {
+    _ if cached => repo.states_at(false, &[])?,
+    Some(within) => repo.states_at(false, within)?,
+    None => repo.states_of_tracked()?,
+  };
+  let mut paths: std::collections::BTreeSet<Vec<u8>> = diff(&mut repo.store, rev, head)?.into_iter().map(|(path, _)| path).collect();
+  paths.extend(states.keys().cloned());
+  let mut changes = Vec::new();
+  for path in paths {
+    if within.is_some_and(|within| !is_within(&path, within)) {
+      continue;
+    }
+    let file = |store: &mut Store, root: Option<Id>| -> Res<Option<Entry>> {
+      Ok(match root {
+        Some(root) => lookup(store, root, &path)?.filter(|e| !e.is_dir()),
+        None => None,
+      })
+    };
+    let old = file(&mut repo.store, rev)?.map(|e| side_of(repo, e)).transpose()?;
+    let new = match states.get(&path) {
+      Some(state) if cached || state.index.is_none() || state.disk_is_index => state.index.map(|e| side_of(repo, e)).transpose()?,
+      Some(state) => state.disk.clone().map(|(mode, bytes)| Side { mode, oid: hex(&git_hash("blob", &bytes)), bytes }),
+      // Not among what differs from the last commit: as it has it.
+      None => file(&mut repo.store, head)?.map(|e| side_of(repo, e)).transpose()?,
+    };
+    let same = match (&old, &new) {
+      (Some(a), Some(b)) => a.oid == b.oid && a.mode == b.mode,
+      (None, None) => true,
+      _ => false,
+    };
+    if !same {
+      changes.push(FileChange { path, from: None, score: 0, old, new });
+    }
+  }
+  Ok(pair_renames(changes))
+}
+
 /// Whether `path` is one of `within` or below one (the empty path is everything).
 fn is_within(path: &[u8], within: &[Vec<u8>]) -> bool {
   within.iter().any(|at| at.is_empty() || path == at.as_slice() || (path.starts_with(at) && path.get(at.len()) == Some(&b'/')))
@@ -2467,7 +2513,15 @@ fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
       between_within(&mut repo, from, to, within)?
     }
     // With conflicts in the tree Git shows both sides against the result, which is not spoken.
-    [] if !repo.unmerged().is_empty() => return unsupported("diff` while a merge has conflicts"),
+    [] | [_] if !repo.unmerged().is_empty() => return unsupported("diff` while a merge has conflicts"),
+    // One revision: that commit against the files, or with `--cached` against the index.
+    [a] => {
+      if within.is_none() && repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(a))).exists() {
+        return unsupported(format_args!("diff {a}` (a name that is a revision or a file)"));
+      }
+      let rev = root(&mut repo, a)?;
+      against_files(&mut repo, rev, cached, within)?
+    }
     [] => on_disk(&mut repo, cached, within)?,
     _ => return unsupported("diff` with this combination of revisions and paths"),
   };
