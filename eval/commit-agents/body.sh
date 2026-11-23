@@ -15,5 +15,7 @@ if log:
     with open(log, "a") as f:
         keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         f.write(" ".join(str(u.get(k, 0)) for k in keys) + "\n")
-print(d.get("result", "").strip())
+# The body only: trailers a CLI adds of its own accord (attribution, a session) are not part of the body.
+body = [line for line in d.get("result", "").strip().splitlines() if not line.startswith(("Co-Authored-By:", "Claude-Session:", "Signed-off-by:"))]
+print("\n".join(body).strip())
 '
