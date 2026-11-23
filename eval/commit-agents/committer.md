@@ -33,3 +33,6 @@ End your answer with a report on using nv for this, as concrete as you can make 
    what it said, what you expected.
 3. What you had to work out by trial, and what you wished nv did or said.
 4. How long you spent waiting, and on what.
+5. Whether any commit seemed wrong to you: one you were given (a checkpoint), one you made, or
+   one as it landed on the ref (after a sync or the server's doing). What was wrong with it, and
+   what you did about it. Say "none" if none did.

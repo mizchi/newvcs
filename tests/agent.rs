@@ -1207,7 +1207,9 @@ fn each_checkpoint_is_committed_and_the_commits_are_made_again_fewer() {
   // Each with the id `nv git` takes, and `nv rebuild` takes that as well.
   let third = ok(&dir, "$NV git log -1 --format=%h");
   assert!(pending.contains(&format!("git {third}")), "{third}: {pending}");
-  let said = ok(&dir, &format!("$NV rebuild . 2 'Add one and two' {third} 'Add three' && $NV pending ."));
+  let made = ok(&dir, &format!("$NV rebuild . 2 'Add one and two' {third} 'Add three'"));
+  assert_eq!(made.matches("(passed unit)").count(), 2, "what it made, and what each passed: {made}");
+  let said = ok(&dir, "$NV pending .");
   assert!(said.contains("1  ") && said.contains("Add one and two") && said.contains("Add three"), "{said}");
   assert_eq!(said.matches("(passed unit)").count(), 2, "each new commit ends where the conditions passed: {said}");
   assert_eq!(ok(&dir, "$NV git log --format=%s | head -3"), "Add three\nAdd one and two\nconditions");

@@ -1344,6 +1344,10 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   let (_, said) = run("ann", "sed -i 's/one/ann one/' f.txt && $NV commit . 'Ann edits one' >/dev/null && $NV push .");
   let tip = run("ann", "$NV git log -1 --format=%h").1;
   assert!(
+    said.contains("nothing else came from the ref") && !said.contains("0 files written"),
+    "a push that brought nothing says so: {said}"
+  );
+  assert!(
     said.contains(&format!("pushed 1 commit: 1 as they were, 0 put on a newer tip; `main` on {url} is now at {}", tip.trim())),
     "{said}"
   );
@@ -1428,12 +1432,15 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
     "{said}"
   );
   assert!(
-    said.contains("1 file content sent (and 2 for the server to merge with)"),
+    said.contains("1 file content sent (and 2 for the server to merge list with)"),
     "what the base was, and the rules, are counted apart: {said}"
   );
+  assert!(said.contains("caught up 1 commit:"), "Ann's, not Bob's own as it landed: {said}");
+  assert!(said.contains("the conditions are run on what landed: `nv pending <dir> --wait` says how they end"), "{said}");
   assert_eq!(read("bob", "list"), "start\nbob\nann\n", "the workspace has what landed");
   let tip = run("bob", "$NV git log -1 --format=%h").1;
   assert!(said.contains(&format!("is now at {}", tip.trim())) && !tip.trim().is_empty(), "the push names the tip: {said}");
+  assert!(said.contains(&format!("1 put on a newer tip (yours: {})", tip.trim())), "and its own commits as they landed: {said}");
   let (_, said) = run("bob", "$NV pending . --wait");
   assert!(said.starts_with("nothing committed here that is not pushed"), "its own commit is known as landed: {said}");
   assert!(said.ends_with("settled: what is recorded is committed, and passed unit\n"), "what the server made is run on: {said}");

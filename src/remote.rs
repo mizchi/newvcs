@@ -315,15 +315,19 @@ pub struct Pushed {
   /// Contents sent for the server to merge with, beside those the commits name: what union
   /// paths were at the base, and the rules above them.
   pub sent_for_merge: usize,
+  /// The paths those were sent for.
+  pub stated_paths: Vec<String>,
+  /// This workspace's commits as they landed on the ref, oldest first.
+  pub landed: Vec<Id>,
   pub synced: Synced,
 }
 
 /// What a push states of the paths it changes that `.gitattributes` merges by union, read from
 /// the tree of the chain's base (not the files on disk, which the server cannot know): as JSON
 /// for the server, and the contents it names. `None` where there are none.
-fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String>, Vec<Id>)> {
-  let Some(base) = chain.first().and_then(|c| c.parents.first().copied()) else { return Ok((None, Vec::new())) };
-  let Some(root) = root_of(store, &base)? else { return Ok((None, Vec::new())) };
+fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String>, Vec<Id>, Vec<String>)> {
+  let Some(base) = chain.first().and_then(|c| c.parents.first().copied()) else { return Ok((None, Vec::new(), Vec::new())) };
+  let Some(root) = root_of(store, &base)? else { return Ok((None, Vec::new(), Vec::new())) };
   let mut paths: Vec<Vec<u8>> = chain
     .iter()
     .flat_map(|c| &c.changes)
@@ -373,9 +377,10 @@ fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String
     }
   }
   if union.is_empty() {
-    return Ok((None, Vec::new()));
+    return Ok((None, Vec::new(), Vec::new()));
   }
-  Ok((Some(serde_json::json!({ "union": union, "attributes": attributes }).to_string()), named))
+  let paths = union.iter().filter_map(|u| u["path"].as_str().map(str::to_string)).collect();
+  Ok((Some(serde_json::json!({ "union": union, "attributes": attributes }).to_string()), named, paths))
 }
 
 /// Send the workspace's published commits that the ref has not seen, and
@@ -451,7 +456,8 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   // Of the paths it changes that `.gitattributes` merges by union, as the chain's base has them:
   // what each was there, and the rules above it, so that the server can merge them if the ref
   // changed them too. Their contents go with the push.
-  let (stated, for_merge) = union_statement(store, &chain)?;
+  let (stated, for_merge, stated_paths) = union_statement(store, &chain)?;
+  done.stated_paths = stated_paths;
   let mut named: Vec<Id> = Vec::new();
   if let Some(stated) = &stated {
     frame(&mut body, stated.as_bytes());
@@ -531,7 +537,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
       return Err(format!("the server refused the push: {answer}"));
     }
   }
-  done.synced.commits += take_commits(store, &url, &answer)?;
+  // Its own commits as they landed: taken with the others', and not counted among them.
+  done.landed = answer["commits"].as_array().into_iter().flatten().filter_map(|id| id_of(id).ok()).collect();
+  let own_new = done.landed.iter().filter(|id| !store.contains(id)).count();
+  done.synced.commits += take_commits(store, &url, &answer)?.saturating_sub(own_new);
   let landed = id_of(&answer["commit"])?;
   // What the push landed as stands on where the ref was when the workspace last saw it.
   if let Err(why) = forward(store, seen_before, &landed) {

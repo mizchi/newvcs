@@ -50,8 +50,8 @@ nv: an experiment in keeping Git's object ids without Git's storage
         last one named are made again as they were. Where each <commit>
         passed the conditions, each new commit does; it is said where one
         did not. Each new commit keeps the author of the first commit it is
-        made of, as a squash in Git does; its committer is whoever runs
-        this. The files are not touched
+        made of, and when that was written, as a squash in Git does; its
+        committer is whoever runs this, now. The files are not touched
   nv watch <dir> [--start | --stop | --status]
         Stay, and snapshot whatever is written there by whatever writes it:
         the operating system reports the writes, so nothing has to. With
@@ -579,7 +579,8 @@ fn run(args: &[String]) -> Result<()> {
         let first = String::from_utf8_lossy(&newvcs::commit::Commit::load(&mut store, id)?.rest)
           .split_once("\n\n")
           .map_or(String::new(), |(_, m)| m.lines().next().unwrap_or_default().to_string());
-        println!("{:>3}  git {git}  nv {}  {first}", n + 1, &hex(id)[..12]);
+        let said = if passed.is_empty() { "conditions not run on it".to_string() } else { format!("passed {}", passed.join(", ")) };
+        println!("{:>3}  git {git}  nv {}  {first}  ({said})", n + 1, &hex(id)[..12]);
         if declared && passed.is_empty() {
           eprintln!("nv: commit {} ({git}) is of files the conditions have not passed on", n + 1);
         }
@@ -681,8 +682,22 @@ fn run(args: &[String]) -> Result<()> {
           Ok(oid) => hex(&oid)[..7].to_string(),
           Err(_) => format!("{} (nv's id)", &hex(&id)[..12]),
         });
+        // Where the server put them on a newer tip, they have ids of its making: named.
+        let yours = if done.rebased > 0 {
+          let ids: Vec<String> = done
+            .landed
+            .iter()
+            .map(|id| match newvcs::git::git_id_of(&mut store, id) {
+              Ok(oid) => hex(&oid)[..7].to_string(),
+              Err(_) => hex(id)[..12].to_string(),
+            })
+            .collect();
+          format!(" (yours: {})", ids.join(", "))
+        } else {
+          String::new()
+        };
         println!(
-          "pushed {landed} {}: {} as they were, {} put on a newer tip; `{}` on {} is now at {}",
+          "pushed {landed} {}: {} as they were, {} put on a newer tip{yours}; `{}` on {} is now at {}",
           if landed == 1 { "commit" } else { "commits" },
           done.updated,
           done.rebased,
@@ -694,8 +709,11 @@ fn run(args: &[String]) -> Result<()> {
       if !done.merged_on_server.is_empty() {
         println!("merged on the server (merge=union): {}", done.merged_on_server.join(", "));
       }
-      let for_merge =
-        if done.sent_for_merge > 0 { format!(" (and {} for the server to merge with)", done.sent_for_merge) } else { String::new() };
+      let for_merge = if done.sent_for_merge > 0 {
+        format!(" (and {} for the server to merge {} with)", done.sent_for_merge, done.stated_paths.join(", "))
+      } else {
+        String::new()
+      };
       println!(
         "{} sent{for_merge}, {} of linked directories not sent; {} in {:.0} ms",
         counted(done.contents_sent, "file content"),
@@ -705,6 +723,9 @@ fn run(args: &[String]) -> Result<()> {
       );
       // And on what the push left: the ref's tip, where the server put the commits on it.
       newvcs::checks::start_behind(&ws.root);
+      if done.rebased > 0 && newvcs::checks::load(&ws.root).ok().flatten().is_some_and(|c| c.auto && !c.checks.is_empty()) {
+        println!("the conditions are run on what landed: `nv pending <dir> --wait` says how they end");
+      }
       if !done.synced.conflicts.is_empty() {
         std::process::exit(1);
       }
@@ -797,6 +818,10 @@ fn counted(n: usize, what: &str) -> String {
 }
 
 fn describe(s: &remote::Synced, root: &Path) -> String {
+  let nothing = s.commits == 0 && s.written == 0 && s.removed == 0 && s.contents_fetched == 0 && s.outside_view == 0 && s.merged == 0;
+  if nothing && s.conflicts.is_empty() && s.cancelled == 0 && s.superseded == 0 && s.folded <= 1 && s.before.is_none() {
+    return "nothing else came from the ref".to_string();
+  }
   let mut text = format!(
     "caught up {}: {} files written, {} removed, {} contents fetched, {} changes outside the view left alone",
     counted(s.commits, "commit"),
