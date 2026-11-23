@@ -2031,7 +2031,13 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
       }
       whole.sort_by(|a, b| a.0.cmp(&b.0));
       let _ = std::fs::remove_file(incomplete_file(ws));
-      Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?
+      let made = Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?;
+      // The settling does not answer for the message: what was said of its base still stands.
+      if let Some((moved, under)) = moved_under(ws).filter(|(id, _)| *id == short) {
+        let _ = moved;
+        set_moved(ws, Some(made), &under)?;
+      }
+      made
     }
     _ => Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?,
   };
@@ -2167,6 +2173,8 @@ pub fn rebuild(store: &mut Store, ws: &mut Workspace, plan: &[(Id, Vec<u8>)], au
   (ws.base, ws.head) = (on, head);
   ws.save()?;
   take_branch_along(store, ws, based)?;
+  // Messages written again are written on the base the commits now stand on.
+  set_moved(ws, None, &[])?;
   Ok(made)
 }
 
@@ -2662,6 +2670,31 @@ pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look
 
 fn unsettled_file(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("conflicts")
+}
+
+fn moved_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("moved")
+}
+
+/// Note that this workspace's own commit was put on commits of others that change files it
+/// changes, and what those say of themselves: its message was written before them.
+pub(crate) fn set_moved(ws: &Workspace, commit: Option<Id>, under: &[String]) -> Result<()> {
+  match commit {
+    Some(id) => crate::write_whole(&moved_file(ws), format!("{}\n{}\n", hex(&id), under.join("\n"))),
+    None => {
+      let _ = std::fs::remove_file(moved_file(ws));
+      Ok(())
+    }
+  }
+}
+
+/// The commit whose message was written before the commits of others it now stands on, and those
+/// commits' summary lines.
+pub fn moved_under(ws: &Workspace) -> Option<(Id, Vec<String>)> {
+  let text = std::fs::read_to_string(moved_file(ws)).ok()?;
+  let mut lines = text.lines();
+  let id = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())?;
+  Some((id, lines.filter(|l| !l.is_empty()).map(str::to_string).collect()))
 }
 
 fn incomplete_file(ws: &Workspace) -> PathBuf {

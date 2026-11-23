@@ -205,6 +205,36 @@ fn opened(dir: &str) -> Result<(Workspace, Store)> {
   Ok((ws, store))
 }
 
+/// Write the body of each of these commits (not pushed, oldest first) with the `[body]` hook,
+/// under its summary line, of its change on the one before; where the hook gives none, the commit
+/// keeps what it had, and that is said. The commits made again.
+fn write_bodies(store: &mut Store, ws: &mut Workspace, hook: &newvcs::checks::Hook, ids: &[newvcs::Id]) -> Result<Vec<newvcs::Id>> {
+  let mut again = Vec::new();
+  let mut parent = match ids.first() {
+    Some(first) => newvcs::commit::Commit::load(store, first)?.parents.first().copied(),
+    None => return Ok(Vec::new()),
+  };
+  for id in ids {
+    let commit = newvcs::commit::Commit::load(store, id)?;
+    let said = String::from_utf8_lossy(&commit.rest).into_owned();
+    let (head, message) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
+    // The summary line is the note; what follows it is written afresh each time, so that a
+    // publish run again (after a clash) does not give a commit its body twice.
+    let subject = message.lines().next().unwrap_or_default().to_string();
+    let change = newvcs::checks::change_between(store, parent, id)?;
+    let message = match newvcs::checks::write_body(&ws.root, hook, id, &subject, &change) {
+      Ok(body) => format!("{subject}\n\n{body}"),
+      Err(why) => {
+        eprintln!("nv: \"{subject}\" goes without a body: {why}");
+        message.trim_end().to_string()
+      }
+    };
+    again.push((*id, format!("{head}\n\n{message}\n").into_bytes()));
+    parent = Some(*id);
+  }
+  workspace::rebuild(store, ws, &again, AUTHOR)
+}
+
 /// A commit's short Git id, and the conditions its files passed.
 fn described(store: &mut Store, root: &Path, id: &newvcs::Id) -> Result<(String, Vec<String>)> {
   let git = newvcs::git::git_id_of(store, id).map(|oid| hex(&oid)[..7].to_string()).unwrap_or_else(|_| "-".repeat(7));
@@ -576,30 +606,10 @@ fn run(args: &[String]) -> Result<()> {
         let _ = last_commit;
       }
       let mut made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
-      // A body for each from the `[body]` hook, given its summary line and its change; where the
-      // hook gives none, the commit goes without one, and that is said.
-      if let Some(hook) = newvcs::checks::load(&ws.root)?.and_then(|c| c.body) {
-        let mut again = Vec::new();
-        let mut parent = workspace::pending(&mut store, &ws)?.first().and_then(|(_, c)| c.parents.first().copied());
-        for id in &made {
-          let commit = newvcs::commit::Commit::load(&mut store, id)?;
-          let said = String::from_utf8_lossy(&commit.rest).into_owned();
-          let (head, message) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
-          // The summary line is the note; what follows it is written afresh each time, so that a
-          // publish run again (after a clash) does not give a commit its body twice.
-          let subject = message.lines().next().unwrap_or_default().to_string();
-          let change = newvcs::checks::change_between(&mut store, parent, id)?;
-          let message = match newvcs::checks::write_body(&ws.root, &hook, id, &subject, &change) {
-            Ok(body) => format!("{subject}\n\n{body}"),
-            Err(why) => {
-              eprintln!("nv: \"{subject}\" goes without a body: {why}");
-              message.trim_end().to_string()
-            }
-          };
-          again.push((*id, format!("{head}\n\n{message}\n").into_bytes()));
-          parent = Some(*id);
-        }
-        made = workspace::rebuild(&mut store, &mut ws, &again, AUTHOR)?;
+      // A body for each from the `[body]` hook, given its summary line and its change.
+      let hook = newvcs::checks::load(&ws.root)?.and_then(|c| c.body);
+      if let Some(hook) = &hook {
+        made = write_bodies(&mut store, &mut ws, hook, &made)?;
       }
       // Pushed, and where the ref took changes to the same files meanwhile, caught up with and
       // pushed again, as long as catching up leaves nothing for a person.
@@ -614,6 +624,14 @@ fn run(args: &[String]) -> Result<()> {
               .map(|id| newvcs::commit::Commit::load(&mut store, id).map(|c| message_of(&c).lines().next().unwrap_or_default().to_string()))
               .collect::<Result<_>>()?;
             let synced = remote::sync(&mut store, &mut ws, AUTHOR)?;
+            // Put on a newer tip, the commits' change is not what their bodies were written of:
+            // written again, of the change as it will land.
+            if synced.conflicts.is_empty()
+              && let Some(hook) = &hook
+            {
+              let now: Vec<newvcs::Id> = workspace::pending(&mut store, &ws)?.iter().map(|(id, _)| *id).collect();
+              made = write_bodies(&mut store, &mut ws, hook, &now)?;
+            }
             if !synced.conflicts.is_empty() {
               // A commit that held nothing but files the sync left unsettled is gone from the
               // tip: its line waits for the settling, as a note, not to be lost with it.
@@ -690,6 +708,12 @@ fn run(args: &[String]) -> Result<()> {
             (false, _) => "D",
           };
           println!("       {what} {}", String::from_utf8_lossy(path));
+        }
+        if let Some((_, under)) = workspace::moved_under(&ws).filter(|(moved, _)| moved == id) {
+          println!(
+            "       its message was written before it was put on top of: {} (they change files it changes); what it says of them may not hold",
+            under.join("; ")
+          );
         }
       }
       let unsettled = workspace::unsettled(&ws);
@@ -976,7 +1000,13 @@ fn counted(n: usize, what: &str) -> String {
 }
 
 fn describe(s: &remote::Synced, root: &Path) -> String {
-  let nothing = s.commits == 0 && s.written == 0 && s.removed == 0 && s.contents_fetched == 0 && s.outside_view == 0 && s.merged == 0;
+  let nothing = s.commits == 0
+    && s.written == 0
+    && s.removed == 0
+    && s.contents_fetched == 0
+    && s.outside_view == 0
+    && s.merged == 0
+    && s.moved_under.is_empty();
   if nothing && s.conflicts.is_empty() && s.cancelled == 0 && s.superseded == 0 && s.folded <= 1 && s.before.is_none() {
     return "nothing else came from the ref".to_string();
   }
@@ -990,6 +1020,12 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
   );
   if s.merged > 0 {
     text.push_str(&format!("; {} files both sides changed were merged", s.merged));
+  }
+  if !s.moved_under.is_empty() {
+    text.push_str(&format!(
+      "\nyour commit is now on top of commits that change the same files: {}. Its message was written before them: what it says of what was there may not hold (`nv rebuild` writes it again)",
+      s.moved_under.join("; ")
+    ));
   }
   if !s.conflicts.is_empty() {
     text.push_str(&format!(

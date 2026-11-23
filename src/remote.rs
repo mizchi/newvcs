@@ -580,6 +580,9 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Synced {
+  /// What the commits of others this workspace's own commit was put on, and that change files it
+  /// changes, say of themselves: its message was written before them.
+  pub moved_under: Vec<String>,
   pub commits: usize,
   pub written: usize,
   pub removed: usize,
@@ -1202,6 +1205,34 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // has one: their settling goes into it (`commit_state`).
   let own = Some(base) != Some(tip) && !done.conflicts.is_empty();
   workspace::set_incomplete(ws, own.then_some(base), &done.conflicts)?;
+  // A commit of this workspace's own put on commits of others that change files it changes: its
+  // message was written on another base, and what it says of what was there may not hold.
+  if Some(base) != standing.base {
+    let mut over: Vec<String> = Vec::new();
+    if Some(base) != Some(tip) {
+      let mine = Commit::load(store, &base)?;
+      // Its paths, and those the sync left out of it, which are its as well.
+      let paths: std::collections::HashSet<&[u8]> =
+        mine.changes.iter().map(|(p, _)| p.as_slice()).chain(done.conflicts.iter().map(|p| p.as_bytes())).collect();
+      let mut at = Some(tip);
+      let mut walked = 0;
+      while let Some(id) = at.filter(|id| Some(*id) != common) {
+        let theirs = Commit::load(store, &id)?;
+        if theirs.rest != mine.rest && theirs.changes.iter().any(|(p, _)| paths.contains(p.as_slice())) {
+          let said = String::from_utf8_lossy(&theirs.rest).into_owned();
+          over.push(said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or_default().to_string());
+        }
+        at = theirs.parents.first().copied();
+        walked += 1;
+        if walked > 100_000 {
+          break;
+        }
+      }
+      over.reverse();
+    }
+    workspace::set_moved(ws, (!over.is_empty()).then_some(base), &over)?;
+    done.moved_under = over;
+  }
   // A push that was not heard back from, found on the ref: the workspace knows now.
   if let Some((sent, last)) = workspace::unheard_push(ws)
     && let Some((own, _, count)) = own_landed

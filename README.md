@@ -566,6 +566,26 @@ again before anyone else sees them:
   the files' tree as well as by the state. The files are not touched. It
   refuses where there is no end to what is not pushed (no ref and no commit
   the workspace was made at), and while a push is unheard.
+- `nv note <dir> <line>` says what the next step was: the next commit the
+  conditions pass on is made under that line, and where the runner has
+  committed those files already under a message of its own, that commit
+  is renamed. A writer that notes each step it finishes has said where
+  commits end without ever committing.
+- `nv publish <dir> [--message <line>]` waits as `nv pending --wait` does,
+  makes the commits again with one ending at each note (what came after
+  the last, under `--message`), and pushes. A `[body]` hook
+  (`run = "..."`, the change on stdin, the summary line in `NV_SUBJECT`)
+  is asked for each commit's body. Where the push is refused over files
+  the ref changed meanwhile, it catches up, writes every body again of
+  the change as it now lands, and pushes again; where catching up leaves
+  a file with both versions, it stops with exit 1 and says so, and the
+  note of a commit the files held is kept for when they are settled.
+
+A commit's message is written of what was there when it was made. When a
+sync or a push puts it on top of other writers' commits that change the
+same files, `nv sync`, `nv push` and `nv pending` name those commits and
+say that what the message says of what was there may not hold, until
+`nv rebuild` (or `nv publish`, which rebuilds) writes it again.
 
 `eval/commit-agents` runs this the way it is meant for: in each of several
 forks, a developer agent that never runs a version control command, and

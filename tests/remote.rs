@@ -1497,7 +1497,8 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
     &format!(
       r##"
       git init -q -b main src && cd src && echo start > a
-      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n\n[body]\nrun = "echo \\"why $NV_SUBJECT\\"; grep -c ^diff"\n' > nv.toml
+      printf '1\n2\n3\n' > lines
+      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n\n[body]\nrun = "[ -z \\"$NV_BODIES\\" ] || echo \\"$NV_SUBJECT\\" >> \\"$NV_BODIES\\"; echo \\"why $NV_SUBJECT\\"; grep -c ^diff"\n' > nv.toml
       git add -A && git commit -q -m seed && cd ..
       {nv} git clone -q src ws && {nv} remote ws {url} main
       "##
@@ -1554,6 +1555,20 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   let (code, said) = run("$NV publish .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("$NV git log -1 --format=%B").1, "Change a\n\nwhy Change a\n1\n\n", "{said}");
+  // A publish whose push the ref refused and whose sync merged by itself writes the body again,
+  // of the change as it lands on the new tip: a body of the old base would say what may no
+  // longer hold.
+  sh(
+    &root,
+    &format!(
+      "cd other && {nv} sync . >/dev/null && printf 'x\\n2\\n3\\n' > lines && {nv} commit . 'Their lines' >/dev/null && {nv} push . >/dev/null"
+    ),
+  );
+  run("printf '1\\n2\\nmine\\n' > lines && $NV note . 'Add lines' && $NV checkpoint . >/dev/null");
+  let (code, said) = run("NV_BODIES=bodies.log $NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("ws/bodies.log")).unwrap().lines().filter(|l| *l == "Add lines").count(), 2, "{said}");
+  assert_eq!(run("cat lines").1, "x\n2\nmine\n");
 }
 
 /// A sync leaves out of the workspace's own commit a file it leaves holding both versions; the
@@ -1612,11 +1627,19 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   assert_eq!(code, 2, "{said}");
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 1, "{said}");
+  // Bob's message was written before his commit was put on Ann's, which changes a file it
+  // changes: what it says may not hold any more, and that is said until it is written again.
+  assert!(said.contains("now on top of commits that change the same files: Add a"), "{said}");
+  let moved = "its message was written before it was put on top of: Add a";
+  assert!(run("bob", "$NV pending .").1.contains(moved));
   // Settled, and committed as the conditions pass: one commit, whole, under its own message.
   let (code, said) = run("bob", "printf '# list\\n- ann\\n- bob\\n' > README.md && $NV checkpoint . >/dev/null && $NV pending .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(said.matches("  git ").count(), 1, "the settling went into Bob's commit: {said}");
   assert!(said.contains("Add b  (passed unit)") && said.contains("M README.md") && said.contains("A b.py"), "{said}");
+  assert!(said.contains(moved), "the settling does not answer for the message: {said}");
+  let (_, said) = run("bob", "$NV rebuild . 1 'Add b' >/dev/null && $NV pending .");
+  assert!(!said.contains(moved), "a message written again is written on the new base: {said}");
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("bob", "$NV git show --name-only --format=%s HEAD").1, "Add b\n\nREADME.md\nb.py\n");
