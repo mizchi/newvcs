@@ -117,6 +117,8 @@ fn a_state_can_be_named_and_the_name_gone_back_to() {
   ok(&dir, "$NV restore . green");
   assert_eq!(files(&dir), "./a.txt=a2 ./b.txt=b1 ./c.txt=c1 ./d/x.txt=x1");
   assert_eq!(ok(&dir, "$NV since . green"), "");
+  // The list is empty, and that it is empty is said, apart from it: a list is still a list to count.
+  assert_eq!(code_of(&dir, "$NV since . green"), (0, "nothing differs from green\n".to_string()));
   // A name moves when it is given again.
   ok(&dir, "echo a5 > a.txt && $NV mark . green && echo a6 > a.txt && $NV restore . green");
   assert_eq!(ok(&dir, "cat a.txt"), "a5");

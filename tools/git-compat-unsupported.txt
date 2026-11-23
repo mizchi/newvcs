@@ -50,7 +50,6 @@ commit --no-verify -m skip
 add -p
 add -u
 add -f a.txt
-rm --cached a.txt
 reset --keep
 reset --merge
 restore --source=HEAD~1 a.txt

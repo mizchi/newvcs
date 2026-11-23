@@ -101,7 +101,7 @@ against the table before any of it runs:
 | `init` | `-q` `-b <branch>` |
 | `clone`, `fetch`, `pull`, `push` | `-q`; `pull --ff-only`, `--no-rebase`; `push` of the branch one is on, to the branch of its name on `origin`. A Git repository on this machine only |
 | `add` | `-A`, paths |
-| `rm`, `mv` | `rm -r -q -f` |
+| `rm`, `mv` | `rm -r -q -f --cached` (the file stays on disk, where Git then does not track it) |
 | `restore` | `--staged`, paths |
 | `reset` | `--soft` `--mixed` `--hard` `-q`, a revision or paths |
 | `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |

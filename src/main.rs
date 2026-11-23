@@ -82,7 +82,8 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Record what is on disk and name that state, e.g. `green`. A name
         given before moves to the new state
   nv since <dir> <state> [--recorded]
-        The paths that differ between a recorded state and the files now.
+        The paths that differ between a recorded state and the files now,
+        one to a line; where none do, the list is empty and stderr says so.
         With --recorded these three look only at the paths given to
         `nv record` (and at what a restore would overwrite), not at the tree
   nv hook claude
@@ -814,8 +815,13 @@ fn run(args: &[String]) -> Result<()> {
     "since" => {
       let (ws, mut store) = opened(arg(1)?)?;
       let state = workspace::state_named(&mut store, &ws, arg(2)?)?;
-      for (path, what) in workspace::since(&mut store, &ws, state, look(3))? {
-        println!("{what} {}", shown(&path));
+      let differs = workspace::since(&mut store, &ws, state, look(3))?;
+      for (path, what) in &differs {
+        println!("{what} {}", shown(path));
+      }
+      // The list stays a list to count; that it is empty is said beside it.
+      if differs.is_empty() {
+        eprintln!("nothing differs from {}", arg(2)?);
       }
     }
     "agent-init" if arg(1)? == "claude" => println!("{CLAUDE_HOOKS}"),

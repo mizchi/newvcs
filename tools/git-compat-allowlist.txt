@@ -36,3 +36,4 @@
 34-merge-attributes.sh
 35-paths-of-show-and-diff.sh
 36-diff-a-revision-against-the-files.sh
+37-rm-cached.sh

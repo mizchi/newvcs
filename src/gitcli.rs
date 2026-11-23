@@ -110,6 +110,22 @@ impl State {
   }
 }
 
+/// The mode and bytes of a file at `path`, if a file (or a link) is there and can be read.
+fn on_disk_as_is(root: &Path, path: &[u8]) -> Option<(u32, std::sync::Arc<Vec<u8>>)> {
+  use std::os::unix::fs::PermissionsExt;
+  let full = root.join(std::ffi::OsStr::from_bytes(path));
+  let meta = std::fs::symlink_metadata(&full).ok()?;
+  if meta.file_type().is_symlink() {
+    let target = std::fs::read_link(&full).ok()?;
+    return Some((MODE_LINK, std::sync::Arc::new(target.as_os_str().as_bytes().to_vec())));
+  }
+  if !meta.is_file() {
+    return None;
+  }
+  let mode = if meta.permissions().mode() & 0o111 != 0 { 0o100755 } else { 0o100644 };
+  Some((mode, std::sync::Arc::new(std::fs::read(&full).ok()?)))
+}
+
 struct Repo {
   ws: Workspace,
   store: Store,
@@ -515,7 +531,16 @@ impl Repo {
     // Where it does not, but the index does.
     for (path, entry) in staged {
       let head = index.get(&path).map(|known| known.entry);
-      states.entry(path).or_insert(State { head, index: entry, disk: None, disk_is_index: head == entry, unmerged: false });
+      if states.contains_key(&path) {
+        continue;
+      }
+      // Taken out of the index (`rm --cached`) and still on disk as the commit has it: a file
+      // Git does not track, unless its rules leave it out.
+      let disk = match (head, entry) {
+        (Some(_), None) if !crate::ignore::is_ignored(&self.ws.root, &path) => on_disk_as_is(&self.ws.root, &path),
+        _ => None,
+      };
+      states.insert(path, State { head, index: entry, disk, disk_is_index: head == entry, unmerged: false });
     }
     // Unmerged whatever the file now holds, until it is added.
     for path in unmerged {
@@ -640,7 +665,7 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
   ("init", &["-q", "--quiet", "-b=", "--initial-branch=", "--initial-branch=*"]),
   ("clone", &["-q", "--quiet"]),
   ("add", &["-A", "--all", "--"]),
-  ("rm", &["-r", "-q", "--quiet", "-f", "--force", "--"]),
+  ("rm", &["-r", "-q", "--quiet", "-f", "--force", "--cached", "--"]),
   ("mv", &[]),
   ("restore", &["--staged", "--"]),
   ("reset", &["-q", "--quiet", "--hard", "--soft", "--mixed", "--"]),
@@ -1214,7 +1239,26 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
     }
     doomed.extend(files.into_iter().cloned());
   }
-  if !has(args, "-f") && !has(args, "--force") {
+  // With `--cached` the file stays where it is, and only the index forgets it.
+  let cached = has(args, "--cached");
+  if cached && !has(args, "-f") && !has(args, "--force") {
+    // What is staged is lost only where it is in neither the file nor the last commit.
+    let changed: Vec<String> = doomed
+      .iter()
+      .filter(|p| states.get(*p).is_some_and(|s| !s.unmerged && s.staged().is_some() && s.unstaged().is_some()))
+      .map(|p| String::from_utf8_lossy(p).into_owned())
+      .collect();
+    if !changed.is_empty() {
+      return fatal(
+        1,
+        format!(
+          "error: the following file has staged content different from both the\nfile and the HEAD:\n    {}\n(use -f to force removal)",
+          changed.join("\n    ")
+        ),
+      );
+    }
+  }
+  if !cached && !has(args, "-f") && !has(args, "--force") {
     // Git will not throw away what is in neither the last commit nor, for the file's edits, the index.
     let changed: Vec<String> = doomed
       .iter()
@@ -1240,6 +1284,17 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
   let index = repo.ws.load_index();
   for path in &doomed {
     let full = repo.ws.root.join(std::ffi::OsStr::from_bytes(path));
+    if cached {
+      if index.get(path).is_some() {
+        staged.insert(path.clone(), None);
+      } else {
+        staged.remove(path);
+      }
+      if !quiet(args) {
+        out(&[b"rm '".as_slice(), path, b"'\n"].concat());
+      }
+      continue;
+    }
     let _ = std::fs::remove_file(&full);
     // Directories this empties go too, as with Git: except the one the command was run in,
     // which is someone's place to stand.
@@ -1663,7 +1718,14 @@ struct Line {
 fn status_lines(repo: &mut Repo) -> Res<(Vec<Line>, Vec<Vec<u8>>)> {
   let states = repo.states()?;
   // What Git has in its index: the files of HEAD and what was added.
+  // A file of HEAD's the index no longer has is not among them: those are few, and looked for
+  // only where there are some.
+  let dropped: std::collections::HashSet<&[u8]> =
+    states.iter().filter(|(_, s)| s.head.is_some() && s.index.is_none()).map(|(p, _)| p.as_slice()).collect();
   let mut tracked: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).collect();
+  if !dropped.is_empty() {
+    tracked.retain(|p| !dropped.contains(p.as_slice()));
+  }
   tracked.extend(states.iter().filter(|(_, s)| s.index.is_some()).map(|(p, _)| p.clone()));
   let holds_tracked = |dir: &[u8]| tracked.iter().any(|p| p.len() > dir.len() && p.starts_with(dir) && p[dir.len()] == b'/');
   let mut lines: Vec<Line> = Vec::new();

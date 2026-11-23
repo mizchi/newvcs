@@ -65,7 +65,7 @@ what they were for; none ran a version control command.
 | 12 | Checkpoint commits are signed `nv <nv@localhost>`, a name nv made up; after `nv rebuild` they are the committer's | 1 | Signed as any commit is; with nobody to sign as, not committed |
 | 13 | After a sync, the commit it put on the tip has lost the unsettled file and keeps its message: nothing in `nv pending` says so | 2 | `nv pending` says which files are in none of its commits until settled |
 | 14 | "1 commits" in `nv rebuild` and in a sync's summary | 3 | Done |
-| 15 | `nv since` with nothing different prints nothing | 2 | Left: it prints paths, as `git diff --name-status` does |
+| 15 | `nv since` with nothing different prints nothing | 2 | Left: it prints paths, as `git diff --name-status` does. Met again in round 15: the list stays empty, and stderr says "nothing differs from <state>" |
 | 16 | The task says "commit the result with a message saying it is a merge"; there is no merge commit to make | 2 | The prompt's wording; left so the rounds compare |
 | 17 | A refused push does not say whose commit it clashed with | 1 | Left: the client has not got that commit yet |
 
