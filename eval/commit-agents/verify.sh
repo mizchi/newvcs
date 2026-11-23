@@ -33,4 +33,18 @@ print(" ".join(n for n in names if not hasattr(pkg, n) or (listed is not None an
 PY
 )
 echo "exports missing at the tip: ${missing:-none}"
+# Where the README lists the functions (CONFLICT=1), every one is listed and the placeholder is gone.
+if grep -q '^## Functions' verify/README.md; then
+  unlisted=$(cd verify && python3 - <<'PY'
+import ast, pathlib
+names = [n.name for f in sorted(pathlib.Path("textkit").glob("*.py")) if f.name != "__init__.py"
+         for n in ast.parse(f.read_text()).body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")]
+readme = pathlib.Path("README.md").read_text()
+section = readme.split("## Functions", 1)[1].split("\n## ", 1)[0]
+missing = [n for n in names if n not in section] + (["(none yet)"] if "(none yet)" in section else [])
+print(" ".join(missing))
+PY
+)
+  echo "functions missing from the README: ${unlisted:-none}"
+fi
 echo "files at the tip: $(cd verify && find . -type f -not -path "./.nv/*" -not -path "*/__pycache__/*" | sort | tr "\n" " ")"

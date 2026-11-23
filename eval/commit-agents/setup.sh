@@ -64,6 +64,11 @@ if [ -n "${BODY:-}" ]; then
   printf '\n[body]\nrun = "NV_BODY_LOG=%s/body.log sh %s/body.sh"\ntimeout = 120\n' "$work" "$here" >> nv.toml
 fi
 printf '# textkit\n\nSmall text utilities.\n' > README.md
+# CONFLICT=1: one line every task is told to replace, in a file that is not a union: the second
+# and third writers to push meet a clash nothing can settle without judgment.
+if [ -n "${CONFLICT:-}" ]; then
+  printf '\n## Functions\n\n- (none yet)\n' >> README.md
+fi
 git init -q -b main && git add -A && git commit -qm "Start textkit"
 cd ..
 

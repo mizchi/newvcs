@@ -62,7 +62,10 @@ def gates(round_dir, tasks):
     commits, passing, provisional, markers = map(int, found.groups())
     exports = re.search(r"exports missing at the tip: (.*)", text)
     exports = exports.group(1).strip() if exports else "none"
+    listed = re.search(r"functions missing from the README: (.*)", text)
+    listed = listed.group(1).strip() if listed else "none"
     return {
+        f"every function in the README's list ({'all' if listed == 'none' else 'missing ' + listed})": listed == "none",
         f"every function exported ({'all' if exports == 'none' else 'missing ' + exports})": exports == "none",
         f"every commit passes its tests ({passing} of {commits})": passing == commits,
         f"no provisional message pushed ({provisional})": provisional == 0,
