@@ -281,6 +281,36 @@ merged by the server and nothing is refused (rounds 4 to 11); `nv publish` folds
 the noted commit and writes its body once (rounds 9 and 13); changes to different paths are put on
 the tip by the server; and now a checkpoint completes the commit the sync left short.
 
+## Round 14 (2026-11-23): made to clash, with the fix
+
+Round 12 again (pattern A, `CONFLICT=1`), on nv at `6c89a8d` and with the committer prompt that
+no longer asks for a merge message. Both committers who met the clash settled the README and
+pushed: the settling went into their commits by itself, and neither rebuilt to fold it in.
+
+| | 12 (before) | 14 (after) |
+| --- | ---: | ---: |
+| makespan, s | 134.6 | 161.3 |
+| latency, s | 60.8 | 74.4 |
+| committers' tokens above the start | 61,073 | 56,815 |
+| committers' tool calls | 46 | 42 |
+| judge, boundary | 5.0 | 5.0 |
+| judge, message | 3.0 | 4.67 |
+| judge prefers | | 14 |
+
+(Judged X round 14, Y round 12; this judge rated round 12's messages 3.0 where round 13's judge had
+given them 3.67.) The time went up with one committer refused twice, at 161 s; three pairs a round
+move that much. What the judge took off in round 14 was one phrase: wrap "exported next to
+slugify", written before word_count and reading_time landed between them. A committer in the same
+round found the same in its own body ("textkit had no functions yet", false once slugify landed)
+and reworded it. The story a message tells can go stale when the commit is put on a newer tip,
+and nothing says so; `nv publish` writes its bodies at publishing, from the change as it lands,
+which is why round 13's did not.
+
+Not done, from this round: `nv status` still says "`nv commit` publishes them" while `nv pending`
+says the settling goes into the commit; `nv git -C <dir>` from outside a workspace runs the Git of
+the directory one is in; "for the server to merge … with" reads as if a merge happened where none
+did (three rounds now).
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
