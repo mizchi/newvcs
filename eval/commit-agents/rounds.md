@@ -172,6 +172,56 @@ which takes reading. Three pairs a round is also few: rounds 4 to 6 ran the same
 | 37 | `--format=fuller`, `%ad`, `%cn`, `%cd` are refused, so a rebuild's committer cannot be checked; the refusal of `show --format=fuller` names `git log` | 1 | Not done |
 | 38 | "(yours: …)" does not say outright that the id pushed is gone | 2 | Not done |
 
+## Rounds 7 to 10 (2026-11-23): no committing agent
+
+Rounds 1 to 6 had a committing agent beside each developer (pattern A). It cost as much as the
+developer (an agent is 67,316 tokens before it does anything), and in 18 tries it made each task
+one commit every time. Rounds 7 to 10 do without it (pattern C+D): the developer says in a line
+what it did at each step that stands by itself (`nv note`, `worker-noted.md`), and when it is done
+`publish.sh` runs `nv publish`, which waits, makes a commit at each note and pushes. From round 9
+a `[body]` hook (`body.sh`, one `claude -p` with no tools, about 3,000 tokens a commit) writes each
+commit's body; where `nv publish` stops at a clash, an agent is given `resolver.md` and nothing
+else. A blind judge (`judge.md`) is given one history of each pattern, X and Y in either order,
+and rates each commit's boundary and message from 1 to 5.
+
+| | A (rounds 4 to 6) | 7 | 8 | 9 | 10 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| what was different | committing agents | notes, publish | the same | + body hook, resolver | + fixes below |
+| makespan, s | 84 to 100 | 48.8 | 55.6 | 98.5 | 72.4 |
+| latency, s | 42 to 52 | 0.8 | 0.9 | 48.4 | 10.6 |
+| total tokens | 466,099 to 468,360 | 223,394 | 225,495 | 387,711 | 235,564 |
+| version control's tool calls | 32 to 34 | 0 | 0 | 16 (2 resolvers, 5 hook calls) | 4 hook calls |
+| judged against | | round 6 | round 5 | round 4 | round 6 |
+| boundary, A / C+D | | 5.0 / 4.5 | 5.0 / 4.5 | 5.0 / 5.0 | 5.0 / 5.0 |
+| message, A / C+D | | 5.0 / 3.5 | 5.0 / 3.25 | 5.0 / 3.33 | 5.0 / 5.0 |
+| judge prefers | | A | A | A | the same |
+
+What each judge found, and what came of it:
+
+- **Rounds 7 and 8**: a note is a summary line, and nothing said what a reader could not see in
+  the diff (that slugify keeps letters of any script, that reading_time raises ValueError). And the
+  README section was a commit of its own, apart from the code it documents, which both judges
+  took off for, though committers of rounds 3 to 5 had wished they could split it so. Done: the
+  `[body]` hook, and the developer prompt says what documents a step goes with it.
+- **Round 9**: three developers added to README.md, which is not a union, and two publishes
+  stopped; a resolver settled each in one publish (5 and 6 tool calls). Their bodies said the same
+  thing twice: a publish run again wrote a body under the one it wrote the first time. And a noted
+  commit holding only files the sync left unsettled would have lost its line. Done: the body is
+  written afresh under the summary line; a line lost so waits for the settling as a note
+  (`tests/remote.rs`). The developers' README lines were not asked for: the prompt had said a step
+  goes with "what documents it", and it now says documentation the task asks for.
+- **Round 10**: no clash, no resolver. The judge found both histories clean and accurate, rated
+  every commit 5 on both counts, and preferred neither. One developer split task 3 into word_count
+  and reading_time, each with its README lines; the judge took that for a smaller review unit, not
+  a fault. The bodies ended in an attribution trailer and a session line the `claude -p` added of
+  its own accord; body.sh now drops such lines.
+
+What this does and does not show: one judge per pair, a model judging models, three small tasks.
+Pattern C+D of round 10 matched A's commits at half the tokens and a fifth of the latency; it needs
+an agent where developers really clash (round 9), and its notes are only as good as the developer's
+idea of a step. A committing agent still earns its place where the history needs judging: a review,
+not a restatement.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being

@@ -31,6 +31,15 @@ then says what the ref came to: each commit after the start, its message and fil
 whether the tests pass on it; how many provisional messages were pushed; whether any file at
 the tip holds a conflict's markers.
 
+## Without a committing agent
+
+`worker-noted.md` is a developer that may run `nv note` and nothing else. With it, no committing
+agent is started: `publish.sh <work-dir> <n>` waits for task n's done file and runs `nv publish`,
+which makes a commit at each note and pushes. `setup.sh` with `BODY=1` gives the seed a `[body]`
+hook (`body.sh`) that writes each commit's body. Where `nv publish` stops over a clash a union does
+not take, an agent is given `resolver.md`. `judge.md` is a blind judge of two histories of the same
+tasks. `rounds.md` has what came of each.
+
 ## Scores
 
 ```
