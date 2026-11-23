@@ -352,6 +352,38 @@ What the committers found:
 - Not done: `nv git show <rev> -- <path>`, `nv git diff <rev>` against the files, `nv since` that
   prints nothing when nothing differs.
 
+## Readers (2026-11-23): the history as memory for the next writer
+
+A fresh agent given only a bare Git repository of a round's history and `reader.md` (six questions:
+when each function arrived, two edge cases of `reading_time`, whether `slugify` keeps "è", which
+commit added "Usage", whether any commit reconciled two writers' changes, what to change to make
+`wrap` split long words), graded against the code at the tip and what the round's records say
+happened. One reader to a history; rounds 13 (C+D), 14 (A) and 15 (A, the moved message flagged).
+
+| | 13 (C+D) | 14 (A) | 15 (A) |
+| --- | ---: | ---: | ---: |
+| answers right | 6 of 6 | 6 of 6 | 6 of 6 |
+| answered from the history, by its reader's count | 4 | 5 | 5 |
+| tokens above the start | 11,804 | 13,891 | 12,459 |
+| tool calls | 3 | 4 | 4 |
+| seconds | 38.5 | 59.1 | 44.4 |
+
+Every answer was right, and every reader said "not recorded" where it was: none guessed. With five
+commits, each reader read the whole history in one `git log -p` or two, so the cost says nothing
+of the patterns; it would at a size where reading everything is not an answer.
+
+- **What the code did not decide, a history cannot say.** Round 13's `reading_time(text, 0)`
+  divides by zero: no commit, test or message chose it, and its reader said so rather than take
+  the `ZeroDivisionError` for a decision. Rounds 14 and 15 chose `ValueError` and said it in the
+  message.
+- **No history records that two writers' changes were reconciled**, though in every round two
+  commits were: a README clash settled by hand, and `textkit/__init__.py` merged as a union. All
+  three readers inferred that it happened from author times earlier than their parents' commit
+  times and from the `merge=union` line; none could name the sides. Round 14's reader used the
+  stale "next to slugify" as evidence: a message gone wrong was the only trace of the merge.
+  Settling a clash is the one act of judgment in these histories, and it is the act a history
+  keeps nothing of.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
