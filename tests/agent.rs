@@ -1329,3 +1329,31 @@ fn a_commit_of_what_the_runner_committed_meanwhile_says_so() {
   ok(&dir, "echo 2 > two && $NV commit . 'Add two' >/dev/null");
   assert_eq!(ok(&dir, "$NV commit . 'Again'"), "nothing to commit");
 }
+
+/// A developer that does no version control may still say, in a line, what it just did: the
+/// next commit the conditions pass on is made under that line, not a provisional message.
+#[test]
+fn a_note_names_the_next_commit_the_conditions_pass_on() {
+  // Made from a commit, as a clone is: what is not pushed is what came after it.
+  let top = fresh("note");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"test ! -e broken\"\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  ok(&dir, "echo 1 > one && $NV note . 'Add one' && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add one");
+  // A note on a state that does not pass goes to the next one that does.
+  ok(&dir, "echo x > broken && echo 2 > two && $NV note . 'Add two' && ($NV checkpoint . >/dev/null 2>&1; true)");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add one");
+  ok(&dir, "rm broken && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add two");
+  // A note on files the runner committed already gives that commit its message.
+  ok(&dir, "echo 3 > three && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed");
+  ok(&dir, "$NV note . 'Add three'");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add three");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "three");
+  // A note is a line that says something.
+  assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
+}

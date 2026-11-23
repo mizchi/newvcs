@@ -293,11 +293,14 @@ pub fn passed_on_tree(root: &Path, tree: &Id) -> Vec<String> {
 /// it wrote since stays recorded on top.
 pub fn commit_checkpoint(root: &Path, config: &Config, state: &Id, author: &str) -> Result<Option<Id>> {
   let names: Vec<&str> = config.checks.iter().map(|c| c.name.as_str()).collect();
-  let message = draft(root, state).unwrap_or_else(|| format!("checkpoint: {} passed", names.join(", ")));
   let _held = workspace::lock(root)?;
   let mut ws = Workspace::open(root)?;
   let mut store = Store::open(&ws.store)?;
   workspace::unfold(&mut store, &mut ws)?;
+  // The writer's own word for these files first (`nv note`), then a drafted message, then one
+  // that says only what passed.
+  let (noted, taken) = notes_for(root, &mut store, &ws, state)?;
+  let message = noted.or_else(|| draft(root, state)).unwrap_or_else(|| format!("{PROVISIONAL}{} passed", names.join(", ")));
   // Signed as any commit made here is: nv does not make a name up.
   let signed = |role: &str| workspace::signature(&ws, role).map_err(|why| format!("not committed: {why}"));
   let rest = format!("author {}\ncommitter {}\n\n{}\n", signed("AUTHOR")?, signed("COMMITTER")?, message.trim_end()).into_bytes();
@@ -305,8 +308,110 @@ pub fn commit_checkpoint(root: &Path, config: &Config, state: &Id, author: &str)
   // Which commit was the runner's own, for a command to say so: a note, nothing depends on it.
   if let Some(id) = made {
     let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(&id).as_bytes());
+    forget_notes(root, &taken)?;
   }
   Ok(made)
+}
+
+/// How a message the runner made up begins: `nv publish` knows such a commit for one to fold.
+pub const PROVISIONAL: &str = "checkpoint: ";
+
+fn notes_file(root: &Path) -> PathBuf {
+  runs_dir(root).join("notes")
+}
+
+/// The notes waiting for a commit: the state each was made on, and its line.
+fn notes(root: &Path) -> Vec<(String, String)> {
+  std::fs::read_to_string(notes_file(root))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.split_once('\t').map(|(state, text)| (state.to_string(), text.to_string())))
+    .collect()
+}
+
+fn forget_notes(root: &Path, taken: &[String]) -> Result<()> {
+  if taken.is_empty() {
+    return Ok(());
+  }
+  let left: String =
+    notes(root).into_iter().filter(|(state, _)| !taken.contains(state)).map(|(state, text)| format!("{state}\t{text}\n")).collect();
+  crate::write_whole(&notes_file(root), left.as_bytes())
+}
+
+/// The notes made on `state` or on a state recorded before it since the last commit, as one
+/// message (the first note its first line), and which they were.
+fn notes_for(root: &Path, store: &mut Store, ws: &Workspace, state: &Id) -> Result<(Option<String>, Vec<String>)> {
+  let waiting = notes(root);
+  if waiting.is_empty() {
+    return Ok((None, Vec::new()));
+  }
+  let mut before: Vec<String> = Vec::new();
+  let mut at = Some(*state);
+  while let Some(id) = at.filter(|id| Some(*id) != ws.base) {
+    before.push(hex(&id));
+    if before.len() > 100_000 {
+      break;
+    }
+    at = crate::commit::Commit::load(store, &id)?.parents.first().copied();
+  }
+  let taken: Vec<(String, String)> = waiting.into_iter().filter(|(noted, _)| before.contains(noted)).collect();
+  if taken.is_empty() {
+    return Ok((None, Vec::new()));
+  }
+  let lines: Vec<&str> = taken.iter().map(|(_, text)| text.as_str()).collect();
+  let message = match lines.split_first() {
+    Some((first, [])) => first.to_string(),
+    Some((first, more)) => format!("{first}\n\n{}", more.join("\n")),
+    None => unreachable!("taken is not empty"),
+  };
+  Ok((Some(message), taken.into_iter().map(|(state, _)| state).collect()))
+}
+
+/// A writer's line for what is on disk (`nv note`), to be the message of the next commit the
+/// conditions pass on, of these files or of files written after them. Where the runner has
+/// committed these files already, under a message it made up, that commit takes the line. Run
+/// with the workspace held.
+pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
+  let text = text.trim();
+  if text.is_empty() || text.contains('\n') {
+    return Err("a note is one line that says what was done".to_string());
+  }
+  let mut ws = Workspace::open(root)?;
+  let mut store = Store::open(&ws.store)?;
+  workspace::unfold(&mut store, &mut ws)?;
+  workspace::snapshot(&mut store, &mut ws, author, Look::Everywhere)?;
+  let state = ws.head.ok_or("there is nothing recorded to note")?;
+  // Committed already, by the runner, under a message of its own making: that commit is renamed.
+  if let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) {
+    let chain = workspace::pending(&mut store, &ws)?;
+    let last = chain.last().map(|(id, _)| *id);
+    if last == Some(base) && String::from_utf8_lossy(&chain.last().expect("not empty").1.rest).contains(&format!("\n\n{PROVISIONAL}")) {
+      let plan: Vec<(Id, Vec<u8>)> = chain
+        .iter()
+        .map(|(id, commit)| {
+          if *id == base {
+            let said = String::from_utf8_lossy(&commit.rest).into_owned();
+            let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
+            (*id, format!("{head}\n\n{text}\n").into_bytes())
+          } else {
+            (*id, commit.rest.clone())
+          }
+        })
+        .collect();
+      let made = workspace::rebuild(&mut store, &mut ws, &plan, author)?;
+      if let Some(id) = made.last() {
+        let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(id).as_bytes());
+      }
+      return Ok(format!("the commit of these files, made already, is now \"{text}\""));
+    }
+  }
+  std::fs::create_dir_all(runs_dir(root)).map_err(|e| e.to_string())?;
+  let mut all = notes(root);
+  all.retain(|(noted, _)| *noted != hex(&state));
+  all.push((hex(&state), text.to_string()));
+  let lines: String = all.into_iter().map(|(state, text)| format!("{state}\t{text}\n")).collect();
+  crate::write_whole(&notes_file(root), lines.as_bytes())?;
+  Ok(format!("noted: the next commit the conditions pass on, of these files or later ones, is \"{text}\""))
 }
 
 /// Whether this commit is one the conditions' runner made (`[commit] each`), as far as its note says.

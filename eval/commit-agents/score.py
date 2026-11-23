@@ -5,7 +5,7 @@ A round directory holds two files beside the workspaces `setup.sh` made:
 
   verify.txt  what `verify.sh <round-dir> <ref-url>` printed
   usage.tsv   one line per agent, as the orchestrator was told when each finished:
-              role (worker, committer or baseline), task, tokens, tool uses, milliseconds,
+              role (worker, committer, script or baseline), task, tokens, tool uses, milliseconds,
               and for a committer the pushes it had refused (from its report)
 
     baseline  -  67316  0   4551    -
@@ -30,6 +30,8 @@ Scores, lower is better:
   dev tokens   the same for the workers: version control should not cost them anything
   vcs share    vcs tokens as a part of vcs and dev tokens together
   vcs calls    the committers' tool calls, in all; each call is a turn
+  total tokens what every agent of the round used, the cost of an agent's start included: what
+               the round costs. A `script` row (publish.sh standing in for a committer) is none
 """
 import re
 import statistics
@@ -73,11 +75,14 @@ def scores(round_dir):
         sys.exit(f"{round_dir}/usage.tsv has no baseline line")
     base = base[0]["tokens"]
     workers = {r["task"]: r for r in rows if r["role"] == "worker"}
-    committers = {r["task"]: r for r in rows if r["role"] == "committer"}
+    # A script that stands in for a committing agent (`publish.sh`) costs no tokens at all.
+    committers = {r["task"]: r for r in rows if r["role"] in ("committer", "script")}
+    above = lambda r: 0 if r["role"] == "script" else r["tokens"] - base
     held = gates(round_dir, len(committers))
     latency = [committers[t]["ms"] - workers[t]["ms"] for t in committers if t in workers]
-    vcs = sum(r["tokens"] - base for r in committers.values())
-    dev = sum(r["tokens"] - base for r in workers.values())
+    vcs = sum(above(r) for r in committers.values())
+    dev = sum(above(r) for r in workers.values())
+    total = sum(r["tokens"] for r in rows if r["role"] in ("worker", "committer"))
     return held, {
         "makespan s": max(r["ms"] for r in committers.values()) / 1000,
         "latency s": statistics.median(latency) / 1000,
@@ -85,11 +90,12 @@ def scores(round_dir):
         "dev tokens": dev,
         "vcs share %": 100 * vcs / (vcs + dev),
         "vcs calls": sum(r["calls"] for r in committers.values()),
+        "total tokens": total,
     }, {
         "refused pushes": sum(r["refused"] for r in committers.values()),
         "latency per task s": ", ".join(f"{t}: {(committers[t]['ms'] - workers[t]['ms']) / 1000:.0f}"
                                         for t in sorted(committers) if t in workers),
-        "vcs tokens per committer": ", ".join(f"{t}: {committers[t]['tokens'] - base}" for t in sorted(committers)),
+        "vcs tokens per committer": ", ".join(f"{t}: {above(committers[t])}" for t in sorted(committers)),
     }
 
 

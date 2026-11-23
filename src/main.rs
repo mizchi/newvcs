@@ -35,6 +35,16 @@ nv: an experiment in keeping Git's object ids without Git's storage
         With `[commit] each = true` in nv.toml a state that passed them all
         is committed, there and then, under its drafted message or a
         provisional one, to be made again with `nv rebuild` before a push
+  nv publish <dir> [--message <line>]
+        Wait as `nv pending --wait` does, make the commits not pushed into
+        one at each `nv note`, of everything since the one before (what
+        came after the last note under --message, or with it), and push
+        them. Where the ref took changes to the same files, catch up and
+        push again; where that leaves files with both versions, stop
+  nv note <dir> <line>
+        Say in a line what was just done: the next commit the conditions
+        pass on (`[commit] each`), of these files or later ones, is made
+        under it. Where that commit was made already, it is renamed
   nv pending <dir> [--wait]
         The commits made here and not pushed, oldest first: each with its
         number, its Git id and nv's, message, the conditions its files
@@ -502,6 +512,107 @@ fn run(args: &[String]) -> Result<()> {
       }
       println!("{} passed every condition, in {:.1} ms", hex(&run.state), ms(started));
     }
+    "publish" => {
+      let (mut ws, mut store) = opened(arg(1)?)?;
+      // `--message <line>`: the line comes after the directory, as the arguments are laid out.
+      let last_message = match (args.iter().any(|a| a == "--message"), args.get(2).filter(|a| !a.starts_with("--"))) {
+        (true, Some(line)) => Some(line.clone()),
+        (true, None) => return Err("`nv publish --message` takes the line to give the last commit".to_string()),
+        (false, Some(_)) => return Err(USAGE.to_string()),
+        (false, None) => None,
+      };
+      if let Some(settled) = SETTLED.get() {
+        println!("{settled}");
+      }
+      let chain = workspace::pending(&mut store, &ws)?;
+      if chain.is_empty() {
+        println!("nothing to publish: every commit made here is pushed");
+        return Ok(());
+      }
+      // A commit at each note (a message that is not one the runner made up), of everything
+      // since the one before; what came after the last note under `--message`, or with it.
+      let message_of = |commit: &newvcs::commit::Commit| {
+        let said = String::from_utf8_lossy(&commit.rest).into_owned();
+        said.split_once("\n\n").map(|(_, m)| m.trim_end().to_string()).unwrap_or_default()
+      };
+      let author_of = |commit: &newvcs::commit::Commit| {
+        String::from_utf8_lossy(&commit.rest).lines().find_map(|l| l.strip_prefix("author ").map(str::to_string))
+      };
+      let committer = signature(&ws, "COMMITTER")?;
+      let mut plan: Vec<(newvcs::Id, Vec<u8>)> = Vec::new();
+      let mut first: Option<String> = None;
+      for (id, commit) in &chain {
+        first = first.or_else(|| author_of(commit));
+        let message = message_of(commit);
+        if !message.starts_with(newvcs::checks::PROVISIONAL) {
+          let author = first.take().map_or_else(|| signature(&ws, "AUTHOR"), Ok)?;
+          plan.push((*id, format!("author {author}\ncommitter {committer}\n\n{message}\n").into_bytes()));
+        }
+      }
+      let (last, last_commit) = chain.last().expect("not empty");
+      if plan.last().map(|(id, _)| id) != Some(last) {
+        match (last_message, plan.pop()) {
+          (Some(message), noted) => {
+            plan.extend(noted);
+            let author = first.take().map_or_else(|| signature(&ws, "AUTHOR"), Ok)?;
+            plan.push((*last, format!("author {author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes()));
+          }
+          // What came after the last note goes with it.
+          (None, Some((_, rest))) => plan.push((*last, rest)),
+          (None, None) => {
+            return Err(format!(
+              "nothing says what these {} commits are: no `nv note` was made, and no `--message` given. Nothing was changed",
+              chain.len()
+            ));
+          }
+        }
+        let _ = last_commit;
+      }
+      let made = workspace::rebuild(&mut store, &mut ws, &plan, AUTHOR)?;
+      // Pushed, and where the ref took changes to the same files meanwhile, caught up with and
+      // pushed again, as long as catching up leaves nothing for a person.
+      let mut tries = 0;
+      let done = loop {
+        tries += 1;
+        match remote::push(&mut store, &mut ws, AUTHOR) {
+          Ok(done) => break done,
+          Err(why) if why.contains("has changes to the same paths") && tries < 3 => {
+            let synced = remote::sync(&mut store, &mut ws, AUTHOR)?;
+            if !synced.conflicts.is_empty() {
+              println!("{}", describe(&synced, &ws.root));
+              eprintln!("nv: the commits are made, and not pushed: settle those files, then `nv publish` again");
+              std::process::exit(1);
+            }
+          }
+          Err(why) => return Err(why),
+        }
+      };
+      let _ = remote::fetch_for_export(&mut store, &ws);
+      let git = |store: &mut Store, id: &newvcs::Id| {
+        newvcs::git::git_id_of(store, id).map_or_else(|_| hex(id)[..12].to_string(), |oid| hex(&oid)[..7].to_string())
+      };
+      println!("published {} as {}:", counted(chain.len(), "commit"), counted(made.len(), "commit"));
+      for id in done.landed.iter() {
+        let subject = message_of(&newvcs::commit::Commit::load(&mut store, id)?).lines().next().unwrap_or_default().to_string();
+        println!("  {}  {subject}", git(&mut store, id));
+      }
+      if !done.merged_on_server.is_empty() {
+        println!("merged on the server (merge=union): {}", done.merged_on_server.join(", "));
+      }
+      let tip = ws.pushed.map(|id| git(&mut store, &id)).unwrap_or_default();
+      println!(
+        "`{}` on {} is now at {tip}, in {:.0} ms",
+        ws.remote_ref.as_deref().unwrap_or("?"),
+        ws.remote.as_deref().unwrap_or("?"),
+        ms(started)
+      );
+      newvcs::checks::start_behind(&ws.root);
+    }
+    "note" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      println!("{}", newvcs::checks::note(&root, arg(2)?, AUTHOR)?);
+      newvcs::checks::start_behind(&root);
+    }
     "pending" => {
       let (ws, mut store) = opened(arg(1)?)?;
       let chain = workspace::pending(&mut store, &ws)?;
@@ -895,6 +1006,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("snapshot", 1, 1, &["--recorded", "--tracked"]),
   ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
   ("checkpoint", 1, 1, &["--until-still"]),
+  ("note", 2, 2, &[]),
+  ("publish", 1, 2, &["--message"]),
   ("pending", 1, 1, &["--wait"]),
   ("rebuild", 3, usize::MAX, &[]),
   ("watch", 1, 1, &["--start", "--stop", "--status"]),
@@ -1092,8 +1205,7 @@ fn main() -> ExitCode {
   }
   // Waiting for the watcher and the conditions is done before the workspace is held: both
   // take it to record and to commit.
-  if args[0] == "pending"
-    && args.iter().any(|a| a == "--wait")
+  if (args[0] == "publish" || args[0] == "pending" && args.iter().any(|a| a == "--wait"))
     && let Some(top) = workspace::top_of(Path::new(&args[1]))
   {
     match newvcs::checks::wait_settled(&top) {

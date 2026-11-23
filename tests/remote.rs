@@ -1476,3 +1476,65 @@ fn entries_added_to_a_union_list_by_two_writers_are_both_kept_and_checked() {
   assert_eq!(code, 2, "{said}");
   assert!(said.contains("has changes to the same paths: list"), "{said}");
 }
+
+/// With no agent to make the commits again: `nv publish` waits for what is coming, makes the
+/// commits not pushed into one at each note, the last under the message it is given, and
+/// pushes them.
+#[test]
+fn publish_makes_a_commit_at_each_note_and_pushes_them() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-publish");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/publish-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && echo start > a
+      printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ws && {nv} remote ws {url} main
+      "##
+    ),
+  );
+  let run = |script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join("ws"))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", "dev")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "dev")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  // Two states before a note, one after it: two commits, the first at the note.
+  run("echo 1 > b && $NV checkpoint . >/dev/null && echo 2 > c && $NV note . 'Add b and c' && $NV checkpoint . >/dev/null");
+  run("echo 3 > d && $NV checkpoint . >/dev/null");
+  assert_eq!(run("$NV pending .").1.matches("  git ").count(), 3);
+  let (code, said) = run("$NV publish . --message 'Add d'");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("$NV git log --format=%s -3").1, "Add d\nAdd b and c\nseed\n", "{said}");
+  assert_eq!(run("$NV git show --name-only --format= HEAD~1").1, "b\nc\n");
+  assert!(run("$NV pending .").1.starts_with("nothing committed here that is not pushed"));
+  // Without a message for what came after the last note, it goes with the note's commit.
+  run("echo 4 > e && $NV note . 'Add e' && $NV checkpoint . >/dev/null && echo 5 > f && $NV checkpoint . >/dev/null");
+  let (code, said) = run("$NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("$NV git log --format=%s -2").1, "Add e\nAdd d\n", "{said}");
+  assert_eq!(run("$NV git show --name-only --format= HEAD").1, "e\nf\n");
+  // Nothing to publish is said, and is not an error.
+  let (code, said) = run("$NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("nothing to publish"), "{said}");
+}
