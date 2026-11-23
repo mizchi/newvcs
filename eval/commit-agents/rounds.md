@@ -241,6 +241,46 @@ found no claim wrong in either, and preferred neither. Two rounds of C+D in its 
 against two different rounds of A with the labels both ways round, came out level with A each
 time, at half the tokens and a sixth of the latency.
 
+## Rounds 12 and 13 (2026-11-23): made to clash
+
+`setup.sh` with `CONFLICT=1`: the README has a list of functions holding one placeholder line,
+and every task is told to replace it with its own. The second and third writers to push meet a
+clash no union takes. Round 12 is pattern A (committing agents), round 13 C+D with the body hook,
+run at the same time; in 13 the agent given `resolver.md` was started on each publish that stopped,
+11 to 17 s after it stopped (counted out of the times below).
+
+| | 12 (A) | 13 (C+D) |
+| --- | ---: | ---: |
+| makespan, s | 134.6 | 80.4 |
+| latency, s | 60.8 | 36.6 |
+| total tokens | 488,188 | 391,292 |
+| version control's tool calls | 46 | 21 (two resolvers, 15; six hook calls) |
+| refused pushes / stopped publishes | 3 | 3 |
+| judge, boundary | 5.0 | 5.0 |
+| judge, message | 3.67 | 5.0 |
+| judge prefers | | 13 |
+
+Both landed everything whole and passing; the README listed every function. The judge took off
+for two of round 12's messages: "Add textkit.wrap, merged with slugify, word_count and
+reading_time", "This is a merge with …", of commits with one parent that hold one feature. Two
+things made them so. The committer prompt asked for "a message saying it is a merge". And the
+sync put each committer's commit on the tip without the README it had left holding both versions:
+the settling was a checkpoint of its own, after a commit short of its own message and untested,
+and the committers rebuilt the two by hand, each time naming what they had merged with. One of them
+pushed after two syncs and said it would have pushed a wrong message had it not rebuilt again.
+Round 13 met none of it: `nv publish` folds what comes after a note into the noted commit.
+
+Done (`6c89a8d`): the sync notes which commit of the workspace's own it left short, and of what; a
+checkpoint that changes nothing but those files goes into that commit, under its message, while it
+is the last made here, not pushed, and no push of it unheard; a workspace with no commit of its own
+gets a commit of its own, never a change to another writer's (`tests/remote.rs`). The committer
+prompt no longer asks for a merge message.
+
+Where it does not happen, each with a test: a file every writer adds to, given `merge=union`, is
+merged by the server and nothing is refused (rounds 4 to 11); `nv publish` folds the settling into
+the noted commit and writes its body once (rounds 9 and 13); changes to different paths are put on
+the tip by the server; and now a checkpoint completes the commit the sync left short.
+
 ## Scores
 
 `score.py` over each round: the gates first (all passed in every round), then, lower being
