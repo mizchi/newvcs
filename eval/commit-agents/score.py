@@ -6,7 +6,8 @@ A round directory holds two files beside the workspaces `setup.sh` made:
   verify.txt  what `verify.sh <round-dir> <ref-url>` printed
   usage.tsv   one line per agent, as the orchestrator was told when each finished:
               role (worker, committer, script or baseline), task, tokens, tool uses, milliseconds,
-              and for a committer the pushes it had refused (from its report)
+              and for a committer the pushes it had refused (from its report); for a script,
+              also the milliseconds from the developer's done file to its end
 
     baseline  -  67316  0   4551    -
     worker    1  73125  4   35387   -
@@ -46,7 +47,8 @@ def load(round_dir):
             continue
         role, task, tokens, calls, ms, *rest = line.split()
         rows.append(dict(role=role, task=task, tokens=int(tokens), calls=int(calls), ms=int(ms),
-                         refused=int(rest[0]) if rest and rest[0] != "-" else 0))
+                         refused=int(rest[0]) if rest and rest[0] != "-" else 0,
+                         after=int(rest[1]) if len(rest) > 1 else None))
     return rows
 
 
@@ -79,7 +81,10 @@ def scores(round_dir):
     committers = {r["task"]: r for r in rows if r["role"] in ("committer", "script")}
     above = lambda r: 0 if r["role"] == "script" else r["tokens"] - base
     held = gates(round_dir, len(committers))
-    latency = [committers[t]["ms"] - workers[t]["ms"] for t in committers if t in workers]
+    # A script says how long after the done file it was done (its `after`); an agent's time less
+    # the worker's is that, as both start together.
+    lag = lambda t: committers[t]["after"] if committers[t]["after"] is not None else committers[t]["ms"] - workers[t]["ms"]
+    latency = [lag(t) for t in committers if t in workers]
     vcs = sum(above(r) for r in committers.values())
     dev = sum(above(r) for r in workers.values())
     total = sum(r["tokens"] for r in rows if r["role"] in ("worker", "committer"))
@@ -93,8 +98,7 @@ def scores(round_dir):
         "total tokens": total,
     }, {
         "refused pushes": sum(r["refused"] for r in committers.values()),
-        "latency per task s": ", ".join(f"{t}: {(committers[t]['ms'] - workers[t]['ms']) / 1000:.0f}"
-                                        for t in sorted(committers) if t in workers),
+        "latency per task s": ", ".join(f"{t}: {lag(t) / 1000:.1f}" for t in sorted(committers) if t in workers),
         "vcs tokens per committer": ", ".join(f"{t}: {above(committers[t])}" for t in sorted(committers)),
     }
 

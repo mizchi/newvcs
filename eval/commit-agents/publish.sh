@@ -9,5 +9,7 @@ until [ -e "$work/task-$n.done" ]; do sleep 0.2; done
 "$work/bin/nv" publish "$work/task-$n" --message "$(head -1 "$work/task-$n.done" | cut -c1-200)" > "$work/publish-$n.out" 2>&1
 code=$?
 end=$(date +%s%3N)
-echo "ms=$((end - start)) code=$code"
+done_at=$(stat -c %.3Y "$work/task-$n.done" | tr -d .)
+# ms: from its start, with the developer's; after: from the developer's done file to the end.
+echo "ms=$((end - start)) after=$((end - done_at)) code=$code"
 cat "$work/publish-$n.out"
