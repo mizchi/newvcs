@@ -257,17 +257,37 @@ impl Index {
     out
   }
 
-  /// Every entry, in path order.
+  /// Every entry, in path order. The base is in path order (`create` sorts it, and lookups
+  /// search it so), and so is the overlay: the two are merged as they are read.
   pub fn entries(&self) -> Vec<(Vec<u8>, Indexed)> {
-    let mut all: BTreeMap<Vec<u8>, Indexed> = BTreeMap::new();
+    let mut all = Vec::with_capacity(self.count + self.overlay.len());
+    let mut overlay = self.overlay.iter().peekable();
     for i in 0..self.count {
       let (path, indexed) = self.base_at(i);
-      if !self.overlay.contains_key(path) {
-        all.insert(path.to_vec(), indexed);
+      // One entry for a path, should the base ever hold one twice.
+      if all.last().is_some_and(|(last, _): &(Vec<u8>, Indexed)| last.as_slice() == path) {
+        continue;
+      }
+      // What the overlay has before this path, and what it says of this one.
+      let mut replaced = false;
+      while let Some((other, value)) = overlay.peek() {
+        match other.as_slice().cmp(path) {
+          std::cmp::Ordering::Greater => break,
+          order => {
+            replaced |= order == std::cmp::Ordering::Equal;
+            if let Some(value) = value {
+              all.push(((*other).clone(), *value));
+            }
+            overlay.next();
+          }
+        }
+      }
+      if !replaced {
+        all.push((path.to_vec(), indexed));
       }
     }
-    all.extend(self.overlay.iter().filter_map(|(path, v)| Some((path.clone(), (*v)?))));
-    all.into_iter().collect()
+    all.extend(overlay.filter_map(|(path, value)| Some((path.clone(), (*value)?))));
+    all
   }
 
   /// Make what this process changed durable: appended to the log, or, once
@@ -308,6 +328,44 @@ mod tests {
 
   fn names(entries: &[(Vec<u8>, Indexed)]) -> Vec<String> {
     entries.iter().map(|(p, _)| String::from_utf8_lossy(p).into_owned()).collect()
+  }
+
+  #[test]
+  fn entries_are_the_base_with_the_overlay_over_it_in_path_order() {
+    // Against a map of the same entries, over many shapes of base and overlay: changes before,
+    // between, at and after the base's paths, removals of paths it has and does not have.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+      seed ^= seed << 13;
+      seed ^= seed >> 7;
+      seed ^= seed << 17;
+      seed % n
+    };
+    for round in 0..200 {
+      let d = dir(&format!("merge-{round}"));
+      let path = |n: u64| format!("p{:02}", n).into_bytes();
+      let mut model: BTreeMap<Vec<u8>, Indexed> = BTreeMap::new();
+      for _ in 0..next(12) {
+        model.insert(path(next(30)), file(next(200) as u8));
+      }
+      Index::create(&d, model.iter().map(|(p, i)| (p.clone(), *i)).collect()).unwrap();
+      let mut index = Index::open(&d);
+      for _ in 0..next(12) {
+        let p = path(next(30));
+        if next(3) == 0 {
+          index.remove(&p);
+          model.remove(&p);
+        } else {
+          let i = file(next(200) as u8);
+          index.insert(p.clone(), i);
+          model.insert(p, i);
+        }
+      }
+      let expected: Vec<(Vec<u8>, Indexed)> = model.into_iter().collect();
+      assert_eq!(names(&index.entries()), names(&expected), "round {round}");
+      assert!(index.entries().iter().zip(&expected).all(|(a, b)| a.1 == b.1), "round {round}");
+      let _ = std::fs::remove_dir_all(&d);
+    }
   }
 
   #[test]

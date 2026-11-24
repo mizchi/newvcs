@@ -122,8 +122,8 @@ pub fn root_of(store: &mut Store, id: &Id) -> Result<Option<Id>> {
   let mut todo = Vec::new();
   let mut at = *id;
   let mut root = loop {
-    if let Some(root) = store.roots.get(&at) {
-      break *root;
+    if let Some(root) = store.root_known(&at) {
+      break root;
     }
     let commit = Commit::load(store, &at)?;
     let parent = commit.parents.first().copied();

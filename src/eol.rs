@@ -163,6 +163,14 @@ impl Eols {
   }
 }
 
+/// Whether `.gitattributes` gives a path Git's `union` merge (`merge=union`): where both sides
+/// changed the same lines, the lines of both are kept, ours first, and the file is merged. Read
+/// from the files on disk, as Git reads them in a working tree, and only for a path that is
+/// being merged: not part of looking at what changed, which this would slow.
+pub fn merges_by_union(root: &Path, path: &[u8]) -> bool {
+  crate::union::is_union(|dir| std::fs::read(root.join(crate::workspace::to_path(dir)).join(".gitattributes")).ok(), path)
+}
+
 #[derive(Default)]
 struct Stats {
   lone_lf: usize,

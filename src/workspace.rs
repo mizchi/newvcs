@@ -205,7 +205,16 @@ fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
       return Ok(());
     }
   }
-  let status = std::process::Command::new("cp").arg("-R").arg(from).arg(to).status()?;
+  // Elsewhere a copy, keeping the times the files were written: the index that comes with the
+  // tree knows each file by them, and a copy that changed them would have every file read again.
+  // Sharing blocks where the file system can (Btrfs, XFS), as APFS does.
+  let mut cp = std::process::Command::new("cp");
+  if cfg!(target_os = "linux") {
+    cp.args(["-R", "--preserve=mode,timestamps", "--reflink=auto"]);
+  } else {
+    cp.arg("-Rp");
+  }
+  let status = cp.arg(from).arg(to).status()?;
   if status.success() { Ok(()) } else { Err(std::io::Error::other("cp failed")) }
 }
 
@@ -267,12 +276,11 @@ impl Workspace {
 
   /// Take a new state arrived at by `remote::sync`.
   pub(crate) fn adopt(&self, index: &mut Index) -> Result<()> {
-    self.save()?;
-    index.save()?;
     if let Some(head) = &self.head {
       self.log("sync", head)?;
     }
-    Ok(())
+    self.save()?;
+    index.save()
   }
 
   /// Write where the workspace stands. The file is replaced whole, so a
@@ -314,19 +322,30 @@ impl Workspace {
     Index::open(&self.root.join(META))
   }
 
+  /// Note an operation. A state is logged before anything names it (before the head moves to
+  /// it), so that a kill in between leaves a state that is somewhere to go back to, never one
+  /// nothing names. A record is one write; a kill can still tear the last one, and the next
+  /// record then starts on a line of its own, leaving the torn one to name nothing.
   pub(crate) fn log(&self, what: &str, id: &Id) -> Result<()> {
-    use std::io::Write;
-    let mut file =
-      std::fs::File::options().append(true).create(true).open(self.root.join(META).join("oplog")).map_err(|e| e.to_string())?;
-    writeln!(file, "{} {what} {}", now_nanos() / 1_000_000, hex(id)).map_err(|e| e.to_string())
+    use std::io::{Read, Seek, Write};
+    let path = self.root.join(META).join("oplog");
+    let mut file = std::fs::File::options().read(true).append(true).create(true).open(path).map_err(|e| e.to_string())?;
+    let mut record = format!("{} {what} {}\n", now_nanos() / 1_000_000, hex(id));
+    let mut last = [0u8; 1];
+    if file.seek(std::io::SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n' {
+      record.insert(0, '\n');
+    }
+    file.write_all(record.as_bytes()).map_err(|e| e.to_string())
   }
 
   /// The operations of this workspace, oldest first: `(milliseconds, what, commit)`.
   pub fn operations(&self) -> Vec<(u128, String, String)> {
     let text = std::fs::read_to_string(self.root.join(META).join("oplog")).unwrap_or_default();
+    // A line torn by a kill names nothing: only whole records are read.
     let parse = |l: &str| {
       let mut f = l.split(' ');
-      Some((f.next()?.parse().ok()?, f.next()?.to_string(), f.next()?.to_string()))
+      let record = (f.next()?.parse().ok()?, f.next()?.to_string(), f.next()?.to_string());
+      (f.next().is_none() && record.2.len() == 64 && record.2.bytes().all(|b| b.is_ascii_hexdigit())).then_some(record)
     };
     text.lines().filter_map(parse).collect()
   }
@@ -337,11 +356,20 @@ impl Workspace {
   /// relative to its top, or absolute and below it. Anything else is
   /// refused, since what is noted here is read and committed.
   pub fn record(&self, path: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let path = self.inside(path)?;
-    let mut file =
-      std::fs::File::options().append(true).create(true).open(self.root.join(META).join("journal")).map_err(|e| e.to_string())?;
-    file.write_all(&[path.as_slice(), b"\0"].concat()).map_err(|e| e.to_string())
+    self.record_all(&[path])
+  }
+
+  /// `record` for several paths, all of them or none: each is checked before any is noted.
+  pub fn record_all(&self, paths: &[&[u8]]) -> Result<()> {
+    // `.nv/exclude` is not a file of the tree, and a change to it is seen without a report.
+    let rules = self.root.join(META).join("exclude");
+    let theirs = |path: &[u8]| {
+      let full = if path.first() == Some(&b'/') { to_path(path).to_path_buf() } else { self.root.join(to_path(path)) };
+      full.parent().and_then(|dir| std::fs::canonicalize(dir).ok()).map(|dir| dir.join(full.file_name().unwrap_or_default()))
+        == rules.parent().and_then(|dir| std::fs::canonicalize(dir).ok()).map(|dir| dir.join("exclude"))
+    };
+    let inside: Vec<Vec<u8>> = paths.iter().filter(|path| !theirs(path)).map(|path| self.inside(path)).collect::<Result<_>>()?;
+    self.note(&inside)
   }
 
   /// A path as the workspace names it: from its top, with no `.` or `..` in it.
@@ -734,25 +762,71 @@ fn untracked_in_the_way(store: &mut Store, root: &Path, from: Option<Id>, change
   Ok(found.into_iter().collect())
 }
 
-/// The files that differ from the last commit and hold the markers a sync writes where both
-/// sides changed the same lines, with this workspace's names for the two sides.
-pub fn with_sync_markers(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
+/// Refused, before a commit is made of what is recorded: files holding the markers a sync writes
+/// where both sides changed the same lines (put back, say, by a restore after the sync's own note
+/// was cleared). Called once what is on disk is recorded, so only what is recorded is read: the
+/// files that differ from the last commit, as the commit would publish them.
+pub(crate) fn refuse_sync_markers(store: &mut Store, ws: &Workspace) -> Result<()> {
+  refuse_sync_markers_in(store, ws, ws.head)
+}
+
+/// `refuse_sync_markers`, for the change from the last commit to `state`.
+fn refuse_sync_markers_in(store: &mut Store, ws: &Workspace, state: Option<Id>) -> Result<()> {
   let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
-  let (from, to) = (tree(store, ws.base)?, tree(store, ws.head)?);
-  let mut changed: Vec<Vec<u8>> =
-    crate::manifest::diff(store, from, to)?.into_iter().filter(|(_, e)| e.is_some()).map(|(p, _)| p).collect();
-  changed.extend(status(ws, Look::Everywhere)?.0.into_iter().filter(|(_, new, _)| new.is_some()).map(|(p, _, _)| p));
-  changed.sort();
-  changed.dedup();
+  let (from, to) = (tree(store, ws.base)?, tree(store, state)?);
   let mut found = Vec::new();
-  for path in changed {
-    let Ok(bytes) = std::fs::read(ws.root.join(to_path(&path))) else { continue };
+  // A file the index says is still what was recorded is read from the disk, which costs less
+  // than taking its content out of the store; what the index cannot vouch for is read from the store.
+  let index = ws.load_index();
+  let (noted, here) = noted_for(ws);
+  let ctimes = match std::fs::read_to_string(&noted).is_ok_and(|was| was == here) {
+    true => Ctimes::Noted,
+    false => Ctimes::CopiedBy(std::fs::symlink_metadata(&noted).map_or(0, |meta| ctime_of(&meta))),
+  };
+  for (path, entry) in crate::manifest::diff(store, from, to)? {
+    let Some(entry) = entry.filter(|e| !e.is_dir() && e.mode != crate::manifest::MODE_GITLINK && e.mode != MODE_LINK) else { continue };
+    let full = ws.root.join(to_path(&path));
+    let on_disk = index.get(&path).filter(|known| known.entry == entry).and_then(|known| {
+      let meta = std::fs::symlink_metadata(&full).ok().filter(|meta| meta.is_file())?;
+      if !unchanged(&known, &meta, ctimes) || link_on_the_way(&ws.root, &path).is_some() {
+        return None;
+      }
+      read_regular(&full).filter(|bytes| bytes.len() as u64 == meta.len())
+    });
+    let bytes = match on_disk {
+      Some(bytes) => std::sync::Arc::new(bytes),
+      None => match store.get(&entry.id)? {
+        Some(bytes) => bytes,
+        None => continue,
+      },
+    };
     let lines = || bytes.split(|&b| b == b'\n');
     if lines().any(|line| line == b"<<<<<<< yours") && lines().any(|line| line == b">>>>>>> theirs") {
       found.push(String::from_utf8_lossy(&path).into_owned());
     }
   }
-  Ok(found)
+  if found.is_empty() {
+    return Ok(());
+  }
+  Err(format!(
+    "these hold both versions between the markers a sync leaves (<<<<<<< yours ... >>>>>>> theirs): {}\nEdit them to what they should be, then commit.",
+    found.join(", ")
+  ))
+}
+
+/// The bytes of a regular file at `path` itself: `None` for a link (not followed), a pipe or a
+/// device (not waited on), or anything that cannot be read. What is opened is what is checked,
+/// so a file replaced by a pipe in between is not read either.
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+  use std::io::Read;
+  use std::os::unix::fs::OpenOptionsExt;
+  let mut file = std::fs::File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
+  if !file.metadata().ok()?.is_file() {
+    return None;
+  }
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes).ok()?;
+  Some(bytes)
 }
 
 /// The store's ready copies, each compared with what it is a copy of: single files under
@@ -1108,11 +1182,13 @@ pub type Content = (u32, Vec<u8>);
 /// `(path, what is on disk now, the entry last recorded)`.
 pub type Difference = (Vec<u8>, Option<Content>, Option<Entry>);
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub struct Looked {
   /// Files whose size and time were looked at, and files that had to be read.
   pub stats: usize,
   pub reads: usize,
+  /// Files that had to be read and may not be: left out of what is recorded.
+  pub unreadable: Vec<Vec<u8>>,
 }
 
 fn read_content(path: &Path, meta: &std::fs::Metadata) -> Result<Content> {
@@ -1174,14 +1250,16 @@ struct Compared {
   out: Vec<Difference>,
   refreshed: Refreshed,
   /// For each directory asked about: whether it, or one above it, is a symbolic link.
-  links: std::collections::HashMap<Vec<u8>, bool>,
+  links: crate::store::PathMap<bool>,
   /// The directory asked about last, and the answer.
   last_dir: (Vec<u8>, bool),
+  /// Where the whole path of the file being compared is put together.
+  full: PathBuf,
 }
 
 /// Whether a path lies beyond a symbolic link: one of the directories on the way to it is a
 /// link, and what is found there is somewhere else's file. Asked once for each directory.
-fn beyond_link(root: &Path, path: &[u8], known: &mut std::collections::HashMap<Vec<u8>, bool>) -> bool {
+fn beyond_link(root: &Path, path: &[u8], known: &mut crate::store::PathMap<bool>) -> bool {
   let Some(slash) = path.iter().rposition(|&b| b == b'/') else { return false };
   let dir = &path[..slash];
   if let Some(answer) = known.get(dir) {
@@ -1198,7 +1276,26 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     // A submodule's directory is not ours to track.
     return Ok(());
   }
-  let full = ws.root.join(to_path(path));
+  // The file's whole path, in a buffer the thread keeps from one file to the next: nothing is
+  // allocated for a file that turns out to be as the index has it.
+  let mut full = std::mem::take(&mut found.full);
+  full.as_mut_os_string().clear();
+  full.push(&ws.root);
+  full.push(to_path(path));
+  let done = compare_at(ws, path, known, found, eols, ctimes, &full);
+  found.full = full;
+  done
+}
+
+fn compare_at(
+  ws: &Workspace,
+  path: &[u8],
+  known: Option<&Indexed>,
+  found: &mut Compared,
+  eols: &mut Eols,
+  ctimes: Ctimes,
+  full: &Path,
+) -> Result<()> {
   found.looked.stats += 1;
   // Files come a directory at a time: the directory just asked about is the next one's, nearly always.
   let dir = path.iter().rposition(|&b| b == b'/').map_or(&path[..0], |slash| &path[..slash]);
@@ -1209,7 +1306,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     found.last_dir = (dir.to_vec(), answer);
     answer
   };
-  let there = if beyond { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) } else { std::fs::symlink_metadata(&full) };
+  let there = if beyond { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) } else { std::fs::symlink_metadata(full) };
   let meta = match there {
     // A pipe, a socket, a device: nothing a tree holds, and reading one could wait for ever.
     Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => meta,
@@ -1231,14 +1328,15 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
   }
   found.looked.reads += 1;
   // A link is read as a link, and what it leads to is never opened: a pipe there would wait for ever.
-  let opened = if meta.is_file() { std::fs::File::open(&full).map(drop) } else { Ok(()) };
+  let opened = if meta.is_file() { std::fs::File::open(full).map(drop) } else { Ok(()) };
   let (mode, mut bytes) = match opened {
     // One file that may not be read is not a reason to record nothing of the others.
     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
       eprintln!("nv: {} may not be read ({e}): it is left out of this look, and of what is recorded", full.display());
+      found.looked.unreadable.push(path.to_vec());
       return Ok(());
     }
-    _ => read_content(&full, &meta)?,
+    _ => read_content(full, &meta)?,
   };
   // As it is first: most files are stored as they are on disk. Then as its rules say it is stored.
   let mut same = known.is_some_and(|k| k.entry.mode == mode && k.entry.id == object_id(Kind::Blob, &bytes));
@@ -1250,7 +1348,7 @@ fn compare(ws: &Workspace, path: &[u8], known: Option<&Indexed>, found: &mut Com
     same = known.is_some_and(|k| k.entry.mode == mode && k.entry.id == object_id(Kind::Blob, &bytes));
   }
   if let Some(k) = known.filter(|_| same) {
-    let now = indexed(&full, k.entry);
+    let now = indexed(full, k.entry);
     if now.mtime != 0 {
       found.refreshed.push((path.to_vec(), now));
     }
@@ -1392,7 +1490,9 @@ pub fn status(ws: &Workspace, look: Look) -> Result<(Vec<Difference>, Looked)> {
       let reported = ws.recorded();
       // A change to the rules of what is left out changes which files there are to record, anywhere
       // below it: no list of reported paths says which, so every file is looked at.
-      if reported.iter().any(|path| path.rsplit(|&b| b == b'/').next().is_some_and(|name| name == b".gitignore")) {
+      if reported.iter().any(|path| path.rsplit(|&b| b == b'/').next().is_some_and(|name| name == b".gitignore"))
+        || rules_outside_changed(ws)
+      {
         return status(ws, Look::Everywhere);
       }
       // A path that was a directory and is now a file takes the files it held with it; a path that
@@ -1659,6 +1759,7 @@ fn finish(ws: &Workspace, mut index: Index, todo: Vec<(Vec<u8>, Option<Indexed>)
     let (l, o, r) = part?;
     looked.stats += l.stats;
     looked.reads += l.reads;
+    looked.unreadable.extend(l.unreadable);
     out.extend(o);
     refreshed.extend(r);
   }
@@ -1694,6 +1795,32 @@ pub(crate) fn arriving(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("arriving")
 }
 
+/// The note a push leaves from before it is sent until its answer is heard: how many commits it
+/// carried, and the last of them. A push killed or timed out may have landed all the same, and
+/// until the workspace knows, nothing may go back past it or make its commits again.
+pub(crate) fn unheard(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("pushing")
+}
+
+/// The commits a push carried that the workspace has not heard about: `(how many, the last)`.
+pub fn unheard_push(ws: &Workspace) -> Option<(usize, Id)> {
+  let text = std::fs::read_to_string(unheard(ws)).ok()?;
+  let mut fields = text.split_whitespace();
+  let count = fields.next()?.parse().ok()?;
+  let last = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok())?;
+  Some((count, last))
+}
+
+/// Refused while a push of this workspace's may have landed unheard.
+pub fn not_unheard(ws: &Workspace, what: &str) -> Result<()> {
+  match unheard_push(ws) {
+    None => Ok(()),
+    Some(_) => Err(format!(
+      "{what} is refused: the last push from this workspace was not heard back from, and may have landed. `nv sync <dir>` finds out where the workspace stands, or `nv push <dir>` again. Nothing was touched."
+    )),
+  }
+}
+
 /// A sync that was killed while writing left files that are half the ref's and half the
 /// workspace's. Recorded as they are, they would be taken for the workspace's own changes.
 pub fn interrupted(ws: &Workspace) -> Result<()> {
@@ -1705,15 +1832,54 @@ pub fn interrupted(ws: &Workspace) -> Result<()> {
   Ok(())
 }
 
+/// The rules of what is left out that are not files of the tree, and so are never reported: the
+/// workspace's `.nv/exclude`, and Git's `info/exclude` where Git shares the directory. Their
+/// bytes, hashed: a copy of the workspace has the same.
+fn rules_outside(ws: &Workspace) -> String {
+  let mut hasher = blake3::Hasher::new();
+  for file in [ws.root.join(META).join("exclude"), ws.root.join(".git").join("info").join("exclude")] {
+    match std::fs::read(file) {
+      Ok(bytes) => hasher.update(&(bytes.len() as u64).to_le_bytes()).update(&bytes),
+      Err(_) => hasher.update(b"-"),
+    };
+  }
+  hasher.finalize().to_hex().to_string()
+}
+
+fn rules_seen(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("exclude.seen")
+}
+
+fn note_rules(ws: &Workspace, rules: Option<String>) {
+  if let Some(rules) = rules.filter(|rules| std::fs::read_to_string(rules_seen(ws)).map_or(true, |seen| seen.trim() != rules)) {
+    let _ = crate::write_whole(&rules_seen(ws), rules);
+  }
+}
+
+/// Whether those rules changed since the last look at every file. Nothing noted yet is nothing
+/// changed: the first snapshot notes them.
+fn rules_outside_changed(ws: &Workspace) -> bool {
+  std::fs::read_to_string(rules_seen(ws)).is_ok_and(|seen| seen.trim() != rules_outside(ws))
+}
+
 pub fn snapshot(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Option<Id>> {
+  snapshot_looking(store, ws, author, look).map(|(id, _)| id)
+}
+
+/// `snapshot`, saying also what its look found: which files may not be read, among others.
+fn snapshot_looking(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<(Option<Id>, Looked)> {
   interrupted(ws)?;
-  let (found, _) = status(ws, look)?;
+  // The rules outside the tree as this look finds them, noted once what it found is recorded, when
+  // it looked at every file (or there is nothing noted yet).
+  let rules = (look == Look::Everywhere || rules_outside_changed(ws) || !rules_seen(ws).exists()).then(|| rules_outside(ws));
+  let (found, looked) = status(ws, look)?;
   // What was reported is forgotten only once it is recorded: a kill before that leaves the
   // report, and the paths are looked at again.
   let journal = ws.root.join(META).join("journal");
   if found.is_empty() {
     let _ = std::fs::remove_file(journal);
-    return Ok(None);
+    note_rules(ws, rules);
+    return Ok((None, looked));
   }
   let mut index = ws.load_index();
   let mut changes: Vec<Change> = Vec::with_capacity(found.len());
@@ -1733,12 +1899,13 @@ pub fn snapshot(store: &mut Store, ws: &mut Workspace, author: &str, look: Look)
   }
   let id = Commit { parents: ws.head.into_iter().collect(), rest: rest_of(author, "snapshot"), changes }.store(store)?;
   store.flush()?;
+  ws.log("snapshot", &id)?;
   ws.head = Some(id);
   ws.save()?;
   index.save()?;
   let _ = std::fs::remove_file(journal);
-  ws.log("snapshot", &id)?;
-  Ok(Some(id))
+  note_rules(ws, rules);
+  Ok((Some(id), looked))
 }
 
 /// Publish: one commit on the last published one, holding everything the
@@ -1754,6 +1921,7 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
   if ws.head == ws.base {
     return Ok(None);
   }
+  refuse_sync_markers(store, ws)?;
   let from = match ws.base {
     Some(base) => root_of(store, &base)?,
     None => None,
@@ -1774,10 +1942,240 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
   let id = Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?;
   root_of(store, &id)?;
   store.flush()?;
+  ws.log("commit", &id)?;
   (ws.base, ws.head) = (Some(id), Some(id));
   ws.save()?;
-  ws.log("commit", &id)?;
   Ok(Some(id))
+}
+
+/// Who a commit made here is by, and when, as Git would say it: the
+/// environment first, then the workspace's own `user.name` and `user.email`,
+/// then the user's Git configuration; the time now, in the zone this
+/// machine is in, unless the environment gives one.
+pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
+  let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
+  let own =
+    |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
+  let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
+  let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| crate::git::config_value(&ws.root, "user", "name"));
+  let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| crate::git::config_value(&ws.root, "user", "email"));
+  // A commit is published under somebody's name. Git refuses to make one up, and so does this.
+  let (Some(name), Some(email)) = (name, email) else {
+    return Err(format!(
+      "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
+    ));
+  };
+  let when = match from_env("DATE") {
+    Some(date) => crate::git::stamp(&date)
+      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
+    None => {
+      let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
+      let east = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let at: libc::time_t = now as libc::time_t;
+        libc::localtime_r(&at, &mut tm);
+        tm.tm_gmtoff
+      };
+      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
+    }
+  };
+  Ok(format!("{name} <{email}> {when}"))
+}
+
+/// Publish a state recorded since the last commit, though the files have moved on: one commit on
+/// the last, of what that state changed. What was recorded after it stays recorded, on top of the
+/// new commit, as changes not committed. `None` when the state is the last commit's files.
+///
+/// For a writer that does not commit: what its conditions passed on is committed as it was, while
+/// it goes on writing. Not beside Git, where a commit is made by Git, from the files.
+pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<u8>, author: &str) -> Result<Option<Id>> {
+  if crate::colocated::shared(&ws.root) {
+    return Err("committing a state the files have moved on from is not done beside Git, where Git commits the files".to_string());
+  }
+  // A state of this workspace's since its last commit: on the way back from where it is now.
+  let mut at = ws.head;
+  let mut found = false;
+  while let Some(id) = at.filter(|id| Some(*id) != ws.base) {
+    if id == state {
+      found = true;
+      break;
+    }
+    at = Commit::load(store, &id)?.parents.first().copied();
+  }
+  if !found {
+    if Some(state) == ws.base {
+      return Ok(None);
+    }
+    return Err(format!("{} is not a state recorded here since the last commit", &hex(&state)[..12]));
+  }
+  refuse_sync_markers_in(store, ws, Some(state))?;
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let (from, to, now) = (tree(store, ws.base)?, tree(store, Some(state))?, tree(store, ws.head)?);
+  let whole = whole_since(store, Some(state), ws.base)?;
+  let changes = crate::manifest::diff_keeping(store, from, to, &whole)?;
+  if changes.is_empty() {
+    return Ok(None);
+  }
+  // The settling of files a sync left out of this workspace's own commit completes that commit,
+  // under its message: not a commit of its own after one that falls short of what it says.
+  let id = match incomplete(store, ws)? {
+    Some((short, paths)) if changes.iter().all(|(path, _)| paths.contains(path)) => {
+      let was = Commit::load(store, &short)?;
+      let mut whole = was.changes.clone();
+      for (path, entry) in changes {
+        match whole.iter_mut().find(|(p, _)| *p == path) {
+          Some(change) => change.1 = entry,
+          None => whole.push((path, entry)),
+        }
+      }
+      whole.sort_by(|a, b| a.0.cmp(&b.0));
+      let _ = std::fs::remove_file(incomplete_file(ws));
+      let made = Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?;
+      // The settling does not answer for the message: what was said of its base still stands.
+      if let Some((moved, under)) = moved_under(ws).filter(|(id, _)| *id == short) {
+        let _ = moved;
+        set_moved(ws, Some(made), &under)?;
+      }
+      made
+    }
+    _ => Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?,
+  };
+  root_of(store, &id)?;
+  // What came after the state, recorded again on the new commit.
+  let head = if Some(state) == ws.head {
+    id
+  } else {
+    let whole = whole_since(store, ws.head, Some(state))?;
+    let later = crate::manifest::diff_keeping(store, to, now, &whole)?;
+    if later.is_empty() { id } else { carry(store, id, later, author)? }
+  };
+  store.flush()?;
+  ws.log("commit", &id)?;
+  if head != id {
+    ws.log("snapshot", &head)?;
+  }
+  let based = ws.base;
+  (ws.base, ws.head) = (Some(id), Some(head));
+  ws.save()?;
+  take_branch_along(store, ws, based)?;
+  Ok(Some(id))
+}
+
+/// The commits published here and not pushed, oldest first: since the ref's tip as this workspace
+/// last saw it, or, for one that never saw it, since the commit it was made at.
+pub fn pending(store: &mut Store, ws: &Workspace) -> Result<Vec<(Id, Commit)>> {
+  let until = ws.pushed.or(ws.start);
+  let mut chain = Vec::new();
+  let mut at = ws.base;
+  while let Some(id) = at.filter(|id| Some(*id) != until) {
+    let commit = Commit::load(store, &id)?;
+    at = commit.parents.first().copied();
+    chain.push((id, commit));
+    if chain.len() > 100_000 {
+      return Err("more than 100,000 commits since the ref: this workspace does not stand on it".to_string());
+    }
+  }
+  chain.reverse();
+  Ok(chain)
+}
+
+/// Make the commits not pushed again, as fewer: one new commit for each `(to, rest)`, of all that
+/// the commits up to and including `to` changed since the one before. Where each `to` is a
+/// checkpoint, each new commit is a state the conditions passed on. Commits after the last `to`
+/// are made again as they were, on top; what is recorded and not committed stays so. The files
+/// are not touched: the last commit has the same files as before.
+pub fn rebuild(store: &mut Store, ws: &mut Workspace, plan: &[(Id, Vec<u8>)], author: &str) -> Result<Vec<Id>> {
+  not_unheard(ws, "rebuilding the commits not pushed")?;
+  if crate::colocated::shared(&ws.root) {
+    return Err("rebuilding commits is not done beside Git: there, Git's own commands do it".to_string());
+  }
+  // What is not pushed has to have an end: the ref as last seen, or the commit the workspace was
+  // made at. Without either it is the whole history, and nothing is made again of that.
+  if ws.pushed.or(ws.start).is_none() {
+    return Err(
+      "this workspace has no ref it pushes to (`nv remote`), nor a commit it was made at: every commit it has would be made again. Nothing was changed".to_string(),
+    );
+  }
+  let chain = pending(store, ws)?;
+  if chain.is_empty() {
+    return Err("there are no commits here that are not pushed".to_string());
+  }
+  if let Some((id, _)) = chain.iter().find(|(_, c)| c.parents.len() > 1) {
+    return Err(format!("{} is a merge: a ref holds one line of commits, and so does a rebuild", &hex(id)[..12]));
+  }
+  // Each `to` among them, in order.
+  let mut ends = Vec::new();
+  let mut from = 0;
+  for (to, _) in plan {
+    let Some(at) = chain[from..].iter().position(|(id, _)| id == to) else {
+      return Err(if chain.iter().any(|(id, _)| id == to) {
+        format!("{} comes before the commit named before it: name them oldest first", &hex(to)[..12])
+      } else {
+        format!("{} is not one of the commits here that are not pushed (`nv pending` lists them)", &hex(to)[..12])
+      });
+    };
+    ends.push(from + at);
+    from += at + 1;
+  }
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let bottom = chain[0].1.parents.first().copied();
+  let mut on = bottom;
+  let mut made = Vec::new();
+  let next = |store: &mut Store, on: Option<Id>, upto: Id, rest: Vec<u8>| -> Result<Option<Id>> {
+    let whole = whole_since(store, Some(upto), bottom)?;
+    let (a, b) = (tree(store, on)?, tree(store, Some(upto))?);
+    let changes = crate::manifest::diff_keeping(store, a, b, &whole)?;
+    if changes.is_empty() {
+      return Ok(None);
+    }
+    let id = Commit { parents: on.into_iter().collect(), rest, changes }.store(store)?;
+    root_of(store, &id)?;
+    Ok(Some(id))
+  };
+  for ((_, rest), end) in plan.iter().zip(&ends) {
+    if let Some(id) = next(store, on, chain[*end].0, rest.clone())? {
+      made.push(id);
+      on = Some(id);
+    }
+  }
+  // After the last one named, the commits as they were.
+  for (id, commit) in &chain[ends.last().map_or(0, |e| e + 1)..] {
+    if let Some(again) = next(store, on, *id, commit.rest.clone())? {
+      made.push(again);
+      on = Some(again);
+    }
+  }
+  if tree(store, on)? != tree(store, ws.base)? {
+    return Err("the commits made again do not come to the same files: nothing was changed".to_string());
+  }
+  let head = if ws.head == ws.base {
+    on
+  } else {
+    let whole = whole_since(store, ws.head, ws.base)?;
+    let (a, b) = (tree(store, ws.base)?, tree(store, ws.head)?);
+    let later = crate::manifest::diff_keeping(store, a, b, &whole)?;
+    match (on, later.is_empty()) {
+      (Some(on), false) => Some(carry(store, on, later, author)?),
+      _ => on,
+    }
+  };
+  store.flush()?;
+  for id in &made {
+    ws.log("commit", id)?;
+  }
+  if head != on
+    && let Some(head) = head
+  {
+    ws.log("snapshot", &head)?;
+  }
+  let based = ws.base;
+  (ws.base, ws.head) = (on, head);
+  ws.save()?;
+  take_branch_along(store, ws, based)?;
+  // Messages written again are written on the base the commits now stand on.
+  set_moved(ws, None, &[])?;
+  Ok(made)
 }
 
 /// The directories set whole by the commits from `from` back to, and not
@@ -1985,7 +2383,7 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
     let differing: Vec<Vec<u8>> = crate::manifest::diff(store, from, to)?.into_iter().map(|(path, _)| path).collect();
     ws.note(&differing)?;
   }
-  snapshot(store, ws, author, look)?;
+  let (_, looked) = snapshot_looking(store, ws, author, look)?;
   let kept = ws.head.filter(|head| Some(*head) != before);
   let from = match ws.head {
     Some(head) => root_of(store, &head)?,
@@ -2126,15 +2524,27 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
       }
     }
   }
+  ws.log("restore", &target)?;
   ws.head = Some(target);
   placed.into_index(&mut index);
   ws.save()?;
   index.save()?;
-  ws.log("restore", &target)?;
   if !stuck.is_empty() {
     return Err(format!(
       "restored, except that these could not be removed and are still there: {}\n{} files written, {} removed",
       stuck.join(", "),
+      done.written,
+      done.removed
+    ));
+  }
+  // A file that may not be read was not recorded, and so was not restored: what it holds is not
+  // known to be what the state has. Not a restore that went through.
+  if !looked.unreadable.is_empty() {
+    let mut left: Vec<String> = looked.unreadable.iter().map(|path| String::from_utf8_lossy(path).into_owned()).collect();
+    left.sort();
+    return Err(format!(
+      "restored, except these, which may not be read: they were not recorded, and are left as they are: {}\n{} files written, {} removed. Make them readable and restore again.",
+      left.join(", "),
       done.written,
       done.removed
     ));
@@ -2194,6 +2604,8 @@ impl Standing {
 /// since is again something the workspace has not seen. A push will be
 /// refused as it was before, and a sync will merge again.
 pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Restored> {
+  // A push of what the sync made may have landed: undoing the sync would make its commits again.
+  not_unheard(ws, "undoing the last sync")?;
   let Some(was) = Standing::kept(ws) else {
     return Err(
       "there is no catching-up to undo: this workspace has not synced since it was made, or has pushed since it last did".to_string(),
@@ -2237,6 +2649,8 @@ pub fn take_branch_along(store: &mut Store, ws: &Workspace, was: Option<Id>) -> 
 /// recorded first and its id handed back. For a workspace whose own work cannot go on top of
 /// what the ref has since.
 pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Restored> {
+  // What is set aside is what the ref does not have: not known while a push may have landed.
+  not_unheard(ws, "setting aside what was not pushed")?;
   // The ref as last seen; for a workspace that never saw it, the commit the workspace was made at.
   let pushed = ws.pushed.or(ws.start).ok_or("this workspace has not pushed to or synced with a server, and was not made at a commit")?;
   snapshot(store, ws, author, look)?;
@@ -2256,6 +2670,59 @@ pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look
 
 fn unsettled_file(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("conflicts")
+}
+
+fn moved_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("moved")
+}
+
+/// Note that this workspace's own commit was put on commits of others that change files it
+/// changes, and what those say of themselves: its message was written before them.
+pub(crate) fn set_moved(ws: &Workspace, commit: Option<Id>, under: &[String]) -> Result<()> {
+  match commit {
+    Some(id) => crate::write_whole(&moved_file(ws), format!("{}\n{}\n", hex(&id), under.join("\n"))),
+    None => {
+      let _ = std::fs::remove_file(moved_file(ws));
+      Ok(())
+    }
+  }
+}
+
+/// The commit whose message was written before the commits of others it now stands on, and those
+/// commits' summary lines.
+pub fn moved_under(ws: &Workspace) -> Option<(Id, Vec<String>)> {
+  let text = std::fs::read_to_string(moved_file(ws)).ok()?;
+  let mut lines = text.lines();
+  let id = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())?;
+  Some((id, lines.filter(|l| !l.is_empty()).map(str::to_string).collect()))
+}
+
+fn incomplete_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("incomplete")
+}
+
+/// Note the commit of this workspace's own that a sync put on the ref's tip without the files it
+/// left holding both versions, and which they are: the commit their settling completes.
+pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String]) -> Result<()> {
+  match commit.filter(|_| !paths.is_empty()) {
+    Some(id) => crate::write_whole(&incomplete_file(ws), format!("{}\n{}\n", hex(&id), paths.join("\n"))),
+    None => {
+      let _ = std::fs::remove_file(incomplete_file(ws));
+      Ok(())
+    }
+  }
+}
+
+/// The commit a settling completes, and the paths it was left without, while that commit is
+/// still the last made here, not pushed, and no push of it may have landed unheard.
+fn incomplete(store: &mut Store, ws: &Workspace) -> Result<Option<(Id, Vec<Vec<u8>>)>> {
+  let Ok(text) = std::fs::read_to_string(incomplete_file(ws)) else { return Ok(None) };
+  let mut lines = text.lines();
+  let Some(id) = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok()) else { return Ok(None) };
+  if ws.base != Some(id) || unheard(ws).exists() || pending(store, ws)?.last().map(|(c, _)| *c) != Some(id) {
+    return Ok(None);
+  }
+  Ok(Some((id, lines.map(|l| l.as_bytes().to_vec()).collect())))
 }
 
 /// Note the files a sync left holding both versions between markers.
@@ -2514,10 +2981,10 @@ pub fn commit_selected(
   let id = Commit { parents: ws.head.into_iter().collect(), rest, changes }.store(store)?;
   root_of(store, &id)?;
   store.flush()?;
+  ws.log("commit", &id)?;
   (ws.base, ws.head) = (Some(id), Some(id));
   ws.save()?;
   index.save()?;
-  ws.log("commit", &id)?;
   Ok(Some(id))
 }
 
@@ -2559,10 +3026,10 @@ pub fn commit_entries_as(
     root_of(store, &id)?;
   }
   store.flush()?;
+  ws.log("commit", &id)?;
   (ws.base, ws.head) = (Some(id), Some(id));
   ws.save()?;
   index.save()?;
-  ws.log("commit", &id)?;
   Ok(id)
 }
 
@@ -2579,6 +3046,12 @@ pub fn write_entries(store: &mut Store, ws: &Workspace, entries: &[(Vec<u8>, Ent
 /// Move the workspace to another commit. Refused, with nothing touched, if
 /// a file it would change has been changed here, or sits here untracked.
 pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
+  switch_over(store, ws, target, &[])
+}
+
+/// `switch`, where the files at `staged` are what the commit gone to has (staged as it has them,
+/// for a fast-forward): those are not in the way, if on disk they are that too.
+pub fn switch_over(store: &mut Store, ws: &mut Workspace, target: Id, staged: &[Vec<u8>]) -> Result<()> {
   let (found, _) = status(ws, Look::Everywhere)?;
   let from = match ws.head {
     Some(head) => root_of(store, &head)?,
@@ -2586,10 +3059,15 @@ pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
   };
   let to = root_of(store, &target)?;
   let changes = removals_first(crate::manifest::diff(store, from, to)?);
-  // A file gone from the disk that the commit gone to does not have either is not in the way.
+  // A file gone from the disk that the commit gone to does not have either is not in the way, nor
+  // one staged as the commit has it that is that on disk too.
+  let already = |path: &Vec<u8>, new: &Option<Content>, entry: &Option<Entry>| match (new, entry) {
+    (Some((mode, bytes)), Some(entry)) => staged.contains(path) && *mode == entry.mode && object_id(Kind::Blob, bytes) == entry.id,
+    _ => false,
+  };
   let in_the_way: Vec<String> = found
     .iter()
-    .filter(|(path, new, _)| changes.iter().any(|(p, entry)| p == path && (new.is_some() || entry.is_some())))
+    .filter(|(path, new, _)| changes.iter().any(|(p, entry)| p == path && (new.is_some() || entry.is_some()) && !already(path, new, entry)))
     .map(|(path, _, _)| String::from_utf8_lossy(path).into_owned())
     .collect();
   if !in_the_way.is_empty() {
@@ -2599,7 +3077,10 @@ pub fn switch(store: &mut Store, ws: &mut Workspace, target: Id) -> Result<()> {
   if !blocking.is_empty() {
     return Err(format!("Updating the following directories would lose untracked files in them:\n\t{}", blocking.join("\n\t")));
   }
-  let untracked = untracked_in_the_way(store, &ws.root, from, &changes)?;
+  let mut untracked = untracked_in_the_way(store, &ws.root, from, &changes)?;
+  untracked.retain(|path| {
+    !found.iter().any(|(p, new, _)| p.as_slice() == path.as_bytes() && changes.iter().any(|(c, entry)| c == p && already(p, new, entry)))
+  });
   if !untracked.is_empty() {
     return Err(format!(
       "The following untracked working tree files would be overwritten by checkout:\n\t{}\nPlease move or remove them before you switch branches.",
@@ -2715,10 +3196,10 @@ pub fn take_changes(store: &mut Store, ws: &mut Workspace, changes: Vec<Change>,
   let mut index = apply_into(store, ws, &changes)?;
   let id = Commit { parents: ws.head.into_iter().collect(), rest: rest_of(author, "snapshot"), changes }.store(store)?;
   store.flush()?;
+  ws.log("snapshot", &id)?;
   ws.head = Some(id);
   ws.save()?;
   index.save()?;
-  ws.log("snapshot", &id)?;
   Ok(id)
 }
 

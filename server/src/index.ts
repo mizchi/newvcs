@@ -1,9 +1,13 @@
 // Routes to the repository's Durable Object:
 //
-//   POST /<owner>/<repo>/push/<ref>?after=N&commits=M
+//   POST /<owner>/<repo>/push/<ref>?after=N&commits=M[&stated=1]
 //                                     body: frames, M commits (one if not said) each on the one
-//                                     before, then the file contents they name
-//                                     -> PushResult, with the commits since N if asked
+//                                     before, then, with `stated`, what the pusher says of the
+//                                     paths it changes that merge by union (JSON, `Attested`),
+//                                     then the file contents they name
+//                                     -> PushResult, with the commits since N if asked. A push
+//                                        that clashes only on such paths is merged here, as
+//                                        `nv sync` would merge it, and lands; the answer names them
 //   GET  /<owner>/<repo>/since/<ref>?after=N  -> { tip, seq, since: the commits after N } | 404
 //   POST /<owner>/<repo>/locate/<ref>         body: commit ids, 32 bytes each, newest first
 //                                     -> the first one the ref's history holds, and its position | 404
@@ -44,9 +48,11 @@
 // of them. What a repository may read is what its table says it was given:
 // knowing an id is not having the content.
 
-import { hex, MAX_PATH, refOk, unhex } from "./commit.ts";
+import { decode, encode, hex, idOf, MAX_PATH, refOk, unhex } from "./commit.ts";
 import { blobHasher, blobId, hash, objectId } from "./hash.ts";
-import { Repo, type Placed, type Step } from "./repo.ts";
+import { merging } from "./merger.ts";
+import compiledMerger from "./merger.wasm";
+import { type Attested, type Landed, Repo, type Placed, type Stated, type Step } from "./repo.ts";
 import { decodeTree, KIND_TREE, MODE_DIR, MODE_GITLINK } from "./tree.ts";
 
 export { Repo };
@@ -93,6 +99,94 @@ function packed(contents: Uint8Array[]): [Uint8Array, number[]] {
 
 const steps = (since: Step[]) => since.map((s) => ({ seq: s.seq, id: s.id, bytes: hex(s.bytes) }));
 
+const merger = merging(compiledMerger);
+
+/// What a pusher states of its union paths, if it is well formed: nothing in it is believed yet.
+function statement(bytes: Uint8Array): Attested | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    return null;
+  }
+  const entry = (e: unknown): e is Stated | null =>
+    e === null || (typeof e === "object" && typeof (e as Stated).mode === "number" && typeof (e as Stated).id === "string" && /^[0-9a-f]{64}$/.test((e as Stated).id));
+  const v = value as Attested;
+  const ok =
+    typeof v === "object" && v !== null && Array.isArray(v.union) && Array.isArray(v.attributes) && v.union.length <= 1000 && v.attributes.length <= 10_000 &&
+    v.union.every((u) => typeof u?.path === "string" && entry(u.base)) &&
+    v.attributes.every((a) => typeof a?.path === "string" && (a.path === ".gitattributes" || a.path.endsWith("/.gitattributes")) && entry(a.entry));
+  return ok ? { union: v.union.map((u) => ({ path: u.path, base: u.base })), attributes: v.attributes.map((a) => ({ path: a.path, entry: a.entry })) } : null;
+}
+
+/// The contents of these placed ids, from the bucket.
+async function read(env: Env, placed: Placed[]): Promise<Map<string, Uint8Array>> {
+  const out = new Map<string, Uint8Array>();
+  await Promise.all(
+    placed.map(async (c) => {
+      const object = c.pack
+        ? await env.OBJECTS.get(`packs/${hex(c.pack)}`, { range: { offset: c.at, length: c.length } })
+        : await env.OBJECTS.get(`objects/${hex(c.id)}`);
+      if (!object) throw new Error(`content ${hex(c.id)} is not in the bucket`);
+      out.set(hex(c.id), new Uint8Array(await object.arrayBuffer()));
+    }),
+  );
+  return out;
+}
+
+/// A push refused for clashing only on paths `.gitattributes` merges by union, merged here as a
+/// sync would merge it: each such path of each commit of the chain, on what the one before it
+/// became, the first on the ref's tip; and landed. `null` where it cannot be: the push stays
+/// refused, and its writer syncs. Made again if the ref moved meanwhile, a few times.
+async function mergeOnServer(env: Env, repo: DurableObjectStub<Repo>, ref: string, chain: Uint8Array[], attested: Attested, after: number | null): Promise<Landed | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const plan = await repo.unionPlan(ref, chain, attested);
+    if ("why" in plan) return null;
+    const bytes = await read(env, plan.contents);
+    const of = (id: string) => bytes.get(id)!;
+    const rules = new Map(plan.attributes.map((a) => [a.dir, of(a.id)]));
+    // The ref's rules, as the pusher started from them, say union for every one of them; and
+    // they are text.
+    if (!plan.paths.every((p) => merger.isUnion(p.path, rules))) return null;
+    if (plan.paths.some((p) => [p.base, p.theirs, ...p.chain].some((id) => id !== null && of(id).includes(0)))) return null;
+    const commits = chain.map(decode);
+    const made: Uint8Array[] = [];
+    const contents: Uint8Array[] = [];
+    // For each path, what it was before the commit being made again, as sent and as made.
+    const sentBefore = new Map(plan.paths.map((p) => [p.path, of(p.base)]));
+    const madeBefore = new Map(plan.paths.map((p) => [p.path, of(p.theirs)]));
+    let previous = unhex(plan.tip);
+    for (const [i, commit] of commits.entries()) {
+      const changes = commit.changes.map((c) => {
+        const path = new TextDecoder().decode(c.path);
+        const p = plan.paths.find((x) => x.path === path);
+        if (!p || !c.entry) return c;
+        const ours = of(p.chain[i]!);
+        const mergedBytes = merger.mergeUnion(sentBefore.get(path)!, ours, madeBefore.get(path)!);
+        sentBefore.set(path, ours);
+        madeBefore.set(path, mergedBytes);
+        contents.push(mergedBytes);
+        return { path: c.path, entry: { mode: c.entry.mode, id: blobId(mergedBytes) } };
+      });
+      const encoded = encode({ ...commit, parents: [previous, ...commit.parents.slice(1)], changes });
+      made.push(encoded);
+      previous = idOf(encoded);
+    }
+    const placed: Placed[] = [];
+    if (contents.length > 0) {
+      const [pack, at] = packed(contents);
+      const packId = hash(pack);
+      contents.forEach((c, i) => placed.push({ id: blobId(c), pack: packId, at: at[i]!, length: c.length }));
+      await env.OBJECTS.put(`packs/${hex(packId)}`, pack);
+    }
+    const landed = await repo.landMerged(ref, chain, made, plan.tipSeq, plan.paths.map((p) => p.path), placed, after);
+    if ("moved" in landed) continue;
+    if (landed.status !== "updated" && landed.status !== "rebased") return null;
+    return { ...landed, merged: plan.paths.map((p) => p.path) };
+  }
+  return null;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -125,7 +219,15 @@ export default {
           if (!Number.isInteger(count) || count < 1 || all.length < count) return json({ error: "a push carries a commit" }, 400);
           // Their own bytes: a view into the request would take the whole request along to the object.
           const commits = all.slice(0, count).map((bytes) => bytes.slice());
-          const contents = all.slice(count);
+          const stated = url.searchParams.get("stated") === "1";
+          let attested: Attested | null = null;
+          if (stated) {
+            const said = all[count];
+            if (!said) return json({ error: "a push that states its union paths says what of them" }, 400);
+            attested = statement(said);
+            if (!attested) return json({ error: "what a push states of its union paths is not well formed" }, 400);
+          }
+          const contents = all.slice(count + (stated ? 1 : 0));
           // A name is a promise about the content, so the name is worked out here, not taken.
           // All of them go into the bucket as one object.
           const placed: Placed[] = [];
@@ -136,6 +238,10 @@ export default {
             await env.OBJECTS.put(`packs/${hex(packId)}`, pack);
           }
           const result = await repo.push(arg, commits, after, placed);
+          if (result.status === "conflict" && attested) {
+            const merged = await mergeOnServer(env, repo, arg, commits, attested, after);
+            if (merged) return json({ ...merged, since: steps(merged.since) });
+          }
           if (result.status === "conflict" || result.status === "unknown-base") return json(result, 409);
           return json({ ...result, since: steps(result.since) });
         }

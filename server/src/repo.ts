@@ -23,19 +23,41 @@
 // tip, so a writer a million commits behind costs what one at the tip does.
 
 import { DurableObject } from "cloudflare:workers";
-import { decode, encode, folded, hex, idOf, MAX_PATH } from "./commit.ts";
+import { type Commit, decode, encode, folded, hex, idOf, MAX_PATH, pathOk } from "./commit.ts";
 import { MODE_DIR, MODE_GITLINK } from "./tree.ts";
 
 export type Step = { seq: number; id: string; bytes: Uint8Array };
 /// Where a file's content is in the bucket: at `at` in the pack `pack`, or
 /// in an object of its own when `pack` is null.
 export type Placed = { id: Uint8Array; pack: Uint8Array | null; at: number; length: number };
+/// A push that landed: `merged` names the paths the server merged by union, if it did.
+export type Landed = { status: "updated" | "rebased"; commit: string; commits: string[]; seq: number; behind: number; since: Step[]; merged?: string[] };
 export type PushResult =
-  | { status: "updated" | "rebased"; commit: string; commits: string[]; seq: number; behind: number; since: Step[] }
+  | Landed
   | { status: "conflict"; commit: string; tip: string; paths: string[]; behind: number }
   | { status: "unknown-base"; tip: string };
 
+/// A path's entry, as a pusher states it and as the server knows it.
+export type Stated = { mode: number; id: string };
+/// What a pusher says of the paths it changes that `.gitattributes` merges by union: each one's
+/// entry at the push's base, and the `.gitattributes` files above it there (`null`: none).
+export type Attested = { union: { path: string; base: Stated | null }[]; attributes: { path: string; entry: Stated | null }[] };
+/// What a merge on the server needs, all of it checked: for each path, the entry at the push's
+/// base, the ref's at its tip, and the push's in each of its commits (`null`: not changed there).
+export type UnionPlan = {
+  tip: string;
+  tipSeq: number;
+  paths: { path: string; mode: number; base: string; theirs: string; chain: (string | null)[] }[];
+  attributes: { dir: string; id: string }[];
+  contents: Placed[];
+};
+
 const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+const REGULAR = [0o100644, 0o100755, 0o100664];
+/// The directories whose `.gitattributes` speak of a path, the top first (`union::attribute_dirs`).
+const attributeDirs = (path: string) => ["", ...[...path.matchAll(/\//g)].map((m) => path.slice(0, m.index))];
+const attributesAt = (dir: string) => (dir ? `${dir}/.gitattributes` : ".gitattributes");
 
 export class Repo extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -54,6 +76,8 @@ export class Repo extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS tree_depth (id BLOB PRIMARY KEY, deepest INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS live (ref TEXT NOT NULL, folded TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (ref, folded)) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS live_by_path ON live (ref, path);
+      CREATE TABLE IF NOT EXISTS path_index (ref TEXT NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, mode INTEGER, id BLOB, PRIMARY KEY (ref, path, seq)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
     `);
   }
 
@@ -143,32 +167,8 @@ export class Repo extends DurableObject<Env> {
       }
 
       const parent = first.parents[0] ?? null;
-      const accept = (onto: Uint8Array | null, status: "updated" | "rebased", behind: number): PushResult => {
-        let seq = at?.seq ?? 0;
-        // A ref's first commit brings its parent along as position 0, so that
-        // a workspace still on that parent can find itself in the history.
-        if (!at && parent) sql.exec("INSERT INTO history (ref, seq, id) VALUES (?, 0, ?)", ref, parent);
-        const ids: Uint8Array[] = [];
-        let previous = onto;
-        commits.forEach((commit, i) => {
-          // Only the parent, and so the id, differs from what was sent.
-          const bytes = previous && status === "rebased" ? encode({ ...commit, parents: [previous, ...commit.parents.slice(1)] }) : chain[i]!;
-          const id = idOf(bytes);
-          seq += 1;
-          sql.exec("INSERT OR IGNORE INTO commits (id, bytes) VALUES (?, ?)", id, bytes);
-          sql.exec("INSERT INTO history (ref, seq, id) VALUES (?, ?, ?)", ref, seq, id);
-          for (const c of commit.changes) {
-            sql.exec("INSERT INTO changed (ref, path, seq) VALUES (?, ?, ?) ON CONFLICT (ref, path) DO UPDATE SET seq = excluded.seq", ref, decoder.decode(c.path), seq);
-            this.spell(ref, decoder.decode(c.path), c.entry);
-          }
-          ids.push(id);
-          previous = id;
-        });
-        const last = ids[ids.length - 1]!;
-        sql.exec("INSERT INTO refs (name, tip, seq) VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE SET tip = excluded.tip, seq = excluded.seq", ref, last, seq);
-        sql.exec("INSERT OR REPLACE INTO landed (ref, sent, landed, moved) VALUES (?, ?, ?, ?)", ref, sent, last, status === "rebased" ? 1 : 0);
-        return { status, commit: hex(last), commits: ids.map(hex), seq, behind, since: since() };
-      };
+      const accept = (onto: Uint8Array | null, status: "updated" | "rebased", behind: number): PushResult =>
+        this.accept(ref, at ?? null, parent, commits, (i, previous) => (previous && status === "rebased" ? encode({ ...commits[i]!, parents: [previous, ...commits[i]!.parents.slice(1)] }) : chain[i]!), onto, status, behind, sent, since);
       // A new ref starts wherever its first commit says.
       if (!tip || !at || (parent && hex(parent) === hex(tip))) return accept(null, "updated", 0);
 
@@ -190,6 +190,174 @@ export class Repo extends DurableObject<Env> {
       }
       // Nothing in the way: the same changes, on the tip.
       return accept(tip, "rebased", behind);
+    });
+  }
+
+  /// Put commits on the ref: `bytes(i, previous)` is the i-th as it lands, on `previous`.
+  private accept(
+    ref: string,
+    at: { tip: ArrayBuffer; seq: number } | null,
+    parent: Uint8Array | null,
+    commits: Commit[],
+    bytes: (i: number, previous: Uint8Array | null) => Uint8Array,
+    onto: Uint8Array | null,
+    status: "updated" | "rebased",
+    behind: number,
+    sent: Uint8Array,
+    since: () => Step[],
+  ): PushResult {
+    const sql = this.ctx.storage.sql;
+    let seq = at?.seq ?? 0;
+    // A ref's first commit brings its parent along as position 0, so that
+    // a workspace still on that parent can find itself in the history.
+    if (!at && parent) sql.exec("INSERT INTO history (ref, seq, id) VALUES (?, 0, ?)", ref, parent);
+    // Every change to every path from here on is in `path_index`: what a merge on the server
+    // reads a path's entry at a push's base from. A ref older than the index is not merged on.
+    sql.exec("INSERT OR IGNORE INTO indexed (ref, since) VALUES (?, ?)", ref, seq);
+    const ids: Uint8Array[] = [];
+    let previous = onto;
+    commits.forEach((commit, i) => {
+      const encoded = bytes(i, previous);
+      const landed = decode(encoded);
+      const id = idOf(encoded);
+      seq += 1;
+      sql.exec("INSERT OR IGNORE INTO commits (id, bytes) VALUES (?, ?)", id, encoded);
+      sql.exec("INSERT INTO history (ref, seq, id) VALUES (?, ?, ?)", ref, seq, id);
+      for (const c of landed.changes) {
+        const path = decoder.decode(c.path);
+        sql.exec("INSERT INTO changed (ref, path, seq) VALUES (?, ?, ?) ON CONFLICT (ref, path) DO UPDATE SET seq = excluded.seq", ref, path, seq);
+        sql.exec("INSERT OR REPLACE INTO path_index (ref, path, seq, mode, id) VALUES (?, ?, ?, ?, ?)", ref, path, seq, c.entry?.mode ?? null, c.entry?.id ?? null);
+        this.spell(ref, path, c.entry);
+      }
+      ids.push(id);
+      previous = id;
+    });
+    const last = ids[ids.length - 1]!;
+    sql.exec("INSERT INTO refs (name, tip, seq) VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE SET tip = excluded.tip, seq = excluded.seq", ref, last, seq);
+    sql.exec("INSERT OR REPLACE INTO landed (ref, sent, landed, moved) VALUES (?, ?, ?, ?)", ref, sent, last, status === "rebased" ? 1 : 0);
+    return { status, commit: hex(last), commits: ids.map(hex), seq, behind, since: since() };
+  }
+
+  /// The entry `path` had at position `seq` of the ref, as far as the index knows: `undefined`
+  /// where no change to it at or before `seq` is in it.
+  private entryAt(ref: string, path: string, seq: number): { mode: number; id: Uint8Array } | null | undefined {
+    const row = this.ctx.storage.sql
+      .exec<{ mode: number | null; id: ArrayBuffer | null }>("SELECT mode, id FROM path_index WHERE ref = ? AND path = ? AND seq <= ? ORDER BY seq DESC LIMIT 1", ref, path, seq)
+      .toArray()[0];
+    if (!row) return undefined;
+    return row.mode === null || row.id === null ? null : { mode: row.mode, id: new Uint8Array(row.id) };
+  }
+
+  /// Whether a push refused for clashing only on paths `.gitattributes` merges by union can be
+  /// merged here, and with what: every entry checked against the ref's own history where it has
+  /// one, and taken from the pusher where the path is as it was before the ref began (nothing
+  /// the pusher says can lose a line of anyone else's: a union keeps both sides). A reason in
+  /// words where it cannot be.
+  unionPlan(ref: string, chain: Uint8Array[], attested: Attested): UnionPlan | { why: string } {
+    const sql = this.ctx.storage.sql;
+    const commits = chain.map(decode);
+    const at = sql.exec<{ tip: ArrayBuffer; seq: number }>("SELECT tip, seq FROM refs WHERE name = ?", ref).toArray()[0];
+    const parent = commits[0]?.parents[0];
+    if (!at || !parent) return { why: "no ref, or a chain with no base" };
+    const known = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, parent).toArray()[0];
+    if (!known) return { why: "the base is not on the ref" };
+    const base = known.seq;
+    const indexed = sql.exec<{ since: number }>("SELECT since FROM indexed WHERE ref = ?", ref).toArray()[0];
+    if (!indexed || indexed.since !== 0) return { why: "the ref began before its paths were indexed" };
+    const paths = [...new Set(commits.flatMap((c) => c.changes.map((x) => decoder.decode(x.path))))];
+    const clash = this.clashes(ref, paths, base);
+    const stated = new Map(attested.union.map((u) => [u.path, u.base]));
+    const statedAttributes = new Map(attested.attributes.map((a) => [a.path, a.entry]));
+    if (stated.size !== attested.union.length || statedAttributes.size !== attested.attributes.length) return { why: "a path stated twice" };
+    const sameAs = (entry: { mode: number; id: Uint8Array } | null, said: Stated | null | undefined) =>
+      said !== undefined && (entry === null ? said === null : said !== null && said.mode === entry.mode && said.id === hex(entry.id));
+    const unhexed = (said: Stated) => {
+      if (!/^[0-9a-f]{64}$/.test(said.id) || !REGULAR.includes(said.mode)) throw new Error("a stated entry is not a file's");
+      return { mode: said.mode, id: Uint8Array.from(said.id.match(/../g)!.map((b) => parseInt(b, 16))) };
+    };
+    const plan: UnionPlan = { tip: hex(new Uint8Array(at.tip)), tipSeq: at.seq, paths: [], attributes: [], contents: [] };
+    const wanted: Uint8Array[] = [];
+    const dirs = new Set<string>();
+    for (const path of clash) {
+      if (!stated.has(path)) return { why: `${path} is not stated as merged by union` };
+      if (!pathOk(encoder.encode(path))) return { why: "a path no tree may have" };
+      // The path itself moved, as a file, and nothing above or below it did.
+      const theirs = this.entryAt(ref, path, at.seq);
+      if (!theirs || !REGULAR.includes(theirs.mode)) return { why: `${path} is not a file on the ref` };
+      const above = attributeDirs(path).slice(1).some((dir) => sql.exec("SELECT 1 FROM changed WHERE ref = ? AND path = ? AND seq > ?", ref, dir, base).toArray().length > 0);
+      const below = sql.exec("SELECT 1 FROM changed WHERE ref = ? AND path > ? AND path < ? AND seq > ? LIMIT 1", ref, path + "/", path + "0", base).toArray().length > 0;
+      if (above || below) return { why: `a directory moved at ${path}` };
+      // Its entry at the base: the ref's word where it has one, the pusher's where it has none.
+      const indexedBase = this.entryAt(ref, path, base);
+      const said = stated.get(path) ?? null;
+      if (indexedBase !== undefined && !sameAs(indexedBase, said)) return { why: `${path} was not at the base what the push says` };
+      if (said === null) return { why: `${path} is new on both sides` };
+      const baseEntry = unhexed(said);
+      const changes = commits.map((c) => c.changes.find((x) => decoder.decode(x.path) === path));
+      if (changes.some((c) => c && (!c.entry || c.entry.mode !== theirs.mode))) return { why: `${path} is removed or changes mode` };
+      if (baseEntry.mode !== theirs.mode) return { why: `${path} changes mode` };
+      plan.paths.push({ path, mode: theirs.mode, base: hex(baseEntry.id), theirs: hex(theirs.id), chain: changes.map((c) => (c?.entry ? hex(c.entry.id) : null)) });
+      wanted.push(baseEntry.id, theirs.id, ...changes.flatMap((c) => (c?.entry ? [c.entry.id] : [])));
+      for (const dir of attributeDirs(path)) dirs.add(dir);
+    }
+    // The rules are the ones the pusher started from, and still the ref's: where they moved since
+    // the base, or move in the push, they are not the pusher's to state.
+    for (const dir of dirs) {
+      const file = attributesAt(dir);
+      if (!statedAttributes.has(file)) return { why: `${file} is not stated` };
+      if (paths.includes(file)) return { why: `the push changes ${file}` };
+      if (sql.exec("SELECT 1 FROM changed WHERE ref = ? AND path = ? AND seq > ?", ref, file, base).toArray().length > 0) return { why: `${file} changed on the ref since the base` };
+      const indexedRule = this.entryAt(ref, file, base);
+      const said = statedAttributes.get(file) ?? null;
+      if (indexedRule !== undefined && !sameAs(indexedRule, said)) return { why: `${file} was not at the base what the push says` };
+      if (said) {
+        const entry = unhexed(said);
+        plan.attributes.push({ dir, id: hex(entry.id) });
+        wanted.push(entry.id);
+      }
+    }
+    // Every content read for the merge is one this repository was given.
+    const found = this.where(wanted);
+    if (new Set(found.map((c) => hex(c.id))).size !== new Set(wanted.map(hex)).size) return { why: "a content the merge needs was not sent" };
+    plan.contents = found;
+    return plan;
+  }
+
+  /// Land what the server merged for a push: `merged` is the push's chain made again on the tip
+  /// the plan was made at, with the union paths' merged contents, which are in `contents`.
+  /// `{ moved: true }` if the ref moved since, for the merge to be made again.
+  landMerged(ref: string, chain: Uint8Array[], merged: Uint8Array[], tipSeq: number, unionPaths: string[], contents: Placed[], after: number | null): PushResult | { moved: true } {
+    const sql = this.ctx.storage.sql;
+    const commits = chain.map(decode);
+    const remade = merged.map(decode);
+    const sent = idOf(chain[chain.length - 1]!);
+    return this.ctx.storage.transactionSync(() => {
+      const at = sql.exec<{ tip: ArrayBuffer; seq: number }>("SELECT tip, seq FROM refs WHERE name = ?", ref).toArray()[0];
+      if (!at || at.seq !== tipSeq) return { moved: true as const };
+      this.place(contents);
+      // The same commits, but for the parents and the union paths' contents, which the repository has.
+      const union = new Set(unionPaths);
+      if (remade.length !== commits.length) throw new Error("a merge on the server is a chain as long as the push");
+      remade.forEach((commit, i) => {
+        const on = i === 0 ? new Uint8Array(at.tip) : idOf(merged[i - 1]!);
+        if (commit.parents.length !== 1 || hex(commit.parents[0]!) !== hex(on)) throw new Error("a merge on the server is a chain on the tip");
+      });
+      remade.forEach((commit, i) => {
+        const was = commits[i]!;
+        if (hex(commit.rest) !== hex(was.rest) || commit.changes.length !== was.changes.length) throw new Error("a merge on the server changed more than contents");
+        commit.changes.forEach((c, j) => {
+          const w = was.changes[j]!;
+          if (hex(c.path) !== hex(w.path)) throw new Error("a merge on the server changed a path");
+          const same = (c.entry === null && w.entry === null) || (c.entry && w.entry && c.entry.mode === w.entry.mode && hex(c.entry.id) === hex(w.entry.id));
+          if (!same && !union.has(decoder.decode(c.path))) throw new Error("a merge on the server changed a path that is not merged by union");
+        });
+      });
+      const ids = remade.flatMap((c) => c.changes.flatMap((x) => (x.entry ? [x.entry.id] : [])));
+      if (new Set(this.where(ids).map((c) => hex(c.id))).size !== new Set(ids.map(hex)).size) throw new Error("a merged content is not in the repository");
+      const base = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, commits[0]!.parents[0]!).toArray()[0]!.seq;
+      sql.exec("DELETE FROM divergent WHERE ref = ? AND id = ?", ref, sent);
+      const result = this.accept(ref, at, commits[0]!.parents[0] ?? null, remade, (i) => merged[i]!, new Uint8Array(at.tip), "rebased", at.seq - base, sent, () => (after === null ? [] : this.steps(ref, after)));
+      return result;
     });
   }
 

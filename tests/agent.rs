@@ -117,6 +117,8 @@ fn a_state_can_be_named_and_the_name_gone_back_to() {
   ok(&dir, "$NV restore . green");
   assert_eq!(files(&dir), "./a.txt=a2 ./b.txt=b1 ./c.txt=c1 ./d/x.txt=x1");
   assert_eq!(ok(&dir, "$NV since . green"), "");
+  // The list is empty, and that it is empty is said, apart from it: a list is still a list to count.
+  assert_eq!(code_of(&dir, "$NV since . green"), (0, "nothing differs from green\n".to_string()));
   // A name moves when it is given again.
   ok(&dir, "echo a5 > a.txt && $NV mark . green && echo a6 > a.txt && $NV restore . green");
   assert_eq!(ok(&dir, "cat a.txt"), "a5");
@@ -467,7 +469,7 @@ fn a_name_that_differs_only_in_case_or_in_how_its_letters_are_built_is_the_same_
   );
   // Going back writes the file; it does not write it and then remove it under its other name.
   ok(&dir, "$NV restore . h >/dev/null");
-  assert_eq!(ok(&dir, "cat a.txt; ls | wc -l"), "a1\n       3");
+  assert_eq!(ok(&dir, "cat a.txt; ls | wc -l | tr -d ' '"), "a1\n3");
   // A name the file system hands back with its accents apart is the name Git has with them joined.
   let apart = "cafe\u{301}.txt";
   let joined = "caf\u{e9}.txt";
@@ -608,7 +610,8 @@ fn an_edit_that_keeps_a_files_size_and_time_is_still_an_edit() {
   assert!(looked.contains("read 0"), "{looked}");
   for copy in ["agent-same-size-fork", "agent-same-size-copy"] {
     if copy.ends_with("copy") {
-      ok(&dir, "cp -c -R -p . ../agent-same-size-copy");
+      // A clone where the file system makes one (`-c` is macOS's), a copy keeping the times elsewhere.
+      ok(&dir, "cp -c -R -p . ../agent-same-size-copy 2>/dev/null || cp -R -p . ../agent-same-size-copy");
     }
     let at = dir.join("..").join(copy);
     ok(
@@ -1087,4 +1090,284 @@ fn what_a_tenth_reviewer_found_in_recording_stays_fixed() {
   ok(&dir, "$NV mark . with-x >/dev/null; echo 1 > x && $NV mark . with-x >/dev/null && rm x && $NV snapshot . >/dev/null && mkfifo x");
   assert_eq!(code_of(&dir, "$NV restore . with-x 2>/dev/null").0, 2);
   assert_eq!(ok(&dir, "test -p x && echo pipe; rm x"), "pipe");
+}
+
+#[test]
+fn a_snapshot_killed_at_any_moment_leaves_every_state_it_reached_named() {
+  // Killed after the head moved: the state the head is at is in the log, so it is somewhere a
+  // restore can go back to, and a line of the log is never torn into the next one.
+  let dir = workspace("eleventh-killed");
+  ok(&dir, "$NV mark . green >/dev/null");
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo \"only copy $i\" > new$i.txt; $NV snapshot . >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.006))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; head=$(sed -n 's/^head //p' .nv/workspace); $NV log . | grep -q \"$head\" || { echo \"head $head is not in the log after kill $i\"; exit 1; }; done",
+  );
+  let log = ok(&dir, "cat .nv/oplog");
+  for line in log.lines() {
+    let fields: Vec<&str> = line.split(' ').collect();
+    let whole = fields.len() == 3 && fields[2].len() == 64;
+    // A torn record is left as a line of its own, which names nothing.
+    assert!(whole || (fields.len() <= 3 && fields.get(2).is_none_or(|id| id.len() < 64)), "a torn line runs into another: {line}");
+  }
+  for line in ok(&dir, "$NV log .").lines() {
+    assert_eq!(line.split_whitespace().nth(2).map(str::len), Some(64), "{line}");
+  }
+  // Every file written is in some state the log names: going back loses none of them.
+  ok(&dir, "$NV snapshot . >/dev/null; $NV restore . green >/dev/null");
+  ok(&dir, "$NV restore . '~0' >/dev/null 2>&1 || $NV restore . \"$(sed -n 's/^head //p' .nv/workspace)\" >/dev/null");
+  ok(&dir, "for i in $(seq 1 300); do grep -q \"only copy $i\" new$i.txt || { echo missing new$i.txt; exit 1; }; done");
+}
+
+#[test]
+fn what_an_eleventh_reviewer_found_in_publishing_stays_fixed() {
+  // What a commit looks through for a sync's markers is read as the tree has it: a link as a link,
+  // and what is not a file not at all. Nothing waits on a pipe, here or beyond a link.
+  let dir = workspace("eleventh-publish");
+  ok(&dir, "rm -rf ../agent-eleventh-outside && mkdir ../agent-eleventh-outside && mkfifo ../agent-eleventh-outside/fifo");
+  let started = std::time::Instant::now();
+  ok(
+    &dir,
+    "printf 1 > a && $NV commit . c1 >/dev/null && ln -s ../agent-eleventh-outside/fifo l && NV_TIMEOUT=20 $NV commit . c2 >/dev/null",
+  );
+  ok(&dir, "printf 2 > g && $NV snapshot . >/dev/null && rm g && mkfifo g && NV_TIMEOUT=20 $NV commit . c3 >/dev/null 2>&1; rm g");
+  assert!(started.elapsed().as_secs() < 10, "it waited {:?}", started.elapsed());
+  // A link to a file outside that holds markers is a link, not that file.
+  ok(
+    &dir,
+    "printf '<<<<<<< yours\\na\\n=======\\nb\\n>>>>>>> theirs\\n' > ../agent-eleventh-outside/marked && ln -s ../agent-eleventh-outside/marked m",
+  );
+  ok(&dir, "$NV commit . 'a link to markers' >/dev/null");
+  // What is looked through for markers is what the commit publishes, found by the same look: with
+  // `--recorded` the paths reported, and not the whole tree.
+  ok(&dir, "printf '<<<<<<< yours\na\n=======\nb\n>>>>>>> theirs\n' > unreported && echo 2 > a && $NV record . a");
+  ok(&dir, "$NV commit . 'what was reported' --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "a");
+  let (code, said) = code_of(&dir, "$NV commit . 'all of it' 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("unreported"), "{said}");
+}
+
+#[test]
+fn an_amend_killed_at_any_moment_leaves_one_commit_in_place_of_the_other() {
+  // Killed while amending, three hundred times: the branch has the commit amended or the one that
+  // replaced it, never both one on the other, and the workspace names a commit the store has.
+  let dir = workspace("killed-amend");
+  ok(&dir, "echo e0 >> a.txt && $NV git commit -q -am c0");
+  ok(
+    &dir,
+    "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo \"e$i\" >> a.txt; $NV git commit -q -a --amend -m \"c$i\" >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,rand(0.012))'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; subjects=$($NV git log --format=%s | tr '\\n' ' '); case \"$subjects\" in 'c'*' base ') ;; *) echo \"after kill $i: $subjects\"; exit 1;; esac; case \"$subjects\" in *' c'*' base ') echo \"after kill $i, one on the other: $subjects\"; exit 1;; esac; done",
+  );
+  ok(&dir, "$NV git commit -q -a --amend -m last && $NV git fsck");
+  assert_eq!(ok(&dir, "$NV git log --format=%s && tail -1 a.txt && $NV git status --short"), "last\nbase\ne300");
+}
+
+#[test]
+fn what_an_eleventh_reviewer_found_in_recording_stays_fixed() {
+  let dir = workspace("eleventh-recording");
+  // A report with one path that is not the workspace's is refused whole: none of it is noted.
+  ok(&dir, "$NV snapshot . >/dev/null; echo 2 > a.txt");
+  let (code, said) = code_of(&dir, "$NV record . a.txt ../zz 2>&1");
+  assert_eq!(code, 2, "{said}");
+  assert_eq!(ok(&dir, "test -s .nv/journal && tr '\\0' ' ' < .nv/journal; true"), "");
+  // A file that may not be read, changed since the state gone back to: not recorded, so not
+  // restored, and the restore says so instead of saying it is done. Reported, the same.
+  ok(&dir, "$NV snapshot . >/dev/null; $NV mark . m >/dev/null && echo changed > b.txt && chmod 000 b.txt");
+  for look in ["", "--recorded"] {
+    let (code, said) = code_of(&dir, &format!("$NV record . b.txt && $NV restore . m {look} 2>&1"));
+    assert_eq!(code, 2, "{look}: {said}");
+    assert!(said.contains("b.txt") && !said.starts_with("restored to"), "{look}: {said}");
+  }
+  assert_eq!(ok(&dir, "chmod 644 b.txt && cat b.txt"), "changed");
+  // The rules of what is left out that are not in the tree: a change to them is seen without a
+  // report, and reporting one is not refused.
+  ok(&dir, "$NV snapshot . >/dev/null; echo '*.log' > .nv/exclude && echo l > x.log && $NV snapshot . >/dev/null");
+  ok(&dir, "rm .nv/exclude && $NV record . .nv/exclude && $NV snapshot . --recorded >/dev/null");
+  assert_eq!(ok(&dir, "$NV since . base | grep log; true"), "A x.log");
+}
+
+/// A writer that never commits: each state its conditions pass on is committed by nv, under a
+/// provisional message, and the commits are made again, fewer and better said, before a push.
+#[test]
+fn each_checkpoint_is_committed_and_the_commits_are_made_again_fewer() {
+  // Made from a commit, as a clone is: what is not pushed is what came after it.
+  let top = fresh("each-checkpoint");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"test ! -e broken\"\\n\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  assert!(code_of(&dir, "$NV rebuild . 1 x 2>&1").1.contains("not pushed"), "nothing to make again yet");
+  // Three states that pass, one that does not between them.
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  ok(&dir, "echo x > broken && ($NV checkpoint . >/dev/null 2>&1; true) && rm broken && echo 2 > two && $NV checkpoint . >/dev/null 2>&1");
+  ok(&dir, "echo 3 > three && $NV checkpoint . >/dev/null 2>&1");
+  let pending = ok(&dir, "$NV pending .");
+  assert_eq!(pending.lines().filter(|l| l.contains("checkpoint: unit passed")).count(), 3, "{pending}");
+  assert_eq!(pending.matches("(passed unit)").count(), 3, "{pending}");
+  assert!(!pending.contains("broken"), "a state the conditions did not pass is not committed: {pending}");
+  assert!(pending.contains("A one") && !pending.contains("M one"), "a new file is added: {pending}");
+  // Each with the id `nv git` takes, and `nv rebuild` takes that as well.
+  let third = ok(&dir, "$NV git log -1 --format=%h");
+  assert!(pending.contains(&format!("git {third}")), "{third}: {pending}");
+  let made = ok(&dir, &format!("$NV rebuild . 2 'Add one and two' {third} 'Add three'"));
+  assert_eq!(made.matches("(passed unit)").count(), 2, "what it made, and what each passed: {made}");
+  let said = ok(&dir, "$NV pending .");
+  assert!(said.contains("1  ") && said.contains("Add one and two") && said.contains("Add three"), "{said}");
+  assert_eq!(said.matches("(passed unit)").count(), 2, "each new commit ends where the conditions passed: {said}");
+  assert_eq!(ok(&dir, "$NV git log --format=%s | head -3"), "Add three\nAdd one and two\nconditions");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD~1"), "one\ntwo");
+  // A workspace with no end to what is not pushed makes nothing again.
+  let plain = workspace("each-checkpoint-plain");
+  let (code, said) = code_of(&plain, "$NV rebuild . 1 x 2>&1");
+  assert!(code != 0 && said.contains("nothing was changed") || said.contains("Nothing was changed"), "{said}");
+  assert_eq!(ok(&dir, "$NV status . 2>/dev/null; cat one two three"), "1\n2\n3", "the files are as they were");
+  // Refused, and nothing changed: a commit that is not one of them, the plan out of order.
+  for plan in ["0123456789ab 'x'", "2 'b' 1 'a'", "1"] {
+    let (code, said) = code_of(&dir, &format!("$NV rebuild . {plan} 2>&1"));
+    assert_ne!(code, 0, "{plan}: {said}");
+  }
+  assert_eq!(ok(&dir, "$NV git log --format=%s | head -2"), "Add three\nAdd one and two");
+  // Made again by someone else, as `git rebase` does: the author stays, the committer is who made them again.
+  ok(
+    &dir,
+    "GIT_AUTHOR_NAME=R GIT_AUTHOR_EMAIL=r@example.com GIT_COMMITTER_NAME=R GIT_COMMITTER_EMAIL=r@example.com $NV rebuild . 2 'Add one, two and three' >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>|%cn <%ce>|%s'"), "A <a@example.com>|R <r@example.com>|Add one, two and three");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "one\nthree\ntwo");
+}
+
+/// The state the conditions passed on is committed though the files moved on since: what came
+/// after stays recorded, as changes not committed.
+#[test]
+fn a_state_the_files_have_moved_on_from_is_committed_as_it_was() {
+  use newvcs::store::Store;
+  use newvcs::workspace::{self, Look, Workspace};
+  let dir = workspace("commit-state");
+  ok(&dir, "echo passed > a.txt");
+  let state = {
+    let mut ws = Workspace::open(&dir).unwrap();
+    let mut store = Store::open(&ws.store).unwrap();
+    workspace::snapshot(&mut store, &mut ws, "t <t@example.com>", Look::Everywhere).unwrap().unwrap()
+  };
+  ok(&dir, "echo later > c.txt && $NV snapshot . >/dev/null && echo 'not even recorded' > d/x.txt");
+  {
+    let mut ws = Workspace::open(&dir).unwrap();
+    let mut store = Store::open(&ws.store).unwrap();
+    let rest = b"author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nwhat passed\n".to_vec();
+    assert!(workspace::commit_state(&mut store, &mut ws, state, rest, "t <t@example.com>").unwrap().is_some());
+  }
+  assert_eq!(ok(&dir, "$NV git show --name-only --format=%s HEAD"), "what passed\n\na.txt");
+  assert_eq!(ok(&dir, "$NV since . base"), "A c.txt\nM d/x.txt");
+  assert_eq!(ok(&dir, "cat a.txt c.txt d/x.txt"), "passed\nlater\nnot even recorded");
+  // A state from before the last commit is not one to commit again.
+  let mut ws = Workspace::open(&dir).unwrap();
+  let mut store = Store::open(&ws.store).unwrap();
+  let rest = b"author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nagain\n".to_vec();
+  let refused = workspace::commit_state(&mut store, &mut ws, state, rest, "t").unwrap_err();
+  assert!(refused.contains("not a state recorded here since the last commit"), "{refused}");
+}
+
+/// With `auto`, a watcher's snapshot starts the conditions as a hook's does, and with `[commit]
+/// each` what passes is committed: a writer that only writes files gets commits.
+#[test]
+fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
+  let dir = workspace("watched-each");
+  ok(
+    &dir,
+    "printf 'auto = true\\n[checks.unit]\\nrun = \"test ! -e broken\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "$NV watch . --start >/dev/null");
+  ok(&dir, "echo 1 > one");
+  // Waited for, the write is committed once it is said to be settled.
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.contains("checkpoint: unit passed") && waited.contains("A one"), "{waited}");
+  assert!(waited.ends_with("settled: what is recorded is committed, and passed unit"), "{waited}");
+  // A state that does not pass is settled as well, and said not to have passed.
+  ok(&dir, "echo x > broken");
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.contains("did not pass (unit did not)"), "{waited}");
+  assert_eq!(waited.matches("checkpoint: unit passed").count(), 1, "{waited}");
+  ok(&dir, "$NV watch . --stop >/dev/null");
+}
+
+/// A checkpoint commit is signed as any commit made here is, and not under a name nv made up;
+/// with nobody to sign as, the state is not committed and the reason is said (round 2 of
+/// `eval/commit-agents`).
+#[test]
+fn a_checkpoint_commit_is_signed_by_whoever_the_workspace_says() {
+  let dir = workspace("checkpoint-signed");
+  ok(
+    &dir,
+    "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format='%an <%ae>|%cn <%ce>|%s'"), "A <a@example.com>|C <c@example.com>|checkpoint: unit passed");
+  let (code, said) = code_of(
+    &dir,
+    "echo 2 > two && env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL $NV checkpoint . 2>&1",
+  );
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("nobody to sign the commit as"), "{said}");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed", "nothing was committed");
+  let waited = ok(&dir, "$NV pending . --wait");
+  assert!(waited.ends_with("it was not committed: `nv checkpoint <dir>` says why"), "{waited}");
+}
+
+/// `nv commit` of files the runner behind writes committed meanwhile (`[commit] each`) is not
+/// refused as files that changed: the files are as the conditions passed on them. It says where
+/// they went, and only for a commit the runner made.
+#[test]
+fn a_commit_of_what_the_runner_committed_meanwhile_says_so() {
+  let dir = workspace("commit-after-runner");
+  ok(
+    &dir,
+    "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
+  );
+  ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  let said = ok(&dir, "$NV commit . 'Add one'");
+  assert!(said.starts_with("nothing to commit: these files were committed already, as "), "{said}");
+  assert!(said.contains("`nv rebuild <dir> <n> <message>`"), "{said}");
+  // A commit of one's own, and then nothing new: nothing to commit, and nothing more said.
+  ok(&dir, "echo 2 > two && $NV commit . 'Add two' >/dev/null");
+  assert_eq!(ok(&dir, "$NV commit . 'Again'"), "nothing to commit");
+}
+
+/// A developer that does no version control may still say, in a line, what it just did: the
+/// next commit the conditions pass on is made under that line, not a provisional message.
+#[test]
+fn a_note_names_the_next_commit_the_conditions_pass_on() {
+  // Made from a commit, as a clone is: what is not pushed is what came after it.
+  let top = fresh("note");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"test ! -e broken\"\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  ok(&dir, "echo 1 > one && $NV note . 'Add one' && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add one");
+  // A note on a state that does not pass goes to the next one that does.
+  ok(&dir, "echo x > broken && echo 2 > two && $NV note . 'Add two' && ($NV checkpoint . >/dev/null 2>&1; true)");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add one");
+  ok(&dir, "rm broken && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add two");
+  // A note on files the runner committed already gives that commit its message.
+  ok(&dir, "echo 3 > three && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed");
+  ok(&dir, "$NV note . 'Add three'");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "Add three");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "three");
+  // A note is a line that says something.
+  assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
+}
+
+/// Where every state that passes is committed (`[commit] each`), `nv status` says that is what
+/// commits what is recorded, not to run `nv commit` (round 14 of `eval/commit-agents`).
+#[test]
+fn status_says_what_commits_what_is_recorded() {
+  let dir = workspace("status-each");
+  let said = ok(&dir, "echo 1 >> a.txt && $NV snapshot . >/dev/null && $NV status . 2>&1");
+  assert!(said.contains("`nv commit` publishes them"), "{said}");
+  ok(&dir, "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml");
+  let said = ok(&dir, "$NV snapshot . >/dev/null && $NV status . 2>&1");
+  assert!(said.contains("committed as the conditions pass on them") && !said.contains("`nv commit` publishes them"), "{said}");
 }

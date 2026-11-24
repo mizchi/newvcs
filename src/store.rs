@@ -24,8 +24,61 @@
 
 use crate::{Id, Result};
 use std::collections::HashMap;
+
+/// A map keyed by ids. An id is a BLAKE3 hash, as even as a hash gets, so its first eight bytes
+/// are its hash here: the default hasher (SipHash) costs more than the lookups themselves when a
+/// map of every commit's root is read at once.
+pub type IdMap<V> = HashMap<Id, V, std::hash::BuildHasherDefault<IdHasher>>;
+/// The same for Git's ids, SHA-1 hashes.
+type OidMap<V> = HashMap<GitOid, V, std::hash::BuildHasherDefault<IdHasher>>;
+
+/// A map keyed by paths, for maps a look at the tree fills once per directory: hashed a word at a
+/// time (as FxHash does), where SipHash would cost more than the lookups. Keys come from the tree,
+/// not from someone choosing them to collide.
+pub type PathMap<V> = HashMap<Vec<u8>, V, std::hash::BuildHasherDefault<PathHasher>>;
+
+#[derive(Default)]
+pub struct PathHasher(u64);
+
+impl std::hash::Hasher for PathHasher {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+  fn write(&mut self, bytes: &[u8]) {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+      self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(K);
+    }
+    if !rest.is_empty() {
+      let mut last = [0u8; 8];
+      last[..rest.len()].copy_from_slice(rest);
+      self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(last)).wrapping_mul(K);
+    }
+  }
+  fn write_usize(&mut self, n: usize) {
+    self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+  }
+}
+
+#[derive(Default)]
+pub struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+  fn write(&mut self, bytes: &[u8]) {
+    // The id itself; anything shorter (a length) is mixed in and changes nothing that matters.
+    let mut word = [0u8; 8];
+    let n = bytes.len().min(8);
+    word[..n].copy_from_slice(&bytes[..n]);
+    self.0 = self.0.rotate_left(5) ^ u64::from_le_bytes(word);
+  }
+  fn write_usize(&mut self, _: usize) {}
+}
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -132,16 +185,21 @@ pub struct Store {
   pending: Vec<u8>,
   sorted: Option<Sorted>,
   /// Objects appended since `sorted` was written.
-  index: HashMap<Id, Slot>,
+  index: IdMap<Slot>,
   /// Recently read or written blobs, raw: the next delta is usually against one of them.
-  cache: HashMap<Id, std::sync::Arc<Vec<u8>>>,
+  cache: IdMap<std::sync::Arc<Vec<u8>>>,
   cache_bytes: usize,
   git_log: File,
   /// Git's id of an object, and for blobs and commits the way back. Read on first use.
   git: Option<GitIds>,
   roots_log: File,
-  /// The root tree of a commit; `None` for a commit with no files.
-  pub roots: HashMap<Id, Option<Id>>,
+  /// The root tree of a commit (`None` for a commit with no files): most in `roots.idx`, sorted
+  /// and mapped, so that opening the store reads none of them; those recorded since it was
+  /// written, here.
+  roots: IdMap<Option<Id>>,
+  roots_sorted: Option<(memmap2::Mmap, usize)>,
+  /// Roots this process recorded: only then is `roots.idx` worth rewriting.
+  roots_added: usize,
   /// Bytes of the segment after its last whole record.
   unread: u64,
   /// The objects in `pending`: their places move if another process appends first.
@@ -186,8 +244,8 @@ impl Stats {
 #[derive(Default)]
 struct GitIds {
   sorted: Option<(memmap2::Mmap, usize)>,
-  of: HashMap<Id, GitOid>,
-  back: HashMap<GitOid, Id>,
+  of: IdMap<GitOid>,
+  back: OidMap<Id>,
   /// Whether this process recorded any: only then is `git.idx` worth rewriting.
   added: bool,
 }
@@ -268,7 +326,7 @@ pub fn object_id(kind: Kind, bytes: &[u8]) -> Id {
 
 /// Read the whole records in `bytes`, which begin at `start` in the segment, into `index`.
 /// Returns how many bytes they take. A record cut short by a crash ends the reading.
-fn scan(bytes: &[u8], start: u64, index: &mut HashMap<Id, Slot>, sorted: Option<&Sorted>, stats: &mut Stats) -> usize {
+fn scan(bytes: &[u8], start: u64, index: &mut IdMap<Slot>, sorted: Option<&Sorted>, stats: &mut Stats) -> usize {
   let mut at = 0usize;
   while at + HEADER <= bytes.len() {
     let h = &bytes[at..at + HEADER];
@@ -295,12 +353,41 @@ fn half_written(path: &Path) -> PathBuf {
   path.with_file_name(format!("{name}~{}", std::process::id()))
 }
 
-fn open_log(path: &Path) -> Result<(File, Vec<u8>)> {
-  let mut file =
-    File::options().read(true).append(true).create(true).open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-  let mut bytes = Vec::new();
-  file.read_to_end(&mut bytes).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-  Ok((file, bytes))
+const ROOT_RECORD: usize = 65;
+const ROOTS_IDX_MAGIC: &[u8; 8] = b"nvroots1";
+const ROOTS_IDX_HEADER: usize = 24;
+/// With this many roots outside `roots.idx`, a store that recorded some rewrites it on closing.
+const ROOTS_CHECKPOINT_AT: usize = 1024;
+
+/// `roots.idx`, if it is whole and of this `roots.map`, and how many records of the log it holds.
+fn sorted_roots(dir: &Path, log: &File) -> (Option<(memmap2::Mmap, usize)>, usize) {
+  let records = log.metadata().map_or(0, |m| m.len() as usize / ROOT_RECORD);
+  let Ok(file) = File::open(dir.join("roots.idx")) else { return (None, 0) };
+  // SAFETY: the file is replaced whole, by rename, never written in place.
+  let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return (None, 0) };
+  if map.len() < ROOTS_IDX_HEADER || &map[..8] != ROOTS_IDX_MAGIC {
+    return (None, 0);
+  }
+  let in_log = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
+  let count = u64::from_le_bytes(map[16..24].try_into().unwrap()) as usize;
+  if in_log > records || map.len() != ROOTS_IDX_HEADER + count * ROOT_RECORD {
+    return (None, 0);
+  }
+  (Some((map, count)), in_log)
+}
+
+/// The records of `roots.map` after the first `covered`.
+fn roots_after(log: &File, covered: usize) -> IdMap<Option<Id>> {
+  let records = log.metadata().map_or(0, |m| m.len() as usize / ROOT_RECORD);
+  let mut tail = vec![0u8; records.saturating_sub(covered) * ROOT_RECORD];
+  let mut roots = IdMap::with_capacity_and_hasher(tail.len() / ROOT_RECORD, Default::default());
+  if log.read_exact_at(&mut tail, (covered * ROOT_RECORD) as u64).is_ok() {
+    for record in tail.as_chunks::<ROOT_RECORD>().0 {
+      let (commit, root): (Id, Id) = (record[..32].try_into().unwrap(), record[33..65].try_into().unwrap());
+      roots.insert(commit, (record[32] != 0).then_some(root));
+    }
+  }
+  roots
 }
 
 impl Store {
@@ -331,7 +418,7 @@ impl Store {
     let covered = sorted.as_ref().map_or(0, |s| s.covered);
     let mut bytes = vec![0u8; (len - covered) as usize];
     segment.read_exact_at(&mut bytes, covered).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut index: HashMap<Id, Slot> = HashMap::new();
+    let mut index: IdMap<Slot> = IdMap::default();
     let at = scan(&bytes, covered, &mut index, sorted.as_ref(), &mut stats);
     // Bytes after the last whole record are left where they are. They may be
     // a record cut short by a crash, or the sign of damage further up; only a
@@ -347,12 +434,15 @@ impl Store {
       .create(true)
       .open(&git_path)
       .map_err(|e| format!("cannot open {}: {e}", git_path.display()))?;
-    let (roots_log, bytes) = open_log(&dir.join("roots.map"))?;
-    let mut roots = HashMap::new();
-    for record in bytes.as_chunks::<65>().0 {
-      let (commit, root): (Id, Id) = (record[..32].try_into().unwrap(), record[33..65].try_into().unwrap());
-      roots.insert(commit, (record[32] != 0).then_some(root));
-    }
+    let roots_path = dir.join("roots.map");
+    let roots_log = File::options()
+      .read(true)
+      .append(true)
+      .create(true)
+      .open(&roots_path)
+      .map_err(|e| format!("cannot open {}: {e}", roots_path.display()))?;
+    let (roots_sorted, covered) = sorted_roots(dir, &roots_log);
+    let roots = roots_after(&roots_log, covered);
     Ok(Store {
       dir: dir.to_path_buf(),
       segment,
@@ -360,12 +450,14 @@ impl Store {
       pending: Vec::new(),
       sorted,
       index,
-      cache: HashMap::new(),
+      cache: IdMap::default(),
       cache_bytes: 0,
       git_log,
       git: None,
       roots_log,
       roots,
+      roots_sorted,
+      roots_added: 0,
       unread,
       pending_ids: Vec::new(),
       pending_roots: Vec::new(),
@@ -387,6 +479,7 @@ impl Store {
   pub fn checkpoint(&mut self) -> Result<()> {
     self.flush()?;
     self.checkpoint_git()?;
+    self.checkpoint_roots()?;
     if self.index.is_empty() && self.sorted.is_some() {
       return Ok(());
     }
@@ -748,10 +841,84 @@ impl Store {
     }
   }
 
-  pub fn set_root(&mut self, commit: Id, root: Option<Id>) -> Result<()> {
-    if self.roots.insert(commit, root).is_some() {
+  /// The root tree of a commit, if it was worked out before: `Some(None)` for one with no files.
+  pub fn root_known(&self, commit: &Id) -> Option<Option<Id>> {
+    if let Some(root) = self.roots.get(commit) {
+      return Some(*root);
+    }
+    let (map, count) = self.roots_sorted.as_ref()?;
+    let record = |i: usize| &map[ROOTS_IDX_HEADER + i * ROOT_RECORD..ROOTS_IDX_HEADER + (i + 1) * ROOT_RECORD];
+    let (mut low, mut high) = (0, *count);
+    while low < high {
+      let mid = (low + high) / 2;
+      match record(mid)[..32].cmp(&commit[..]) {
+        std::cmp::Ordering::Less => low = mid + 1,
+        std::cmp::Ordering::Greater => high = mid,
+        std::cmp::Ordering::Equal => {
+          let r = record(mid);
+          return Some((r[32] != 0).then(|| r[33..65].try_into().unwrap()));
+        }
+      }
+    }
+    None
+  }
+
+  /// Every root known, for checking them.
+  pub fn all_roots(&self) -> Vec<(Id, Option<Id>)> {
+    let mut all: Vec<(Id, Option<Id>)> = self.roots.iter().map(|(c, r)| (*c, *r)).collect();
+    if let Some((map, count)) = &self.roots_sorted {
+      for i in 0..*count {
+        let r = &map[ROOTS_IDX_HEADER + i * ROOT_RECORD..ROOTS_IDX_HEADER + (i + 1) * ROOT_RECORD];
+        all.push((r[..32].try_into().unwrap(), (r[32] != 0).then(|| r[33..65].try_into().unwrap())));
+      }
+    }
+    all
+  }
+
+  /// Write every root recorded so far into `roots.idx`, so that the next process reads none of
+  /// `roots.map`. Read from the file, not from what this process holds: others may have added
+  /// some since it opened the store.
+  fn checkpoint_roots(&mut self) -> Result<()> {
+    let records = self.roots_log.metadata().map_or(0, |m| m.len() as usize / ROOT_RECORD);
+    let (sorted, covered) = sorted_roots(&self.dir, &self.roots_log);
+    if covered == records && sorted.is_some() {
       return Ok(());
     }
+    let mut all: Vec<[u8; ROOT_RECORD]> = Vec::with_capacity(records);
+    if let Some((map, count)) = &sorted {
+      for i in 0..*count {
+        all.push(map[ROOTS_IDX_HEADER + i * ROOT_RECORD..ROOTS_IDX_HEADER + (i + 1) * ROOT_RECORD].try_into().unwrap());
+      }
+    }
+    let mut tail = vec![0u8; (records - covered) * ROOT_RECORD];
+    self.roots_log.read_exact_at(&mut tail, (covered * ROOT_RECORD) as u64).map_err(|e| format!("cannot read the roots map: {e}"))?;
+    all.extend(tail.as_chunks::<ROOT_RECORD>().0.iter().copied());
+    // A commit's root is what its changes make it: recorded twice, it is the same both times.
+    all.sort_unstable_by(|a, b| a[..32].cmp(&b[..32]));
+    all.dedup_by(|a, b| a[..32] == b[..32]);
+    let mut out = Vec::with_capacity(ROOTS_IDX_HEADER + all.len() * ROOT_RECORD);
+    out.extend_from_slice(ROOTS_IDX_MAGIC);
+    out.extend_from_slice(&(records as u64).to_le_bytes());
+    out.extend_from_slice(&(all.len() as u64).to_le_bytes());
+    for record in &all {
+      out.extend_from_slice(record);
+    }
+    let path = self.dir.join("roots.idx");
+    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&temp, &out).and_then(|_| std::fs::rename(&temp, &path)).map_err(|e| format!("cannot write the roots index: {e}"))?;
+    let (sorted, covered) = sorted_roots(&self.dir, &self.roots_log);
+    self.roots_sorted = sorted;
+    self.roots = roots_after(&self.roots_log, covered);
+    self.roots_added = 0;
+    Ok(())
+  }
+
+  pub fn set_root(&mut self, commit: Id, root: Option<Id>) -> Result<()> {
+    if self.root_known(&commit).is_some() {
+      return Ok(());
+    }
+    self.roots.insert(commit, root);
+    self.roots_added += 1;
     let mut record = Vec::with_capacity(65);
     record.extend_from_slice(&commit);
     record.push(root.is_some() as u8);
@@ -903,6 +1070,9 @@ impl Drop for Store {
     if self.git.as_ref().is_some_and(|ids| ids.added && ids.of.len() >= GIT_CHECKPOINT_AT) {
       let _ = self.checkpoint_git();
     }
+    if self.roots_added > 0 && self.roots.len() >= ROOTS_CHECKPOINT_AT {
+      let _ = self.checkpoint_roots();
+    }
   }
 }
 
@@ -918,6 +1088,43 @@ fn compress_against(base: &[u8], new: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn roots_are_found_in_the_sorted_index_and_after_it() {
+    let dir = std::env::temp_dir().join(format!("nv-roots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let id = |n: u32| -> Id { *blake3::hash(&n.to_le_bytes()).as_bytes() };
+    {
+      let mut store = Store::create(&dir).unwrap();
+      for n in 0..2000 {
+        store.set_root(id(n), (n % 3 != 0).then(|| id(n + 100_000))).unwrap();
+      }
+      // Closing a store that recorded this many writes them into `roots.idx`.
+    }
+    assert!(dir.join("roots.idx").is_file());
+    {
+      let mut store = Store::open(&dir).unwrap();
+      assert!(store.roots.is_empty(), "nothing of roots.map is read when roots.idx holds it all");
+      for n in 2000..2010 {
+        store.set_root(id(n), Some(id(n + 100_000))).unwrap();
+      }
+    }
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.roots.len(), 10, "only what was recorded after roots.idx is read");
+    for n in 0..2010 {
+      assert_eq!(store.root_known(&id(n)), Some((n % 3 != 0 || n >= 2000).then(|| id(n + 100_000))), "{n}");
+    }
+    assert_eq!(store.root_known(&id(5_000_000)), None);
+    assert_eq!(store.all_roots().len(), 2010);
+    // An index that is not of this roots.map (cut short, or of more records) is not believed.
+    drop(store);
+    let idx = std::fs::read(dir.join("roots.idx")).unwrap();
+    std::fs::write(dir.join("roots.idx"), &idx[..idx.len() - 1]).unwrap();
+    let store = Store::open(&dir).unwrap();
+    assert_eq!(store.roots.len(), 2010);
+    assert_eq!(store.root_known(&id(7)), Some(Some(id(100_007))));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 
   fn temp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("newvcs-store-{}-{name}", std::process::id()));
@@ -1024,7 +1231,7 @@ mod tests {
       assert_eq!(fresh.get(id).unwrap().as_deref(), Some(bytes));
     }
     // A root is written down only once the tree it names is.
-    for (commit, root) in fresh.roots.clone() {
+    for (commit, root) in fresh.all_roots() {
       assert!(root.is_none_or(|root| fresh.contains(&root)), "the root of {commit:?} names a tree the store lacks");
     }
     assert_eq!(fresh.check().unwrap().1, Vec::<String>::new());

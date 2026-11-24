@@ -32,3 +32,8 @@
 30-an-eighth-round.sh
 31-a-ninth-round.sh
 32-a-tenth-round.sh
+33-an-eleventh-round.sh
+34-merge-attributes.sh
+35-paths-of-show-and-diff.sh
+36-diff-a-revision-against-the-files.sh
+37-rm-cached.sh

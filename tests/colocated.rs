@@ -167,7 +167,7 @@ fn what_git_would_not_commit_nv_does_not_either() {
   ok(&dir, "echo '*.up filter=up' > .gitattributes && echo hello > f.up && printf 'a\\r\\nb\\r\\n' > crlf.txt");
   ok(&dir, "$NV commit . 'by the rules' >/dev/null");
   assert_eq!(ok(&dir, "git ls-tree --name-only HEAD"), ".gitattributes\na.txt\ncrlf.txt\nd\nf.up\nfine.txt");
-  assert_eq!(ok(&dir, "git cat-file -p HEAD:f.up; git cat-file -p HEAD:crlf.txt | od -c | head -1"), "HELLO\n0000000    a  \\n   b  \\n");
+  assert_eq!(ok(&dir, "git cat-file -p HEAD:f.up; git cat-file -p HEAD:crlf.txt | od -An -c | head -1 | tr -s ' '"), "HELLO\n a \\n b \\n");
   assert_eq!(ok(&dir, "git status --porcelain"), "");
   // A hook of the user's own runs, and its no is a no: nothing is committed and nothing recorded is lost.
   ok(
@@ -231,8 +231,8 @@ fn publishing_keeps_out_of_what_git_is_in_the_middle_of() {
   assert_eq!(ok(&dir, "git status --porcelain | tr ' ' _"), before);
   ok(&dir, "printf 'one\\nBOTH\\nthree\\n' > a.txt && git add a.txt && git commit -q -m merged");
   assert_eq!(
-    ok(&dir, "git ls-tree --name-only HEAD | tr '\\n' ' '; git rev-list --parents -1 HEAD | wc -w"),
-    "a.txt d s.txt s2.txt        3"
+    ok(&dir, "git ls-tree --name-only HEAD | tr '\\n' ' '; git rev-list --parents -1 HEAD | wc -w | tr -d ' '"),
+    "a.txt d s.txt s2.txt 3"
   );
   // The same during a rebase that stopped: no commit with both versions in a file.
   ok(&dir, "git checkout -q -b r1 HEAD~1 && printf 'one\\nR1\\nthree\\n' > a.txt && git commit -q -am r1");
@@ -504,4 +504,45 @@ fn what_a_tenth_reviewer_found_beside_git_stays_fixed() {
   ok(&dir, "rm .git/hooks/pre-commit && git commit -qm user");
   assert_eq!(ok(&dir, "git show --format= --name-status HEAD"), "A\tu.txt");
   assert_eq!(ok(&dir, "git ls-files hookfile"), "hookfile");
+}
+
+#[test]
+fn what_an_eleventh_reviewer_found_beside_git_stays_fixed() {
+  // A rename Git was told of, published with a look at what is tracked: the whole rename, as
+  // `git commit -a` makes it, and nothing of it left staged.
+  let dir = adopted("eleventh");
+  for at in ["d", "."] {
+    ok(&dir, "git mv d/x.txt d/y.txt");
+    ok(&dir, &format!("$NV commit {at} 'mv' --tracked >/dev/null"));
+    assert_eq!(ok(&dir, "git status --porcelain"), "", "{at}");
+    assert_eq!(ok(&dir, "git show --name-status --format= HEAD"), "R100\td/x.txt\td/y.txt", "{at}");
+    ok(&dir, "git mv d/y.txt d/x.txt && git commit -qm back && $NV commit . >/dev/null 2>&1; true");
+  }
+  // A lock of Git's left behind: Git would refuse to commit, and so does nv, before writing anything.
+  for lock in [".git/index.lock", ".git/HEAD.lock", ".git/refs/heads/main.lock"] {
+    let before = ok(&dir, "echo more >> a.txt && git status --porcelain; git rev-parse HEAD; cat .git/index | cksum");
+    let out = sh(&dir, &format!("touch {lock} && $NV commit . 'with {lock}' 2>&1"));
+    let said = text(&out);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains(lock), "{said}");
+    assert_eq!(ok(&dir, &format!("git status --porcelain; git rev-parse HEAD; cat .git/index | cksum; rm {lock}")), before, "{lock}");
+    ok(&dir, "$NV commit . 'without the lock' >/dev/null && git status --porcelain");
+  }
+  // A commit stopped for taking too long leaves no lock of the Git it stopped, however often,
+  // with the user's own staging beside it too.
+  ok(&dir, "printf '#!/bin/sh\\nexec sleep 60\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit");
+  ok(&dir, "echo u > u.txt && git add u.txt");
+  for round in 0..2 {
+    let out = sh(&dir, &format!("echo {round} >> a.txt && NV_GIT_TIMEOUT=1 $NV commit . 'stopped {round}' 2>&1"));
+    assert!(!out.status.success() && text(&out).contains("did not finish"), "{}", text(&out));
+  }
+  std::thread::sleep(std::time::Duration::from_millis(300));
+  assert_eq!(ok(&dir, "ls -a .git .nv | grep -v -x -e lock -e publishing.lock | grep -e 'lock$' -e 'tmp' || true"), "");
+  assert_eq!(
+    ok(
+      &dir,
+      "rm .git/hooks/pre-commit && $NV commit . 'no hook' >/dev/null && git status --porcelain; git show --format= --name-only HEAD"
+    ),
+    "a.txt\nu.txt"
+  );
 }

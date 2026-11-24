@@ -39,7 +39,7 @@ the README or undone. "Tree" means the files of one commit.
 | `restore`, `mark`, `since` with `--recorded` | paths that differ or were reported, and for a restore the bytes it writes | tree size | 5–6 ms on oxc |
 | The watcher | writes made | tree size, time spent idle | no CPU when idle; a write is a snapshot 40 ms later |
 | `commit` (publishing snapshots), no Git beside it | paths changed | tree size, history | 59 ms for 52 snapshots |
-| `commit` beside a Git repository | paths changed, and what `git add` and `git commit` of them cost | history | 126 ms on oxc with `--recorded` (six Git commands, of which the commit is 35 ms); Git's own commit is 42 ms |
+| `commit` beside a Git repository | paths changed, and what `git add` and `git commit` of them cost | history | 126 ms on oxc with `--recorded` (six Git commands, of which the commit is 35 ms); Git's own commit is 42 ms. 90–94 ms against Git's 39 on oxc of 17,002 files on a Linux VM, after the eleventh round |
 | Following a move Git made on its own | commits and paths new to nv | history | 15 ms after one raw commit on oxc |
 | `git commit`, the index file (no Git beside it) | paths staged | tree size | 7.1 ms on oxc; an untouched index is an empty file |
 | `git add <path>` (no Git beside it) | what is at that path | tree size | 8.1 ms on oxc; Git takes 11 ms |
@@ -51,7 +51,7 @@ the README or undone. "Tree" means the files of one commit.
 | `status`, a snapshot with nothing reported | files walked | rules, attributes, store size | 40 ms on oxc on eight threads; Git takes 58 ms |
 | `--tracked`, `git diff`, `git commit -a` | files the index knows, and one look at each of their directories | untracked files | 16–20 ms on oxc; Git takes 17–30 ms |
 | Server push | paths in the push | how far behind the pusher is, how many commits the push has | 4–6 ms with one content; 74 ms for 1,000 paths and their contents |
-| Writes to the bucket for a push | 1, and 1 for each large file | how many files the push has | 200 files: 1 write |
+| Writes to the bucket for a push | 1, and 1 for each large file, and 1 more where the server merged a `merge=union` path | how many files the push has | 200 files: 1 write |
 | Linking a directory of another repository | nothing stored but one change | files and bytes of the directory | 464 bytes for 14,716 files, 119 MB |
 | Pushing a linked directory | its tree objects, and the files the server cannot find | bytes of files the repository it came from has | 833 ms for oxc, 1 content sent |
 | Three-way merge of a file | its lines | | 4.7 ms for 58,000 lines |

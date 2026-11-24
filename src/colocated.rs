@@ -177,6 +177,29 @@ fn busy(root: &Path) -> Option<&'static str> {
   .map(|(_, what)| what)
 }
 
+/// A lock of Git's that is there: another Git is running, or one was stopped and left it. Git
+/// refuses to write what it locks, and nv refuses before writing anything, files included,
+/// rather than half-way through. The index, HEAD, and the branch HEAD is on.
+pub fn locked(root: &Path) -> Result<()> {
+  if !shared(root) {
+    return Ok(());
+  }
+  let dir = root.join(".git");
+  let mut locks = vec![PathBuf::from("index.lock"), PathBuf::from("HEAD.lock")];
+  if let Some(branch) =
+    std::fs::read_to_string(dir.join("HEAD")).ok().and_then(|head| head.trim().strip_prefix("ref: ").map(str::to_string))
+  {
+    locks.push(PathBuf::from(format!("{branch}.lock")));
+  }
+  match locks.iter().find(|lock| dir.join(lock).exists()) {
+    None => Ok(()),
+    Some(lock) => Err(format!(
+      "Git's lock `.git/{}` is there: another Git is running, or one was stopped and left it behind. Nothing was touched.\nOnce no Git is running here, remove it and try again.",
+      lock.display()
+    )),
+  }
+}
+
 /// Bring Git to where nv is, after nv caught up with a server: the commits,
 /// whatever HEAD names, and Git's index for the paths that changed. Files
 /// are not touched; nv wrote them as it caught up.
@@ -185,6 +208,7 @@ fn mirror(store: &mut Store, ws: &Workspace, was: Option<Id>) -> Result<()> {
   if let Some(what) = busy(&ws.root) {
     return Err(format!("Git is in the middle of {what}: finish or abort it with Git, and Git will be brought along then"));
   }
+  locked(&ws.root)?;
   // Git's history holds every version of every file; what came from a server came with the
   // latest only. The rest is fetched before Git is written to.
   crate::remote::fetch_for_export(store, ws)?;
@@ -371,6 +395,20 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
       "Git is in the middle of {what}: conclude it or abort it with Git first. Nothing was touched, and what nv recorded is kept."
     ));
   }
+  locked(&ws.root)?;
+  // What the user has staged. A look at the tracked files, which is `git commit -a`, would not find
+  // a file Git was told of and nv was not (the new name of a `git mv`, a `git add` of a new file),
+  // where `git commit -a` commits it: those paths are looked at too. A look at reported writes
+  // leaves the user's staging the user's.
+  let staged_out =
+    git(&ws.root).args(["diff", "--cached", "--name-only", "--no-renames", "-z"]).output().map_err(|e| format!("cannot run git: {e}"))?;
+  let staged_paths: std::collections::HashSet<Vec<u8>> =
+    staged_out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec).collect();
+  if look == Look::Tracked && !staged_paths.is_empty() {
+    let mut paths: Vec<Vec<u8>> = staged_paths.iter().cloned().collect();
+    paths.sort();
+    ws.note(&paths)?;
+  }
   workspace::snapshot(store, ws, author, look)?;
   if ws.head == ws.base {
     return Ok(None);
@@ -395,6 +433,7 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
       }
     }
   }
+  workspace::refuse_sync_markers(store, ws)?;
   let root = |store: &mut Store, id: Option<Id>| match id {
     Some(id) => root_of(store, &id),
     None => Ok(None),
@@ -455,7 +494,7 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   };
   // Whether the user has anything staged of their own. If not, the commit is the plain one, of the
   // whole index: a hook that changes a file and adds it again then leaves the index as the commit.
-  let only_ours = git(&dir).args(["diff", "--cached", "--quiet"]).status().is_ok_and(|status| status.success());
+  let only_ours = staged_out.status.success() && staged_paths.is_empty();
   // A file the user has staged in part is two decisions in one file: which lines go in is theirs
   // to say, and committing the whole file, or only what they staged, would each unsay one of them.
   if !only_ours {
@@ -463,7 +502,7 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
       let out = git(&dir).args(args).output().map_err(|e| format!("cannot run git: {e}"))?;
       Ok(out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(<[u8]>::to_vec).collect())
     };
-    let (staged, unstaged) = (names(&["diff", "--cached", "--name-only", "-z"])?, names(&["diff", "--name-only", "-z"])?);
+    let (staged, unstaged) = (&staged_paths, names(&["diff", "--name-only", "-z"])?);
     let partly: Vec<String> = changed
       .iter()
       .map(|(path, _)| git_name(&dir, path))
@@ -601,10 +640,11 @@ pub fn commit(store: &mut Store, ws: &mut Workspace, author: &str, message: &str
   repair(&dir)?;
   let oid = after.ok_or("Git has no commit after committing")?;
   let id = take_in(store, &dir, &oid)?;
+  store.flush()?;
+  ws.log("commit", &id)?;
   move_to(store, ws, Some(id))?;
   store.flush()?;
   write_point(&dir, &Point { git: Some(oid.clone()), branch, nv: Some(id) })?;
-  ws.log("commit", &id)?;
   Ok(Some(oid))
 }
 
@@ -642,6 +682,7 @@ pub fn publish_step(args: &[String]) -> i32 {
     Ok(status) => status.code().unwrap_or(2),
     Err(why) => {
       eprintln!("{why}");
+      stopped_gits_locks(dir, own);
       2
     }
   };
@@ -658,6 +699,25 @@ pub fn publish_step(args: &[String]) -> i32 {
     }
   }
   code
+}
+
+/// What a Git stopped part-way leaves: the lock on the index nv built for it, and the index of
+/// `commit --only`, named after its process. Only a lock whose process is gone is removed.
+fn stopped_gits_locks(dir: &Path, own: &Path) {
+  let mut lock = own.as_os_str().to_owned();
+  lock.push(".lock");
+  let _ = std::fs::remove_file(lock);
+  for entry in std::fs::read_dir(dir.join(".git")).into_iter().flatten().flatten() {
+    let name = entry.file_name();
+    let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("next-index-")?.strip_suffix(".lock")?.parse::<i32>().ok()) else {
+      continue;
+    };
+    // SAFETY: signal 0 sends nothing; it asks whether the process is there.
+    let gone = unsafe { libc::kill(pid, 0) } == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    if gone {
+      let _ = std::fs::remove_file(entry.path());
+    }
+  }
 }
 
 /// Bring Git's index up to a commit that nv published and did not live to bring it up to: for the

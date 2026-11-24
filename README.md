@@ -101,14 +101,14 @@ against the table before any of it runs:
 | `init` | `-q` `-b <branch>` |
 | `clone`, `fetch`, `pull`, `push` | `-q`; `pull --ff-only`, `--no-rebase`; `push` of the branch one is on, to the branch of its name on `origin`. A Git repository on this machine only |
 | `add` | `-A`, paths |
-| `rm`, `mv` | `rm -r -q -f` |
+| `rm`, `mv` | `rm -r -q -f --cached` (the file stays on disk, where Git then does not track it) |
 | `restore` | `--staged`, paths |
 | `reset` | `--soft` `--mixed` `--hard` `-q`, a revision or paths |
 | `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
 | `status` | the long form, `--porcelain`, `--short` |
 | `log` | `--oneline` `--format=` `--pretty=format:` `--pretty=tformat:` `-n`, a revision; the default format. Placeholders: `%H %h %T %t %P %p %s %b %B %an %ae %at %cn %ce %ct %n %%` |
-| `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>` |
-| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, the working tree against the index, `--cached` |
+| `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>`; a commit kept to paths after `--` |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--` |
 | `rev-parse` | a revision, `<rev>^{tree}`, `<rev>:<path>`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
 | `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags, by revision or `<rev>:<path>` |
 | `ls-tree` | `-r` `--name-only`, a revision or `<rev>:<path>`, one path (`dir/` lists what is in it) |
@@ -287,10 +287,18 @@ all of Git has it by keeping Git in the directory.
 - A merge stops for someone only where lines of text met. Where one side
   deleted a file the other changed, both added one of the same name, or the
   file is binary, it refuses and touches nothing.
+- Paths after `--` are names of files and directories, from where the
+  command is run. Git's patterns and magic (`'*.txt'`, `:(exclude)...`,
+  `:/`) are refused, as are paths given to `show` of a merge or a tag. As
+  in Git, `show` of a commit that changes nothing under them prints
+  nothing, and a move with one end outside them is the other end alone.
 - `diff` while a merge has conflicts is refused: Git shows both sides
   against the result, which is not spoken.
-- `.gitattributes` is read for line endings only (`text`, `text=auto`,
-  `eol`, `-text`, `binary`), as Git does with `core.autocrlf` unset on a
+- `.gitattributes` is read for line endings (`text`, `text=auto`,
+  `eol`, `-text`, `binary`), and for `merge=union`, which `git merge` and
+  `nv sync` both honour: where both sides changed the same lines of such a
+  path, both sides' lines are kept, ours first, and the path is merged.
+  Line endings are read as Git does with `core.autocrlf` unset on a
   system whose line ending is LF. Filters, `ident` and
   `working-tree-encoding` are not applied. A file under `text=auto` that
   was committed with CRLF and is then edited is stored with LF, where Git
@@ -392,7 +400,7 @@ runs with `hyperfine`:
 | `nv mark` | | | 4.4 ms |
 | `nv since` | | | 4.1 ms |
 | `nv restore` (two files differ) | | | 5.3 ms |
-| `nv commit`, the commit made by Git | 108 ms | 81 ms | 74 ms |
+| `nv commit`, the commit made by Git (older than the eleventh round's fixes: see "Not done") | 108 ms | 81 ms | 74 ms |
 | `git commit -a`, for scale | | 30 ms | |
 
 Recording is what happens hundreds of times, and it is four to six times
@@ -528,9 +536,77 @@ it prove nothing. Then nothing is named and nothing is kept, and the
 runner goes again. The workspace is held only to record and to name,
 never while a condition runs.
 
-Not done: the watcher does not start runs, only the hook does. A write
+With `auto = true` a watcher starts the runs too, after each snapshot that
+recorded something: a writer that only writes files needs neither a hook
+nor a command.
+
+#### A commit at every state that passes, made again before it is pushed
+
+```toml
+[commit]
+each = true                 # commit every state all the conditions pass on
+```
+
+With `each`, a state every condition passed on is committed there and
+then, under the drafted message or a provisional one (`checkpoint: unit
+passed`), signed as any commit made here is (the environment, the
+workspace's `user.name` and `user.email`, then Git's configuration; with
+none, the state is not committed and `nv checkpoint` says why). The writer
+may have gone on writing while the conditions ran;
+the commit is of the state they passed on, and what was written since stays
+recorded on top of it, uncommitted. These commits are meant to be made
+again before anyone else sees them:
+
+- `nv pending <dir>` lists the commits not pushed, oldest first: number,
+  Git id and nv's, message, the conditions the files passed, and each path
+  as `A`, `M` or `D`. `--wait` first waits until nothing more is coming
+  (the watcher has recorded every write, no run is under way) and says
+  whether what is on disk is committed or did not pass.
+- `nv rebuild <dir> <commit> <message> [<commit> <message>...]` makes them
+  again as fewer commits: each new one ends at a `<commit>` (its number, or
+  the start of either id) and holds everything since the one before,
+  under the author of the first commit it is made of, as a squash in Git
+  keeps it; the committer is whoever ran it.
+  Where each `<commit>` passed, each new commit did, as results are kept by
+  the files' tree as well as by the state. The files are not touched. It
+  refuses where there is no end to what is not pushed (no ref and no commit
+  the workspace was made at), and while a push is unheard.
+- `nv note <dir> <line>` says what the next step was: the next commit the
+  conditions pass on is made under that line, and where the runner has
+  committed those files already under a message of its own, that commit
+  is renamed. A writer that notes each step it finishes has said where
+  commits end without ever committing.
+- `nv publish <dir> [--message <line>]` waits as `nv pending --wait` does,
+  makes the commits again with one ending at each note (what came after
+  the last, under `--message`), and pushes. A `[body]` hook
+  (`run = "..."`, the change on stdin, the summary line in `NV_SUBJECT`)
+  is asked for each commit's body. Where the push is refused over files
+  the ref changed meanwhile, it catches up, writes every body again of
+  the change as it now lands, and pushes again; where catching up leaves
+  a file with both versions, it stops with exit 1 and says so, and the
+  note of a commit the files held is kept for when they are settled.
+
+A commit's message is written of what was there when it was made. When a
+sync or a push puts it on top of other writers' commits that change the
+same files, `nv sync`, `nv push` and `nv pending` name those commits and
+say that what the message says of what was there may not hold, until
+`nv rebuild` (or `nv publish`, which rebuilds) writes it again.
+
+`eval/commit-agents` runs this the way it is meant for: in each of several
+forks, a developer agent that never runs a version control command, and
+beside it a committer agent that waits for the work, remakes the commits
+and pushes, all to one ref. `rounds.md` there has what each round found.
+
+Not done: a write
 that lands after a runner's last look and before it ends waits for the
-next write to be run on. Conditions do not run in a copy, so a slow test
+next write to be run on. A sync's own commit on the ref's tip leaves out
+a file the sync left with both versions. Its settling, when the
+conditions pass on it and it changes nothing but those files, goes into
+that commit as long as it is the last made here and not pushed: the
+commit is whole again under its own message (a checkpoint's settling;
+`nv commit` of it is a commit of its own). Where the workspace had no
+commit of its own, the settling is one, on the ref's tip, never a change
+to another writer's. Conditions do not run in a copy, so a slow test
 suite and a busy writer may never agree on a state. Nothing is shared
 with other workspaces yet: taking another writer's checkpoint in early,
 and running one's own conditions on the two together, is the next step.
@@ -747,6 +823,14 @@ processor time: 205 ms of it for the 40 ms `status`, where one thread used
 turned on a reviewer measured it at 21.5 ms, which nv does not match and
 has no equivalent of. `git diff` is level, not ahead.
 
+`git diff <rev>`, a commit against the files, looks at what `git diff`
+does and at the paths that differ between that commit and the last one.
+On oxc of 17,002 files on a Linux VM of four threads, one file edited,
+means of 20 runs: `diff HEAD` 20.4 ms, Git 16.3; `diff --stat HEAD~5`
+22.3 ms, Git 16.7; kept to `-- crates/oxc_parser`, 7.6 ms, Git 7.5. On
+that machine plain `git diff` is 23.2 ms against Git's 16.2: the gap is
+that of `git diff`, which the table above measured on another.
+
 ## Pushing at once
 
 `server/test/e2e.ts`, against the Durable Object under `cf dev` on the same
@@ -772,6 +856,16 @@ How the cost of one push grows (`server/test/bench.ts`, medians):
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Commits the writer's base is behind the tip | 5.6 ms | 5.3 ms | 4.6 ms | 4.1 ms | 3.9 ms |
 | Paths changed by the commit, a content each | 4.3 ms | 4.7 ms | 11.3 ms | 74.3 ms | 328 ms |
+
+Since the server merges `merge=union` paths, it also keeps every change to
+every path (`path_index`, a row beside the one it had), to check what a push
+says a path was at its base. Measured on a 4-core Linux VM, the code before and
+after run back to back, twice each (the VM is far slower than the machine of
+the table above, for both): a push of 1,000 paths 653 to 732 ms before and 722
+to 724 after, of 10,000 paths 35.5 to 38.8 s before and 35.9 to 38.8 s after;
+64 writers on one repository 126 to 128 pushes a second before and 107 to 111
+after, which is the row. On 8 and 64 repositories, 124 to 128 before and 110 to
+128 after.
 
 How far behind a writer is does not matter: the server keeps, for each path,
 the position at which it last changed, and looks up the pushed paths. What a
@@ -819,7 +913,8 @@ before:
   (`gix-merge`). Where the two changed different lines the result is the
   workspace's change on top of theirs, and the push then goes through.
   Where they changed the same lines the file is left holding both versions
-  between Git's markers, as a change not yet recorded; the sync exits 1,
+  between Git's markers, as a change not yet recorded, unless
+  `.gitattributes` gives it `merge=union` (below); the sync exits 1,
   as `git pull` does, and `nv commit` refuses while a file from that sync
   still holds the markers. What cannot be merged as text (a file one side
   removed, a binary file) stops the sync with nothing touched. The way on
@@ -827,6 +922,42 @@ before:
   as it last saw it, and what it had beyond that (commits not pushed,
   snapshots, the files) is set aside under an id it prints, to be read
   with `nv since` or written out beside the workspace with `nv checkout`.
+- **A list every writer adds to need not be a conflict.** A file of
+  entries, one to a line (imports, a changelog, names exported), meets
+  the same lines changed by every writer after the first, though no two
+  disagree. Given `merge=union` in `.gitattributes`, as Git users give a
+  changelog, a sync keeps both sides' lines and goes on. Union is only
+  right where each entry is a line of its own and order does not matter:
+  two writers who each wrote `__all__ = ["theirs"]` on one line get both
+  lines, and the second assignment wins. Where the conditions run behind
+  writes (`auto`), they are run on what a sync or a push made, so that
+  `nv pending` says whether the merged commit passes; a union that went
+  wrong is caught there, when the conditions look at it. A sync that put
+  a commit of the workspace's own on a newer tip says so, and where to hear
+  how they end; without `auto`, it says they have not run on it.
+- **The server merges such a list itself, and the push lands.** A push
+  refused only over paths `merge=union` gives would cost its writer a sync
+  and a second push, every writer after the first, every time. So a push
+  says, of each such path it changes, what the path was at its base and
+  what the `.gitattributes` above it said there, and sends those contents
+  with it. Where the ref clashes only on such paths, the server merges each
+  one, commit by commit, on what the ref has, with the code a sync uses
+  (`src/union.rs`, compiled to WebAssembly in `server/merger`, so that the
+  bytes are the same), and the push lands with the merged contents. `nv
+  push` names the paths; the workspace is brought to what landed, and a
+  later sync knows the commits for its own though their contents differ.
+  What the pusher says is checked against the ref's own history wherever
+  it has one: what a path was at the base, the rules at the base. Where the
+  ref has none (the path is as it was before the ref began), it is taken
+  on the pusher's word. That gives a writer nothing it could not have by
+  syncing and pushing whatever it liked on top, and a union never drops a
+  line of anyone's. Not merged, and refused as before: rules that changed
+  on the ref since the base or change in the push, a path removed, a mode
+  changed, a binary file, a content the repository was not sent, a
+  directory moving above or below the path, and a ref that began before
+  the server indexed every change to every path (one row per path a commit
+  changes, beside the row it had). A merged push writes the bucket twice:
+  the contents it brought, then the merged ones.
 - **What a workspace pushed is its own work, not a change of someone
   else's.** A file committed, edited again and then pushed stays as
   edited, the edit an unpublished change on the commit; a file committed
@@ -1589,6 +1720,96 @@ on oxc where it was 227), and a restore hashes the ready copy of each
 file it writes and looks at what stands in the way (5.6 ms for two files
 where it was 5.0).
 
+What the eleventh round found and is now fixed, each with a test that
+failed first:
+
+- **A `nv snapshot` killed after it moved the workspace's state and before
+  it logged it left a state nothing named**, and the next `nv restore`
+  removed a file's only copy. A state is now logged before anything names
+  it, everywhere a state is made, and a record is one write: a kill no
+  longer tears a line into the next, and a torn line names nothing.
+- **`nv git merge --abort` threw away an unstaged edit to a file the merge
+  did not touch.** It is Git's `reset --merge` now: the files the merge
+  wrote go back, the others keep what was done to them.
+- **Finishing a conflicting sync with `--amend` amended the other writer's
+  commit**, and a later sync undid a third writer's change. Refused, as
+  Git refuses an amend in a merge that stopped.
+- **A killed `nv git commit --amend` left the branch on the commit it
+  replaced**, and every commit after was refused ("another workspace
+  moved it"). The next command finishes the move, as it already did for a
+  plain commit.
+- `nv commit` opened what a link to a pipe led to, and waited for ever; it
+  reads only regular files, and a link as a link.
+- Beside Git, `git mv` and `nv commit --tracked` published half the move;
+  the paths Git has staged are now looked at by `--tracked`, as
+  `git commit -a` commits them. A lock Git left behind (`index.lock`,
+  `HEAD.lock`, the branch's) is found before anything is written, where
+  `nv sync` used to write the files and fail at the end, and `nv commit`
+  wrote Git's index over the lock. A Git commit stopped by
+  `NV_GIT_TIMEOUT` no longer leaves its locks behind.
+- `nv record . a ../zz` refused `../zz` and had noted `a`; it notes all or
+  none. A push refused over a sync's markers in a commit now says what
+  takes them out of the chain (a commit on top does not). A restore that
+  could not read a file it should have recorded no longer says it is
+  done. A change to `.nv/exclude` (or Git's `info/exclude`) is seen by
+  `--recorded` without being reported.
+- `nv git`: `reset <path>` in a stopped merge, a merge refused over a
+  local edit (nothing on stdout, exit 2), a fast-forward over a staged
+  file it does not touch, `restore --staged` before the first commit,
+  `rm` of a tracked link, "Initial commit", `show` of a merge, and
+  `reset --hard` before the first commit now do what Git does (case 33).
+
+**A model of pushing and syncing** (`formal/sync`, checked with
+[idealis](https://github.com/mizchi/idealis)) follows the client and the server as they are
+written, kills a workspace while it waits for an answer, and writes lines back to what they
+were. Its counterexamples, each then reproduced with nv against the server:
+
+- **Work after a push that landed unheard was merged on the wrong tree.** A line changed back
+  after that push was silently taken from the ref (the push's own version of it) when another
+  writer had changed the file elsewhere, and a line changed again was a conflict with itself.
+  It is merged now on what the workspace's landed commits left.
+- **Going back past a push that may have landed made its commits again**: `restore pushed`
+  set aside as "what the ref does not have" a commit the ref had, `restore before-sync` undid
+  a sync whose result was pushed, and an amend made the pushed commit again. Each made the
+  next sync a conflict between two versions of the workspace's own. A push leaves a note from
+  before it is sent until its answer is heard or a sync finds its commits on the ref, and
+  those three are refused while it is there.
+- Found beside it: **amending a commit that was pushed and heard** did the same. A ref only
+  goes forward, and the amend is refused.
+
+**Tuning on Linux.** Measured on oxc (17,002 files, 22,530 commits) on a
+4-core Linux VM (ext4, Git 2.43), each row the old binary and the new one
+back to back, medians of 20 runs, with Git beside them in the same session:
+
+| | before | after | Git |
+| --- | ---: | ---: | ---: |
+| `nv status` (beside Git) / `git status` | 36.3 ms | 34.9 ms | 52.1 ms |
+| `nv git status` (no Git beside it) | 48.5 ms | 39.9 ms | 52.1 ms |
+| `nv git diff --stat` | 29.2 ms | 19.7 ms | 14.2 ms |
+| `nv git commit -qam` | 36.4 ms | 22.2 ms | 36.9 ms |
+| `nv git switch` there and back, 52 files | 101.3 ms | 89.6 ms | 81.6 ms |
+| `nv git log -20 --oneline` | 7.7 ms | 3.1 ms | 2.5 ms |
+| `nv snapshot --recorded` | 10.4 ms | 4.0 ms | |
+| `nv snapshot --tracked` | 29.1 ms | 18.9 ms | |
+| `nv mark` / `nv since` with `--recorded` | 11.3 / 9.9 ms | 4.8 / 4.7 ms | |
+| `nv commit` beside Git, `--recorded` | 81.1 ms | 78.8 ms | 36.9 ms (`commit -qam`) |
+| `nv commit` beside Git, `--tracked` | 144.9 ms | 105.9 ms | |
+| `nv commit` beside Git, walking | 172.9 ms | 130.0 ms | |
+| first `nv status` after `nv fork` | 121 ms, 17,002 files read | 63 ms, none read | |
+
+What changed, found with callgrind: opening the store read every commit's
+root into a hash map, which was 90% of a `rev-parse`; roots are now in a
+sorted, mapped `roots.idx` as Git ids are in `git.idx`. Maps keyed by ids
+hash the id's first eight bytes, where SipHash cost more than the lookups.
+Listing the index merged its parts through a map of every path, and comparing
+a file with it allocated its path; both are gone. A commit looked for a
+sync's markers with a look of its own, so `--tracked` and walking looked at
+the tree twice; it now looks in what it recorded. A copy made where there is
+no clone kept nothing of when files were written, and every file was read
+again after a fork. Publishing beside Git is still twice `git commit`: Git's
+index (2 MB for oxc) is written twice, by `git add` and by Git's commit,
+where `git commit -a` writes it once.
+
 What the rounds agree on, measured three times by different hands on a
 machine busy with the other reviewers: recording is about three times
 quicker than Git's quickest commit; going back is five to six times
@@ -1647,22 +1868,12 @@ stops.
 
 ## Not done
 
-- **Found by the eleventh round and not fixed yet**, each a way to lose
-  work or publish the wrong thing in ordinary use:
-  - a `nv snapshot` killed after it moved the workspace's state and
-    before it logged it leaves a state nothing names, and the next
-    `nv restore` removes a file's only copy;
-  - `nv git merge --abort` throws away an unstaged edit to a file the
-    merge did not touch;
-  - finishing a conflicting sync with `--amend` amends the other writer's
-    commit, and a later sync can then undo a third writer's change;
-  - `nv commit` opens what a link to a pipe leads to, and waits;
-  - a directory renamed only in case (`d` to `D`) on a file system that
-    folds case is recorded beside the old spelling;
-  - `git rm way` then `nv git add WAY` stages nothing; beside Git,
-    `git mv` and `nv commit --tracked` publish half the move;
-  - a kill can tear a line of `.nv/oplog`, and the id on it is then not a
-    name `restore` takes.
+- **Found by the eleventh round and not fixed yet**, each a way to
+  publish the wrong thing in ordinary use, on a file system that folds
+  case (none was at hand where the rest were fixed):
+  - a directory renamed only in case (`d` to `D`) is recorded beside the
+    old spelling;
+  - `git rm way` then `nv git add WAY` stages nothing.
 
 - The server checks a push against the spellings of the ref's paths it
   has kept since those checks were added: a ref older than them was not
@@ -1670,14 +1881,26 @@ stops.
   down, not all the way. A server that sends one byte a second is cut
   off only by the command's own limit (30 minutes).
 
-- Publishing a commit beside Git is three to four times slower than
-  `git commit`: on oxc 126 ms with `--recorded`, 135 with `--tracked`,
-  164 walking, where `git commit -am` takes 42. It was two to three times
-  until the fifth round. What was added since is what makes a killed or
-  refused publishing leave Git's index alone: a look at what the user has
-  staged, an index of nv's own, a process of its own for the commit. Six
-  Git commands are run where `git commit` is one. `git status` with fsmonitor and the untracked cache is
-  quicker than `nv status`, which has no equivalent of either.
+- Publishing a commit beside Git is two to four times slower than
+  `git commit`. On oxc as it is now (17,002 files, 22,530 commits; a
+  4-core Linux VM, ext4, Git 2.43; medians of 25 runs), `nv commit
+  --recorded` takes 90 to 94 ms, `--tracked` 150, where `git commit -qam`
+  takes 39. Until the eleventh round's fixes `--recorded` took 143 to 147
+  ms there: looking for a sync's markers before publishing walked the whole
+  tree, whatever the look, and now it looks where the commit does. Taking
+  Git's commit in asks Git once where it asked twice. `--tracked` still
+  looks at every tracked file twice, once for the markers and once to
+  record. What makes a killed or refused publishing leave Git's index alone
+  costs the rest: a look at what the user has staged, an index of nv's
+  own, a process of its own for the commit; six Git commands are run where
+  `git commit` is one. `git status` with fsmonitor and the untracked cache
+  is quicker than `nv status`, which has no equivalent of either.
+- After a push that was not heard back from, `restore pushed`, `restore before-sync` and
+  `nv git commit --amend` are refused until the workspace knows where it stands: a push that
+  is answered, or a sync that finds the push's commits on the ref. A push that never reached
+  the server is known only by pushing again.
+- The model in `formal/sync` is checked for two writers, one file of two lines and a ref of
+  three commits. A bug that needs more than that is not ruled out by it.
 - Two writers who each add a file whose names differ only in case both
   land; on a file system that does not tell the names apart, a workspace
   then has one file on disk for the two.
@@ -1826,15 +2049,22 @@ stops.
 - A fork keeps build output, but whether a build tool still trusts it under
   a new absolute path has not been tried.
 - In a workspace with no Git beside it, `.gitattributes` is read for line
-  endings only: no filters, no LFS. Beside Git, commits are Git's and
+  endings and `merge=union` only: no filters, no LFS, no `-merge` (it is
+  merged as text), no merge drivers of one's own (`merge=<name>` with
+  `merge.<name>.driver`, which would let a syntax-aware tool or an agent
+  settle a conflict before a person sees it). Beside Git, commits are Git's and
   filters apply to them; nv's own snapshots hold the files as they are on
   disk.
 - `.gitignore` is honoured, and `.nv/exclude` is a workspace's own list in
   the same form. Nothing is skipped by name, so a workspace without rules
   sees its `target` and `node_modules`.
 - Nothing searches the snapshots for the one that broke a test.
-- The watcher has only been run on macOS, and copy-on-write clones are
-  APFS's: on another file system a checkout or fork would have to copy.
+- The watcher has been run on macOS, and on Linux by the tests only.
+  Copy-on-write clones are APFS's, and Btrfs's and XFS's through
+  `cp --reflink=auto`: on another file system (ext4) a checkout or fork
+  copies, keeping the times files were written, so that the index that
+  comes with them still vouches for them. A store inside the workspace (as
+  `nv git clone` makes one) is copied with a fork: 390 MB for oxc, 10 s on ext4.
 - A tree whose entries are not in Git's order, or whose directory modes are
   written with a leading zero, would not round-trip. File modes Git no
   longer writes do. None of the former turned up in 271,812 commits.
@@ -1845,10 +2075,23 @@ stops.
 cargo test
 cargo build --release   # target/release/nv
 pkf run ci              # fmt, clippy, tests
+cargo test --profile fast   # while working on nv
 ```
 
+The release profile is built with fat LTO and one codegen unit, and a change
+to one file takes a minute to rebuild. The `fast` profile is optimized but
+not linked whole, and rebuilds in seconds; the tests pass on it as on
+release. Numbers in this file are measured with release builds only.
+
 The end-to-end tests build a Git repository with `git`, so `git` has to be on
-the path.
+the path. Some tests make files unreadable with `chmod 000`, which does not
+stop root: run them as another user.
+
+On Linux (ext4, Git 2.43, the tests run as an unprivileged user and against
+a local server) everything passes but case 27 of the Git cases (Git 2.43
+takes `log -n abc`, newer Git refuses it), and, now and then, the check that
+a hook's process is gone after it was stopped, which can still be seen there
+for a moment until it is reaped.
 
 The server:
 

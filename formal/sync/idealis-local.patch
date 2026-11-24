@@ -1,0 +1,262 @@
+diff --git a/crates/idealis-cli/src/bin/idealis/tlc.rs b/crates/idealis-cli/src/bin/idealis/tlc.rs
+index 03cf2841..eb5f8dc8 100644
+--- a/crates/idealis-cli/src/bin/idealis/tlc.rs
++++ b/crates/idealis-cli/src/bin/idealis/tlc.rs
+@@ -83,15 +83,23 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<u8> {
+     // Check the source before lowering: the executable IR omits proof declarations.
+     rtla_compiler::analyze_modules(&bundle.root, &bundle.dependencies, true)
+         .map_err(|e| (150, e.to_string()))?;
+-    let program = rtla_compiler::compile_modules(&bundle.root, &config, &bundle.dependencies)
++    // Local change: IDEALIS_IR=2 selects the IR that shares operator bodies.
++    let options = rtla_compiler::CompileOptions {
++        irVersion: if std::env::var("IDEALIS_IR").as_deref() == Ok("2") {
++            rtla_compiler::IrVersion::V2
++        } else {
++            rtla_compiler::IrVersion::default()
++        },
++    };
++    let program = rtla_compiler::compile_modules_with_options(&bundle.root, &config, &bundle.dependencies, options)
+         .map_err(|e| (150, e.to_string()))?;
+     let started = std::time::Instant::now();
+     let check = program.check_with_options(
+         SafetyBounds {
+-            max_depth: 1000,
+-            max_states: 100000,
+-            max_work: 10000000,
+-            max_temporal_nodes: Some(100000),
++            max_depth: bound("IDEALIS_MAX_DEPTH", 1000),
++            max_states: bound("IDEALIS_MAX_STATES", 100000),
++            max_work: bound("IDEALIS_MAX_WORK", 10000000),
++            max_temporal_nodes: Some(bound("IDEALIS_MAX_TEMPORAL_NODES", 100000)),
+         },
+         SafetyOptions {
+             workers,
+@@ -184,3 +192,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<u8> {
+         code
+     })
+ }
++
++/// A search bound from the environment, or its default. Local change for larger models.
++fn bound<T: std::str::FromStr>(name: &str, default: T) -> T {
++    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
++}
+diff --git a/crates/rtlc/src/ir.rs b/crates/rtlc/src/ir.rs
+index 633cb37b..b4a8969a 100644
+--- a/crates/rtlc/src/ir.rs
++++ b/crates/rtlc/src/ir.rs
+@@ -762,7 +762,7 @@ impl SafetyProgram {
+ pub struct SafetyBounds {
+     pub max_depth: u32,
+     pub max_states: u32,
+-    pub max_work: u32,
++    pub max_work: u64,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub max_temporal_nodes: Option<u32>,
+ }
+@@ -797,7 +797,7 @@ pub struct SafetyResult {
+     pub states: usize,
+     pub generated: u32,
+     pub depth: u32,
+-    pub work: u32,
++    pub work: u64,
+     pub violation: Option<SafetyViolation>,
+ }
+ 
+@@ -809,7 +809,7 @@ pub struct SafetyActionCoverage {
+     pub enabled: u32,
+     pub generated: u32,
+     pub distinct: usize,
+-    pub work: u32,
++    pub work: u64,
+ }
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+@@ -817,7 +817,7 @@ pub struct SafetyActionCoverage {
+ pub struct SafetyCoverage {
+     pub initial: Vec<SafetyActionCoverage>,
+     pub next: Vec<SafetyActionCoverage>,
+-    pub unattributed_work: u32,
++    pub unattributed_work: u64,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+diff --git a/crates/rtlc/src/safety_coverage.rs b/crates/rtlc/src/safety_coverage.rs
+index efbc3e2a..257d8eb7 100644
+--- a/crates/rtlc/src/safety_coverage.rs
++++ b/crates/rtlc/src/safety_coverage.rs
+@@ -6,7 +6,7 @@ pub(super) trait Recording: Sync {
+     type Output;
+     const ENABLED: bool;
+     fn new(program: &SafetyProgram) -> Self;
+-    fn record(&mut self, initial: bool, action: usize, work: u32, generated: u32, distinct: usize);
++    fn record(&mut self, initial: bool, action: usize, work: u64, generated: u32, distinct: usize);
+     fn finish(self, result: SafetyResult) -> Self::Output;
+ }
+ 
+@@ -17,7 +17,7 @@ impl Recording for NoCoverage {
+     fn new(_: &SafetyProgram) -> Self {
+         Self
+     }
+-    fn record(&mut self, _: bool, _: usize, _: u32, _: u32, _: usize) {}
++    fn record(&mut self, _: bool, _: usize, _: u64, _: u32, _: usize) {}
+     fn finish(self, result: SafetyResult) -> Self::Output {
+         result
+     }
+@@ -48,7 +48,7 @@ impl Recording for WithCoverage {
+             unattributed_work: 0,
+         })
+     }
+-    fn record(&mut self, initial: bool, action: usize, work: u32, generated: u32, distinct: usize) {
++    fn record(&mut self, initial: bool, action: usize, work: u64, generated: u32, distinct: usize) {
+         let row = if initial {
+             &mut self.0.initial[action]
+         } else {
+@@ -68,7 +68,7 @@ impl Recording for WithCoverage {
+                 .iter()
+                 .chain(&self.0.next)
+                 .map(|row| row.work)
+-                .sum::<u32>();
++                .sum::<u64>();
+         SafetyCoverageReport {
+             result,
+             coverage: self.0,
+diff --git a/crates/rtlc/src/safety_expressions.rs b/crates/rtlc/src/safety_expressions.rs
+index b366ea90..1fb9db49 100644
+--- a/crates/rtlc/src/safety_expressions.rs
++++ b/crates/rtlc/src/safety_expressions.rs
+@@ -114,7 +114,7 @@ impl<'a> EvalContext<'a> {
+         if arena.metadata.is_none() && arena.definitions.is_empty() && self.frame.is_none() {
+             return Ok(());
+         }
+-        if self.evaluation_depth >= 128 {
++        if self.evaluation_depth >= 250 {
+             if self.recursive {
+                 return Err(CoreError {
+                     code: "evaluation-budget",
+diff --git a/crates/rtlc/src/safety_parallel.rs b/crates/rtlc/src/safety_parallel.rs
+index 1013fbb4..bea5244d 100644
+--- a/crates/rtlc/src/safety_parallel.rs
++++ b/crates/rtlc/src/safety_parallel.rs
+@@ -132,7 +132,7 @@ impl<R: Recording> Search<'_, '_, R> {
+                     })
+                     .collect()
+             });
+-            arena.work += expansions.iter().map(|delta| delta.work).sum::<u32>();
++            arena.work += expansions.iter().map(|delta| delta.work).sum::<u64>();
+             let candidates = workers
+                 .buffers
+                 .iter()
+diff --git a/crates/rtlc/src/safety_values.rs b/crates/rtlc/src/safety_values.rs
+index 3e065c80..6838e8dd 100644
+--- a/crates/rtlc/src/safety_values.rs
++++ b/crates/rtlc/src/safety_values.rs
+@@ -87,12 +87,12 @@ pub(crate) struct Arena<'a> {
+     types: HashMap<Expression, Option<Arc<MembershipSet>>>,
+     registered: RegisteredMembership,
+     membership: MembershipCache,
+-    pub work: u32,
+-    maximum: u32,
++    pub work: u64,
++    maximum: u64,
+ }
+ 
+ impl<'scope> Arena<'scope> {
+-    pub fn new(maximum: u32) -> Self {
++    pub fn new(maximum: u64) -> Self {
+         Self {
+             definitions: &[],
+             metadata: None,
+@@ -117,7 +117,7 @@ impl<'scope> Arena<'scope> {
+             maximum,
+         }
+     }
+-    pub fn with_prepared(maximum: u32, prepared: &'scope PreparedProgram) -> Self {
++    pub fn with_prepared(maximum: u64, prepared: &'scope PreparedProgram) -> Self {
+         Self {
+             prepared: Some(prepared),
+             constants: vec![None; prepared.len()],
+@@ -171,7 +171,7 @@ impl<'scope> Arena<'scope> {
+             self.work = self.maximum;
+             return Err(work_exhausted());
+         }
+-        self.work += count as u32;
++        self.work += count as u64;
+         Ok(())
+     }
+     #[cfg(not(target_arch = "wasm32"))]
+@@ -1192,7 +1192,7 @@ pub(crate) struct ValueDelta {
+     registered: RegisteredMembership,
+     membership: MembershipCache,
+     offset: usize,
+-    pub work: u32,
++    pub work: u64,
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+diff --git a/crates/rtlc/src/safety_work.rs b/crates/rtlc/src/safety_work.rs
+index affa9805..df250afd 100644
+--- a/crates/rtlc/src/safety_work.rs
++++ b/crates/rtlc/src/safety_work.rs
+@@ -1,25 +1,25 @@
+ use crate::CoreError;
+ use std::sync::Mutex;
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ #[repr(align(128))]
+-struct WorkCredit(AtomicU32);
++struct WorkCredit(AtomicU64);
+ 
+ pub(crate) struct WorkBudget {
+-    available: Mutex<u32>,
++    available: Mutex<u64>,
+     credits: Vec<WorkCredit>,
+ }
+ 
+ impl WorkBudget {
+-    pub fn new(maximum: u32, workers: usize) -> Self {
++    pub fn new(maximum: u64, workers: usize) -> Self {
+         Self {
+             available: Mutex::new(maximum),
+             credits: (0..workers)
+-                .map(|_| WorkCredit(AtomicU32::new(0)))
++                .map(|_| WorkCredit(AtomicU64::new(0)))
+                 .collect(),
+         }
+     }
+-    pub fn consume(&self, worker: usize, mut count: usize) -> Result<u32, CoreError> {
++    pub fn consume(&self, worker: usize, mut count: usize) -> Result<u64, CoreError> {
+         let mut consumed = 0;
+         while count > 0 {
+             let used = take(&self.credits[worker].0, count);
+@@ -42,7 +42,7 @@ impl WorkBudget {
+             return Ok(true);
+         }
+         if *available > 0 {
+-            let grant = requested.min(*available as usize) as u32;
++            let grant = requested.min(*available as usize) as u64;
+             *available -= grant;
+             credit.fetch_add(grant, Ordering::Relaxed);
+             return Ok(true);
+@@ -59,10 +59,10 @@ impl WorkBudget {
+     }
+ }
+ 
+-fn take(credit: &AtomicU32, count: usize) -> u32 {
++fn take(credit: &AtomicU64, count: usize) -> u64 {
+     let mut available = credit.load(Ordering::Relaxed);
+     while available > 0 {
+-        let used = count.min(available as usize) as u32;
++        let used = count.min(available as usize) as u64;
+         match credit.compare_exchange_weak(
+             available,
+             available - used,
+@@ -92,7 +92,7 @@ mod tests {
+     fn concurrent_workers_consume_exactly_the_global_budget() {
+         for maximum in [1, 7, 255, 256, 257, 100_003] {
+             let budget = WorkBudget::new(maximum, 8);
+-            let consumed: u32 = std::thread::scope(|scope| {
++            let consumed: u64 = std::thread::scope(|scope| {
+                 let handles: Vec<_> = (0..8)
+                     .map(|index| {
+                         let budget = &budget;
