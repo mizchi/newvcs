@@ -2033,7 +2033,8 @@ stops.
   met by a real file of a gigabyte. Nothing yet fetches a large file only
   when it is opened.
 - A workspace with several unpushed commits that has to catch up first gets
-  them back as one commit, under the message of the last; the sync says so.
+  them back as one commit, under the lines of all of them (their summary
+  lines joined by `; `, their bodies one after another); the sync says so.
 - The server compares paths. Two changes to different functions of one file
   need a sync and a second push from one of the writers; the merge is the
   client's. A push that was refused stays on the server as a row nobody

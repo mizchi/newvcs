@@ -741,6 +741,49 @@ fn arriving(ws: &Workspace) -> std::path::PathBuf {
   workspace::arriving(ws)
 }
 
+/// What the one commit the workspace's own commits not pushed become, `last` and the `count - 1`
+/// before it, says of itself: the last one's author and committer, and the lines of all of them
+/// (a summary line each, joined by `; `, the bodies one after another). Under the last one's
+/// message alone, the others' lines were lost (twelfth round: notes `nv publish` had made).
+/// Provisional lines, the runner's, say nothing where there are others.
+fn folded_rest(store: &mut Store, last: Id, count: usize, common: Option<Id>) -> Result<Vec<u8>> {
+  let commit = Commit::load(store, &last)?;
+  if count <= 1 {
+    return Ok(commit.rest);
+  }
+  let mut messages = Vec::new();
+  let mut at = Some(last);
+  while let Some(id) = at.filter(|id| Some(*id) != common && messages.len() < count) {
+    let c = Commit::load(store, &id)?;
+    let said = String::from_utf8_lossy(&c.rest).into_owned();
+    messages.push(said.split_once("\n\n").map(|(_, m)| m.trim_end().to_string()).unwrap_or_default());
+    at = c.parents.first().copied();
+  }
+  messages.reverse();
+  let said = String::from_utf8_lossy(&commit.rest).into_owned();
+  let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h).to_string();
+  let mut subjects: Vec<String> = Vec::new();
+  let mut bodies: Vec<String> = Vec::new();
+  for message in &messages {
+    let (subject, body) = message.split_once("\n\n").unwrap_or((message.as_str(), ""));
+    let subject = subject.lines().next().unwrap_or_default().trim().to_string();
+    if !subject.is_empty() && !subjects.contains(&subject) {
+      subjects.push(subject);
+    }
+    if !body.trim().is_empty() {
+      bodies.push(body.trim().to_string());
+    }
+  }
+  if subjects.iter().any(|s| !s.starts_with(crate::checks::PROVISIONAL)) {
+    subjects.retain(|s| !s.starts_with(crate::checks::PROVISIONAL));
+  }
+  let mut message = subjects.join("; ");
+  if !bodies.is_empty() {
+    message = format!("{message}\n\n{}", bodies.join("\n\n"));
+  }
+  Ok(format!("{head}\n\n{message}\n").into_bytes())
+}
+
 /// Finish an arrival that a killed process left half done. Its files may be
 /// partly written, so the disk is not looked at: what the workspace had
 /// recorded when that arrival began is what it brings along.
@@ -1265,7 +1308,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // what it had only recorded stays recorded on top of that.
   let base = match (published.is_empty(), ws.base) {
     (false, Some(was)) => {
-      let rest = Commit::load(store, &was)?.rest;
+      let rest = folded_rest(store, was, still_mine, common)?;
       let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
       root_of(store, &id)?;
       // A commit of this workspace's own, like the one it stands for: logged once it is stored.

@@ -1117,7 +1117,7 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
   }
   if s.folded > 1 {
     text.push_str(&format!(
-      "\n{} commits made here and not yet pushed are now one commit on top of the ref's, under the message of the last",
+      "\n{} commits made here and not yet pushed are now one commit on top of the ref's, under the lines of all of them",
       s.folded
     ));
   }
