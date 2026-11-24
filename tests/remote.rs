@@ -1917,4 +1917,17 @@ fn commits_a_sync_makes_one_keep_all_their_lines() {
   assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step A; Step B\nAnn edits five\n", "{said}");
   assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why A.\n\nWhy B.");
   assert!(said.contains("under the lines of all of them"), "{said}");
+  // Commits that came are counted though the store, which Ann's fork shares, had them already
+  // (twelfth round: "caught up 0 commits", from two reviewers).
+  run(
+    "ann",
+    "$NV sync . >/dev/null; echo 7 > h && $NV commit . 'Ann adds h' >/dev/null && echo 8 > i && $NV commit . 'Ann adds i' >/dev/null && $NV push . >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 2 commits"), "{said}");
+  run("ann", "echo 9 > j && $NV commit . 'Ann adds j' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 1 commit"), "{said}");
 }

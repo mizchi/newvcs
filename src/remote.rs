@@ -138,6 +138,11 @@ struct Tip {
 }
 
 /// Store the commits an answer carries (`since`), checking each against its id.
+/// The ids of the commits an answer says the ref went through.
+fn steps(answer: &serde_json::Value) -> impl Iterator<Item = Id> + '_ {
+  answer["since"].as_array().into_iter().flatten().filter_map(|step| id_of(&step["id"]).ok())
+}
+
 fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Result<usize> {
   let mut taken = 0;
   let mut dirs: Vec<Id> = Vec::new();
@@ -539,8 +544,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   }
   // Its own commits as they landed: taken with the others', and not counted among them.
   done.landed = answer["commits"].as_array().into_iter().flatten().filter_map(|id| id_of(id).ok()).collect();
-  let own_new = done.landed.iter().filter(|id| !store.contains(id)).count();
-  done.synced.commits += take_commits(store, &url, &answer)?.saturating_sub(own_new);
+  take_commits(store, &url, &answer)?;
+  // The ref's commits since the workspace last looked, less its own: counted whether or not the
+  // store had them already, as a store shared with other workspaces does (twelfth round).
+  done.synced.commits += steps(&answer).filter(|id| !done.landed.contains(id)).count();
   let landed = id_of(&answer["commit"])?;
   // What the push landed as stands on where the ref was when the workspace last saw it.
   if let Err(why) = forward(store, seen_before, &landed) {
@@ -580,6 +587,8 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Synced {
+  /// How many of the ref's commits the arrival found to be this workspace's own, landed.
+  pub own_landed: usize,
   /// What the commits of others this workspace's own commit was put on, and that change files it
   /// changes, say of themselves: its message was written before them.
   pub moved_under: Vec<String>,
@@ -645,10 +654,12 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
     }
     return Ok(Synced::default());
   }
-  let commits = take_commits(store, &url, &answer)?;
+  take_commits(store, &url, &answer)?;
   forward(store, ws.pushed, &tip.id)?;
+  let came = steps(&answer).count();
   let mut done = arrive(store, ws, &url, tip, author)?;
-  done.commits = commits;
+  // Those of the ref's commits since the workspace last looked that are not its own, landed.
+  done.commits = came.saturating_sub(done.own_landed);
   Ok(done)
 }
 
@@ -1367,6 +1378,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   ws.adopt(&mut index)?;
   workspace::take_branch_along(store, ws, based)?;
   let _ = std::fs::remove_file(arriving(ws));
+  done.own_landed = own_landed.map_or(0, |(_, _, count)| count);
   // A push that was not heard back from, found on the ref: the workspace knows now.
   if let Some((sent, last)) = workspace::unheard_push(ws)
     && let Some((own, _, count)) = own_landed
