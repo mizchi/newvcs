@@ -40,3 +40,4 @@
 38-mv-to-the-top.sh
 39-untracked-by-rm-cached.sh
 40-paths-the-index-let-go.sh
+41-staged-files-nobody-walks-to.sh

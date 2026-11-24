@@ -534,13 +534,20 @@ impl Repo {
       if states.contains_key(&path) {
         continue;
       }
-      // Taken out of the index (`rm --cached`) and still on disk as the commit has it: a file
-      // Git does not track, unless its rules leave it out.
-      let disk = match (head, entry) {
-        (Some(_), None) if !crate::ignore::is_ignored(&self.ws.root, &path) => on_disk_as_is(&self.ws.root, &path),
-        _ => None,
+      let (disk, disk_is_index) = match (head, entry) {
+        // Taken out of the index (`rm --cached`) and still on disk as the commit has it: a file
+        // Git does not track, unless its rules leave it out.
+        (Some(_), None) if !crate::ignore::is_ignored(&self.ws.root, &path) => (on_disk_as_is(&self.ws.root, &path), false),
+        // Staged, and not reported by the look over the tree: under a directory the rules now
+        // leave out, or put back to what the last commit has. What it is, is the file's to say:
+        // read, not taken for gone. (Staged files are few.)
+        (_, Some(staged)) => match on_disk_as_is(&self.ws.root, &path) {
+          Some((mode, bytes)) if mode == staged.mode && crate::store::object_id(Kind::Blob, &bytes) == staged.id => (None, true),
+          other => (other, false),
+        },
+        _ => (None, head == entry),
       };
-      states.insert(path, State { head, index: entry, disk, disk_is_index: head == entry, unmerged: false });
+      states.insert(path, State { head, index: entry, disk, disk_is_index, unmerged: false });
     }
     // Unmerged whatever the file now holds, until it is added.
     for path in unmerged {
@@ -1388,6 +1395,17 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
     return unsupported(format_args!("mv {from_arg} {to_arg}` (a destination outside the workspace)"));
   }
   std::fs::rename(full(&from), full(&to)).map_err(|e| format!("renaming '{from_arg}' failed: {e}"))?;
+  // What the index had at the destination, a tracked file gone from disk, is gone from the index:
+  // the moved files take its place.
+  for path in in_index(&repo) {
+    if under(std::slice::from_ref(&to), &path) && !under(std::slice::from_ref(&from), &path) {
+      if index.get(&path).is_some() {
+        staged.insert(path, None);
+      } else {
+        staged.remove(&path);
+      }
+    }
+  }
   // The index entry moves with the file; edits not yet added stay not added, under the new name.
   for (path, entry) in moving {
     let moved = [to.as_slice(), &path[from.len()..]].concat();
