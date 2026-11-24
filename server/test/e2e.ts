@@ -63,6 +63,21 @@ const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
   console.log(`one push of 5,000 paths: ${small} ms; of 20,000: ${large} ms`);
 }
 
+// ---------------------------------------------------------------- one content asked for many times
+// Twelfth round: an id repeated in a fetch was answered once for every repeat, and a 26 KB
+// request had 419 MB back. Each content is in the answer once.
+{
+  const name = `${repo}-repeat`;
+  const one = commit(null, ["big.bin"], "one content");
+  assert.equal((await push(name, "main", one)).status, "updated");
+  const id = hex(decode(one).changes[0]!.entry!.id);
+  const answer = new Uint8Array(await (await fetch(`${server}/${name}/fetch/objects`, { method: "POST", body: `${id}\n`.repeat(1000) })).arrayBuffer());
+  const view = new DataView(answer.buffer);
+  let frames = 0;
+  for (let at = 0; at < answer.length; at += 4 + view.getUint32(at, true)) frames += 1;
+  assert.equal(frames, 3, "the answer's head, and the content's id and bytes once");
+}
+
 // ---------------------------------------------------------------- a push of several commits
 {
   const name = `${repo}-chain`;
