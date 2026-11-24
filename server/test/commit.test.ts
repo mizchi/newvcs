@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { conflicts, decode, encode, hex, idOf, pathsConflict, type Commit } from "../src/commit.ts";
+import { conflicts, decode, encode, folded, hex, idOf, pathOk, pathsConflict, type Commit } from "../src/commit.ts";
 
 const text = (s: string) => new TextEncoder().encode(s);
 
@@ -41,6 +41,17 @@ test("a commit that sets a file and something below it, or spells a change two w
   assert.equal(bytes[kind], 1);
   bytes[kind] = 2;
   assert.throws(() => decode(bytes), /kind/);
+});
+
+test("names Windows takes for others are refused, or folded together", () => {
+  // Twelfth round, the same as `manifest::tests::names_windows_takes_for_others_are_refused_or_folded`.
+  for (const name of [".git::$INDEX_ALLOCATION", ".nv::$INDEX_ALLOCATION", ".git:x", "nv~1:x", ".GIT :stream", ".git\\config", ".nv\\x", "..\\..\\x", "\\abs", "a\\..", "..:x", ".. "]) {
+    assert.ok(!pathOk(text(name)), name);
+  }
+  for (const name of ["a:b", "a\\b", "...", "x.git", "git"]) assert.ok(pathOk(text(name)), name);
+  for (const [one, other] of [["a", "a::$DATA"], ["a", "a."], ["a", "a "], ["a", "A."], ["a", "a:b"], ["d/a", "d/a."]]) {
+    assert.equal(folded(one!), folded(other!), `${one} and ${other}`);
+  }
 });
 
 test("moving a commit to another parent changes its id and nothing else", () => {

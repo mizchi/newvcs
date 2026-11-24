@@ -113,7 +113,20 @@ export function pathOk(path: Uint8Array): boolean {
   } catch {
     return false;
   }
-  return text.split("/").every(partOk);
+  return text.split("/").every((part) => partOk(part) && windowsOk(part));
+}
+
+/// What Windows makes of a name (`manifest::windows_ok` on the other side): a backslash is a
+/// separator there, and a name ends at a `:` (what follows names a stream of the file). Each part,
+/// up to its `:`, may be neither `.git` nor `.nv`, nor a parent or the directory itself; with a
+/// backslash, no part is empty.
+function windowsOk(name: string): boolean {
+  const parted = name.includes("\\");
+  return name.split("\\").every((part) => {
+    const stem = part.split(":")[0]!;
+    const spaced = stem.replace(/ +$/, "");
+    return !(parted && part === "") && spaced !== "." && spaced !== ".." && (stem === "" || partOk(stem) || stem === "." || stem === "..");
+  });
 }
 
 /// One name, an entry of a directory (`manifest::name_ok` on the other side): not empty, not `.`
@@ -143,7 +156,18 @@ export const MAX_PATH = 1024;
 /// (`manifest::fold_name` on the other side): composed, and folded as Unicode folds case in full,
 /// as APFS does (`ß` is `ss`, `ſ` is `s`, `ﬁ` is `fi`). Lower, upper, then lower again brings
 /// together what lower case alone leaves apart.
-export const folded = (text: string) => text.normalize("NFC").toLowerCase().toUpperCase().toLowerCase().normalize("NFC");
+export const folded = (text: string) =>
+  text
+    .split("/")
+    // To NTFS a name ends at a `:` and without the dots and spaces at its end: `a`, `a.`, `a ` and
+    // `a::$DATA` are one file (`manifest::fold_name` on the other side).
+    .map((name) => name.split(":")[0]!.replace(/[. ]+$/, "") || name)
+    .join("/")
+    .normalize("NFC")
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .normalize("NFC");
 
 /// A ref's name: parts of letters, digits and `-_.`, with `/` between them.
 export const refOk = (name: string) => name.length <= 255 && name.split("/").every((part) => /^[A-Za-z0-9_.-]+$/.test(part) && part !== "." && part !== "..");
