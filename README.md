@@ -575,7 +575,12 @@ again before anyone else sees them:
   conditions pass on is made under that line, and where the runner has
   committed those files already under a message of its own, that commit
   is renamed. A writer that notes each step it finishes has said where
-  commits end without ever committing.
+  commits end without ever committing. A note waits for a commit however
+  the work goes meanwhile (a state that fails, commits below it made
+  again); notes that wait together, because the conditions passed on
+  none of the states in between, are one commit, under their lines
+  joined by `; `, as is a line given for files committed under a note
+  already. Only a state the conditions passed on is a commit's end.
 - `nv publish <dir> [--message <line>]` waits as `nv pending --wait` does,
   makes the commits again with one ending at each note (what came after
   the last, under `--message`), and pushes. A `[body]` hook

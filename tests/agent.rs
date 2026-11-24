@@ -1362,6 +1362,39 @@ fn a_note_names_the_next_commit_the_conditions_pass_on() {
   assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
 }
 
+/// Every note a writer gives reaches a commit (twelfth round: 110 of 184 did not). A note waits
+/// for the next commit the conditions pass on, however the work went in between, and notes that
+/// wait together are that commit's line together.
+#[test]
+fn no_note_is_lost_on_the_way_to_a_commit() {
+  let top = fresh("notes-kept");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"test ! -e broken\"\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  let subject = || ok(&dir, "$NV git log -1 --format=%s");
+  // Given before anything was written: the next commit is under it, and the checkpoint is fine.
+  let (code, said) = code_of(&dir, "$NV note . 'Start' >/dev/null && echo 1 > one && $NV checkpoint .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(subject(), "Start");
+  // Two steps noted before the conditions passed on either: one commit, under both.
+  ok(
+    &dir,
+    "echo 2 > two && $NV note . 'Add two' >/dev/null && echo 3 > three && $NV note . 'Add three' >/dev/null && $NV checkpoint . >/dev/null 2>&1",
+  );
+  assert_eq!(subject(), "Add two; Add three");
+  // A second line for files already committed under a note joins it.
+  ok(&dir, "$NV note . 'Count to three' >/dev/null");
+  assert_eq!(subject(), "Add two; Add three; Count to three");
+  // A note on a state that failed, and the commits below it made again meanwhile: it waits still.
+  ok(&dir, "echo x > broken && echo 4 > four && $NV note . 'Add four' >/dev/null && ($NV checkpoint . >/dev/null 2>&1; true)");
+  ok(&dir, "$NV rebuild . 2 'Three steps' >/dev/null");
+  ok(&dir, "rm broken && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(subject(), "Add four");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "four");
+}
+
 /// A commit the runner made under its provisional message is not pushed as it is: twelfth-round
 /// reviewers got `checkpoint: unit passed` onto the ref by following nv's own advice.
 #[test]

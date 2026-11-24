@@ -355,32 +355,36 @@ fn forget_notes(root: &Path, taken: &[String]) -> Result<()> {
   crate::write_whole(&notes_file(root), left.as_bytes())
 }
 
-/// The notes made on `state` or on a state recorded before it since the last commit, as one
-/// message (the first note its first line), and which they were.
+/// The notes waiting for a commit of `state`, as one line, and which they were: those made on it
+/// or on a state recorded before it since the last commit, the last commit included (a note
+/// given before anything was written); and those made on a state the workspace no longer stands
+/// on at all (the commits below it were made again since), which nothing else will take. Not
+/// those on work recorded after `state`: they wait for the commit of that work.
 fn notes_for(root: &Path, store: &mut Store, ws: &Workspace, state: &Id) -> Result<(Option<String>, Vec<String>)> {
   let waiting = notes(root);
   if waiting.is_empty() {
     return Ok((None, Vec::new()));
   }
-  let mut before: Vec<String> = Vec::new();
-  let mut at = Some(*state);
-  while let Some(id) = at.filter(|id| Some(*id) != ws.base) {
-    before.push(hex(&id));
-    if before.len() > 100_000 {
-      break;
+  let chain = |store: &mut Store, from: Option<Id>, stop: Option<Id>| -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut at = from;
+    while let Some(id) = at {
+      out.push(hex(&id));
+      if Some(id) == stop || out.len() > 100_000 || waiting.iter().all(|(noted, _)| out.contains(noted)) {
+        break;
+      }
+      at = crate::commit::Commit::load(store, &id)?.parents.first().copied();
     }
-    at = crate::commit::Commit::load(store, &id)?.parents.first().copied();
-  }
-  let taken: Vec<(String, String)> = waiting.into_iter().filter(|(noted, _)| before.contains(noted)).collect();
+    Ok(out)
+  };
+  let mine = chain(store, Some(*state), ws.base)?;
+  let stood_on = chain(store, ws.head, None)?;
+  let taken: Vec<(String, String)> = waiting.into_iter().filter(|(noted, _)| mine.contains(noted) || !stood_on.contains(noted)).collect();
   if taken.is_empty() {
     return Ok((None, Vec::new()));
   }
-  let lines: Vec<&str> = taken.iter().map(|(_, text)| text.as_str()).collect();
-  let message = match lines.split_first() {
-    Some((first, [])) => first.to_string(),
-    Some((first, more)) => format!("{first}\n\n{}", more.join("\n")),
-    None => unreachable!("taken is not empty"),
-  };
+  // One line: a body is the `[body]` hook's to write, and written again, a body loses what was in it.
+  let message = taken.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("; ");
   Ok((Some(message), taken.into_iter().map(|(state, _)| state).collect()))
 }
 
@@ -399,8 +403,14 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
   workspace::snapshot(&mut store, &mut ws, author, Look::Everywhere)?;
   let state = ws.head.ok_or("there is nothing recorded to note")?;
   // Committed already, by the runner, under a message of its own making: that commit is renamed.
-  if rename_provisional(root, &mut store, &mut ws, text, author)?.is_some() {
-    return Ok(format!("the commit of these files, made already, is now \"{text}\""));
+  // Under a note already: this line joins it, as notes that wait together do.
+  if let Some(id) = rename_runner_commit(root, &mut store, &mut ws, author, |subject| {
+    if subject.starts_with(PROVISIONAL) { text.to_string() } else { format!("{subject}; {text}") }
+  })? {
+    let subject = crate::commit::Commit::load(&mut store, &id)?;
+    let said = String::from_utf8_lossy(&subject.rest).into_owned();
+    let line = said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or(text).to_string();
+    return Ok(format!("the commit of these files, made already, is now \"{line}\""));
   }
   std::fs::create_dir_all(runs_dir(root)).map_err(|e| e.to_string())?;
   let mut all = notes(root);
@@ -415,6 +425,25 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
 /// the last not pushed: give it `message` (a summary line, and a body if there is one), keeping
 /// everything else of it. The commit made again, or `None` where there is no such commit.
 pub fn rename_provisional(root: &Path, store: &mut Store, ws: &mut Workspace, message: &str, author: &str) -> Result<Option<Id>> {
+  let Some(base) = ws.base else { return Ok(None) };
+  let provisional = workspace::pending(store, ws)?
+    .last()
+    .is_some_and(|(id, c)| *id == base && String::from_utf8_lossy(&c.rest).contains(&format!("\n\n{PROVISIONAL}")));
+  if !provisional {
+    return Ok(None);
+  }
+  rename_runner_commit(root, store, ws, author, |_| message.to_string())
+}
+
+/// Where the files are, as recorded, the commit the runner made of them, the last not pushed: give
+/// it the message `message` makes of its summary line, keeping everything else of it.
+fn rename_runner_commit(
+  root: &Path,
+  store: &mut Store,
+  ws: &mut Workspace,
+  author: &str,
+  message: impl Fn(&str) -> String,
+) -> Result<Option<Id>> {
   let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) else { return Ok(None) };
   // Made again only where what is not pushed has an end, and not beside Git, where Git's own
   // commands do that: elsewhere the commit keeps its message, and the caller says so.
@@ -422,8 +451,8 @@ pub fn rename_provisional(root: &Path, store: &mut Store, ws: &mut Workspace, me
     return Ok(None);
   }
   let chain = workspace::pending(store, ws)?;
-  let Some((last, commit)) = chain.last() else { return Ok(None) };
-  if *last != base || !String::from_utf8_lossy(&commit.rest).contains(&format!("\n\n{PROVISIONAL}")) {
+  let Some((last, _)) = chain.last() else { return Ok(None) };
+  if *last != base {
     return Ok(None);
   }
   let plan: Vec<(Id, Vec<u8>)> = chain
@@ -431,8 +460,8 @@ pub fn rename_provisional(root: &Path, store: &mut Store, ws: &mut Workspace, me
     .map(|(id, commit)| {
       if *id == base {
         let said = String::from_utf8_lossy(&commit.rest).into_owned();
-        let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
-        (*id, format!("{head}\n\n{}\n", message.trim_end()).into_bytes())
+        let (head, was) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
+        (*id, format!("{head}\n\n{}\n", message(was.lines().next().unwrap_or_default()).trim_end()).into_bytes())
       } else {
         (*id, commit.rest.clone())
       }
