@@ -367,8 +367,11 @@ export class Repo extends DurableObject<Env> {
   /// directories on the way count, and so do the entries of a directory set whole.
   private spell(ref: string, path: string, entry: { mode: number; id: Uint8Array } | null): void {
     const sql = this.ctx.storage.sql;
-    // What was at the path, and below it, is gone: replaced or removed.
-    sql.exec("DELETE FROM live WHERE ref = ? AND (path = ? OR (path > ? AND path < ?))", ref, path, path + "/", path + "0");
+    // What was at the path, and below it, is gone: replaced or removed. Two statements, each on
+    // the index by path: joined by `OR`, the delete read the whole table, once for every path of
+    // a push, and a push of many paths took the square of their number (twelfth round).
+    sql.exec("DELETE FROM live WHERE ref = ? AND path = ?", ref, path);
+    sql.exec("DELETE FROM live WHERE ref = ? AND path > ? AND path < ?", ref, path + "/", path + "0");
     const parts = path.split("/");
     if (!entry) {
       // A directory left with nothing in it is gone as well.

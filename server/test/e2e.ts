@@ -45,6 +45,24 @@ async function push(name: string, ref: string, bytes: Uint8Array): Promise<Pushe
 }
 const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
 
+// ---------------------------------------------------------------- a push of many paths
+// The cost of a push grows with its paths, not with their square (twelfth round: 20,000 paths
+// took 17 s, 40,000 took 55 s, and every other repository waited). Four times the paths may take
+// some more than four times as long, not sixteen.
+{
+  const timed = async (n: number) => {
+    const name = `${repo}-wide-${n}`;
+    const paths = Array.from({ length: n }, (_, i) => `d${i % 50}/f${i}.txt`);
+    const started = Date.now();
+    const pushed = await push(name, "main", commit(null, paths, `${n} paths`));
+    assert.equal(pushed.status, "updated");
+    return Date.now() - started;
+  };
+  const [small, large] = [await timed(5_000), await timed(20_000)];
+  assert.ok(large < small * 8, `5,000 paths took ${small} ms and 20,000 took ${large} ms`);
+  console.log(`one push of 5,000 paths: ${small} ms; of 20,000: ${large} ms`);
+}
+
 // ---------------------------------------------------------------- a push of several commits
 {
   const name = `${repo}-chain`;
