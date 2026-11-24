@@ -84,9 +84,12 @@ impl Commit {
     for _ in 0..c.u32()? {
       let len = c.u32()?;
       let path = c.take(len)?.to_vec();
+      // A change is spelled one way: 0 removes, 1 sets. Any other byte would give one commit
+      // many ids.
       let entry = match c.take(1)?[0] {
         0 => None,
-        _ => Some(Entry { mode: u32::from_le_bytes(c.take(4)?.try_into().unwrap()), id: c.take(32)?.try_into().unwrap() }),
+        1 => Some(Entry { mode: u32::from_le_bytes(c.take(4)?.try_into().unwrap()), id: c.take(32)?.try_into().unwrap() }),
+        other => return Err(format!("a commit has a change of a kind there is none of ({other})")),
       };
       // A commit may have come from anyone. Its paths will be written by whoever takes it in.
       if !crate::manifest::path_ok(&path) {
@@ -101,6 +104,26 @@ impl Commit {
     named.sort_unstable();
     if named.windows(2).any(|pair| pair[0] == pair[1]) {
       return Err("a commit says two things of one path".to_string());
+    }
+    // Nor sets a path as something that is not a directory and sets something below it: no tree
+    // holds both, and taking the changes in order would write through a link.
+    let leaves: std::collections::HashSet<&[u8]> =
+      changes.iter().filter(|(_, e)| e.is_some_and(|e| !e.is_dir())).map(|(path, _)| path.as_slice()).collect();
+    for (path, entry) in &changes {
+      if entry.is_none() {
+        continue;
+      }
+      let mut at = path.len();
+      while let Some(slash) = path[..at].iter().rposition(|&b| b == b'/') {
+        if leaves.contains(&path[..slash]) {
+          return Err(format!(
+            "a commit sets `{}` and something below it, `{}`",
+            String::from_utf8_lossy(&path[..slash]),
+            String::from_utf8_lossy(path)
+          ));
+        }
+        at = slash;
+      }
     }
     Ok(Commit { parents, rest, changes })
   }
@@ -143,6 +166,28 @@ pub fn root_of(store: &mut Store, id: &Id) -> Result<Option<Id>> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Twelfth round: a commit that set `l` as a link and `l/x` as a file was served, and a client
+  /// taking the changes in order would have written through the link. Nor is a change spelled in
+  /// more than one way: its kind is 0 or 1, as one commit has one id.
+  #[test]
+  fn a_commit_that_sets_a_file_and_something_below_it_is_refused() {
+    let set = |path: &[u8], mode: u32| (path.to_vec(), Some(Entry { mode, id: [1; 32] }));
+    let commit = |changes: Vec<Change>| Commit { parents: vec![], rest: b"r".to_vec(), changes }.encode();
+    for (first, mode) in [(&b"l"[..], 0o120000), (b"a", 0o100644), (b"s", 0o160000)] {
+      let below = [first, b"/x"].concat();
+      assert!(Commit::decode(&commit(vec![set(first, mode), set(&below, 0o100644)])).is_err(), "{:?}", String::from_utf8_lossy(first));
+    }
+    // A file put where a directory was, and the other way round, are one change each and fine.
+    assert!(Commit::decode(&commit(vec![set(b"a", 0o100644), (b"a/x".to_vec(), None)])).is_ok());
+    assert!(Commit::decode(&commit(vec![(b"a".to_vec(), None), set(b"a/x", 0o100644)])).is_ok());
+    assert!(Commit::decode(&commit(vec![set(b"a", 0o100644), set(b"ab/x", 0o100644)])).is_ok());
+    let mut bytes = commit(vec![set(b"a", 0o100644)]);
+    let kind = bytes.len() - 32 - 4 - 1;
+    assert_eq!(bytes[kind], 1);
+    bytes[kind] = 2;
+    assert!(Commit::decode(&bytes).is_err(), "a change of kind 2");
+  }
 
   /// A commit is bytes that may have come from anyone: one that names a path no tree may have is no commit.
   #[test]

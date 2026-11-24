@@ -26,6 +26,23 @@ test("a commit survives encoding, and damaged bytes are refused", () => {
   assert.throws(() => decode(Uint8Array.of(0xff, 0xff, 0xff, 0xff)));
 });
 
+test("a commit that sets a file and something below it, or spells a change two ways, is refused", () => {
+  // Twelfth round: `l` a link and `l/x` a file in one commit were taken and served.
+  const set = (path: string, mode: number) => ({ path: text(path), entry: { mode, id: new Uint8Array(32).fill(1) } });
+  const commit = (changes: Commit["changes"]): Commit => ({ parents: [], rest: text("r"), changes });
+  for (const [first, mode] of [["l", 0o120000], ["a", 0o100644], ["s", 0o160000]] as const) {
+    assert.throws(() => decode(encode(commit([set(first, mode), set(`${first}/x`, 0o100644)]))), /below/);
+  }
+  assert.doesNotThrow(() => decode(encode(commit([set("a", 0o100644), { path: text("a/x"), entry: null }]))));
+  assert.doesNotThrow(() => decode(encode(commit([{ path: text("a"), entry: null }, set("a/x", 0o100644)]))));
+  assert.doesNotThrow(() => decode(encode(commit([set("a", 0o100644), set("ab/x", 0o100644)]))));
+  const bytes = encode(commit([set("a", 0o100644)]));
+  const kind = bytes.length - 32 - 4 - 1;
+  assert.equal(bytes[kind], 1);
+  bytes[kind] = 2;
+  assert.throws(() => decode(bytes), /kind/);
+});
+
 test("moving a commit to another parent changes its id and nothing else", () => {
   const moved = { ...pinned, parents: [new Uint8Array(32).fill(0x33)] };
   assert.notEqual(hex(idOf(encode(moved))), hex(idOf(encode(pinned))));

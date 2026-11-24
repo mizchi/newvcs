@@ -60,7 +60,10 @@ export function decode(bytes: Uint8Array): Commit {
   const changes: Change[] = [];
   for (let n = u32(); n > 0; n--) {
     const path = take(u32());
-    const entry = take(1)[0] === 0 ? null : { mode: u32(), id: take(32) };
+    // A change is spelled one way: 0 removes, 1 sets. Any other byte would give one commit many ids.
+    const kind = take(1)[0];
+    if (kind > 1) throw new Error("a commit has a change of a kind there is none of");
+    const entry = kind === 0 ? null : { mode: u32(), id: take(32) };
     if (!pathOk(path)) throw new Error("a commit names a path no tree may have");
     if (entry && !MODES.includes(entry.mode)) throw new Error("a commit gives a path a mode no file has");
     changes.push({ path, entry });
@@ -70,6 +73,16 @@ export function decode(bytes: Uint8Array): Commit {
   // leave its history unreadable to whoever synced it.
   if (parents.length > 1) throw new Error("a commit with more than one parent is a merge, and a ref holds one line of commits");
   if (new Set(changes.map((c) => hex(c.path))).size !== changes.length) throw new Error("a commit says two things of one path");
+  // Nor sets a path as something that is not a directory and sets something below it: no tree
+  // holds both, and a client taking the changes in order would write through a link.
+  const leaves = new Set(changes.filter((c) => c.entry && c.entry.mode !== 0o40000).map((c) => utf8.decode(c.path)));
+  for (const c of changes) {
+    if (!c.entry) continue;
+    const parts = utf8.decode(c.path).split("/");
+    for (let n = 1; n < parts.length; n++) {
+      if (leaves.has(parts.slice(0, n).join("/"))) throw new Error("a commit sets a path and something below it");
+    }
+  }
   // Nor two paths that macOS and Windows take for one: one would be written on, or through, the other.
   // The directories on the way count as well: `Link` and `link/x` are a link and something through it.
   const spelled = new Map<string, string>();
