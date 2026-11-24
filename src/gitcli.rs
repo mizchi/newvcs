@@ -1114,7 +1114,12 @@ fn stage(repo: &mut Repo, states: &std::collections::BTreeMap<Vec<u8>, State>, p
       // Known only as staged (a removal, say), and there on disk: what the look over the files did
       // not list is as the last commit has it.
       // (A directory standing there is not the file.)
-      None if std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok_and(|meta| !meta.is_dir()) => {
+      // Unless the index had let it go and the rules now leave it out: then it stays out, as an
+      // untracked file the rules ignore is not added.
+      None
+        if std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok_and(|meta| !meta.is_dir())
+          && !(state.index.is_none() && crate::ignore::is_ignored(&repo.ws.root, path)) =>
+      {
         state.head
       }
       None => None,
@@ -1504,7 +1509,24 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
       // Nothing is discarded before it is known that the whole of it can be done.
       let going: Vec<Vec<u8>> =
         repo.states()?.into_iter().filter(|(_, state)| state.head.is_none() && state.staged().is_some()).map(|(path, _)| path).collect();
-      let blocking = workspace::hard_reset_blocked(&mut repo.store, &repo.ws, target, &going)?;
+      let mut blocking = workspace::hard_reset_blocked(&mut repo.store, &repo.ws, target, &going)?;
+      // A file of HEAD's the index let go of (`rm --cached`) is not tracked: where the commit has
+      // none it is left as it is, and where the commit has another, nv does not write over it.
+      let target_root = root(&mut repo.store, target)?;
+      let mut let_go: Vec<(Vec<u8>, u32, std::sync::Arc<Vec<u8>>)> = Vec::new();
+      for (path, state) in repo.states()? {
+        let (Some(_), None, Some((mode, bytes))) = (state.head, state.index, state.disk.clone()) else { continue };
+        let at = match target_root {
+          Some(root) => lookup(&mut repo.store, root, &path)?.filter(|e| !e.is_dir()),
+          None => None,
+        };
+        match at {
+          None => let_go.push((path, mode, bytes)),
+          Some(e) if e.mode == mode && e.id == crate::store::object_id(Kind::Blob, &bytes) => {}
+          Some(_) => blocking.push(String::from_utf8_lossy(&path).into_owned()),
+        }
+      }
+      blocking.sort();
       if let Some(first) = blocking.first() {
         return fatal(
           128,
@@ -1527,6 +1549,20 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
       workspace::restore(&mut repo.store, &repo.ws, &[Vec::new()])?;
       if let Some(target) = target.filter(|t| Some(*t) != before) {
         workspace::switch(&mut repo.store, &mut repo.ws, target)?;
+      }
+      for (path, mode, bytes) in let_go {
+        use std::os::unix::fs::PermissionsExt;
+        let file = repo.ws.root.join(std::ffi::OsStr::from_bytes(&path));
+        if let Some(parent) = file.parent() {
+          std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if mode == MODE_LINK {
+          std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), &file).map_err(|e| e.to_string())?;
+          continue;
+        }
+        std::fs::write(&file, bytes.as_slice()).map_err(|e| e.to_string())?;
+        let bits = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(bits)).map_err(|e| e.to_string())?;
       }
     }
     "--soft" if repo.merging().is_some() => return fatal(128, "fatal: Cannot do a soft reset in the middle of a merge."),

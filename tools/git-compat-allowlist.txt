@@ -38,3 +38,4 @@
 36-diff-a-revision-against-the-files.sh
 37-rm-cached.sh
 38-mv-to-the-top.sh
+39-untracked-by-rm-cached.sh
