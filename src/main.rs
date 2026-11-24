@@ -535,6 +535,7 @@ fn run(args: &[String]) -> Result<()> {
       if !run.passed() {
         std::process::exit(1);
       }
+      let config = &run.config;
       if let Some(hook) = &config.message
         && newvcs::checks::draft(&root, &run.state).is_none()
         && let Err(why) = newvcs::checks::write_draft(&root, hook, &run.state)
@@ -542,7 +543,7 @@ fn run(args: &[String]) -> Result<()> {
         eprintln!("nv: {why}");
       }
       if config.commit_each {
-        match newvcs::checks::commit_checkpoint(&root, &config, &run.state, AUTHOR)? {
+        match newvcs::checks::commit_checkpoint(&root, config, &run.state, AUTHOR)? {
           Some(id) => println!("{} passed every condition, and is committed as {}, in {:.1} ms", hex(&run.state), hex(&id), ms(started)),
           None => println!("{} passed every condition, and is what is committed already, in {:.1} ms", hex(&run.state), ms(started)),
         }

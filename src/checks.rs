@@ -96,6 +96,9 @@ impl Outcome {
 #[derive(Clone, Debug)]
 pub struct Run {
   pub state: Id,
+  /// The conditions it ran: those the files declared when the state was recorded, which may
+  /// not be those the caller read before.
+  pub config: Config,
   pub results: Vec<(String, Outcome, Duration)>,
   /// The files changed while it ran: what it found is about no recorded state.
   pub moved: bool,
@@ -225,10 +228,14 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
     Ok(ws.head)
   };
   let state = recorded(Look::Everywhere)?.ok_or("there is nothing recorded to run the conditions on")?;
+  // The conditions are the state's own: read again now that it is recorded, since the writer may
+  // have changed them since the caller read them. Changed again while they run, the files are no
+  // longer the state, and what is found is kept for none.
+  let config = &load(root)?.unwrap_or_else(|| Config { checks: Vec::new(), ..config.clone() });
   // A state they passed on before passes still: they are about the files, and the files are the same.
   if passed_on(root, config, &state) {
     let results = config.checks.iter().map(|c| (c.name.clone(), Outcome::Passed, Duration::ZERO)).collect();
-    return Ok(Run { state, results, moved: false });
+    return Ok(Run { state, config: config.clone(), results, moved: false });
   }
   let dir = runs_dir(root);
   std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -271,7 +278,7 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
     }
     None => true,
   };
-  let run = Run { state, results, moved };
+  let run = Run { state, config: config.clone(), results, moved };
   if !run.moved {
     let _held = workspace::lock(root)?;
     let ws = Workspace::open(root)?;
@@ -550,6 +557,8 @@ pub fn run_until_still(root: &Path, config: &Config, author: &str) -> Result<Opt
   for _ in 0..20 {
     let run = run(root, config, author)?;
     let moved = run.moved;
+    // What the run found is under the conditions it ran, not those this runner began with.
+    let config = &run.config;
     if run.passed()
       && let Some(hook) = &config.message
       && draft(root, &run.state).is_none()
