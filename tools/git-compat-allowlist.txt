@@ -39,3 +39,4 @@
 37-rm-cached.sh
 38-mv-to-the-top.sh
 39-untracked-by-rm-cached.sh
+40-paths-the-index-let-go.sh

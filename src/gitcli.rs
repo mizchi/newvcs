@@ -1154,15 +1154,16 @@ fn add(mut repo: Repo, args: &[&str]) -> Res<i32> {
       return fatal(128, format!("fatal: pathspec '{arg}' is beyond a symbolic link"));
     }
   }
-  if has(args, "-A") || has(args, "--all") {
+  // `-A` alone is the whole tree; with paths, what is under them.
+  if (has(args, "-A") || has(args, "--all")) && paths.is_empty() {
     paths.push(Vec::new());
   }
   if paths.is_empty() {
     println!("Nothing specified, nothing added.");
     return Ok(0);
   }
-  // A path has to be something: on disk, or known and now gone.
-  let known: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).chain(repo.staged().into_keys()).collect();
+  // A path has to be something: on disk, or in the index and now gone.
+  let known = in_index(&repo);
   for (path, arg) in paths.iter().zip(&given) {
     let on_disk = std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok();
     if !path.is_empty() && !on_disk && !known.iter().any(|k| under(std::slice::from_ref(path), k)) {
@@ -1439,10 +1440,19 @@ fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
   put_back(&mut repo, &given, &paths)
 }
 
+/// The paths the index has now: HEAD's files and what was added, less what was taken out. A path
+/// whose removal is staged is not among them, as to Git it matches nothing.
+fn in_index(repo: &Repo) -> Vec<Vec<u8>> {
+  let staged = repo.staged();
+  let mut known: Vec<Vec<u8>> =
+    repo.ws.load_index().entries().into_iter().map(|(p, _)| p).filter(|p| staged.get(p) != Some(&None)).collect();
+  known.extend(staged.into_iter().filter(|(_, e)| e.is_some()).map(|(p, _)| p));
+  known
+}
+
 /// Files back to what the index has for them: what was added, or else what HEAD has.
 fn put_back(repo: &mut Repo, given: &[&str], paths: &[Vec<u8>]) -> Res<i32> {
-  let staged = repo.staged();
-  let known: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).chain(staged.keys().cloned()).collect();
+  let known = in_index(repo);
   for (path, arg) in paths.iter().zip(given) {
     if !known.iter().any(|k| under(std::slice::from_ref(path), k)) {
       return fatal(1, format!("error: pathspec '{arg}' did not match any file(s) known to git"));
