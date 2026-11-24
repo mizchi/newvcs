@@ -1324,9 +1324,11 @@ fn a_commit_of_what_the_runner_committed_meanwhile_says_so() {
     "printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && $NV git add nv.toml && $NV git commit -qm conditions",
   );
   ok(&dir, "echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  // With no end to what is not pushed (no ref, no commit the workspace was made at), the
+  // runner's commit cannot be made again: that is said. Where it can, it is given the message
+  // (`a_commit_given_a_message_has_it_where_the_runner_committed_first`).
   let said = ok(&dir, "$NV commit . 'Add one'");
   assert!(said.starts_with("nothing to commit: these files were committed already, as "), "{said}");
-  assert!(said.contains("`nv rebuild <dir> <n> <message>`"), "{said}");
   // A commit of one's own, and then nothing new: nothing to commit, and nothing more said.
   ok(&dir, "echo 2 > two && $NV commit . 'Add two' >/dev/null");
   assert_eq!(ok(&dir, "$NV commit . 'Again'"), "nothing to commit");
@@ -1358,6 +1360,45 @@ fn a_note_names_the_next_commit_the_conditions_pass_on() {
   assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "three");
   // A note is a line that says something.
   assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
+}
+
+/// A commit the runner made under its provisional message is not pushed as it is: twelfth-round
+/// reviewers got `checkpoint: unit passed` onto the ref by following nv's own advice.
+#[test]
+fn a_provisional_message_is_not_pushed() {
+  let top = fresh("provisional");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf '[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  // Nothing listens there: a push that went ahead would fail on the connection, not on this.
+  ok(&dir, "$NV remote . http://127.0.0.1:9/o/r main && echo 1 > one && $NV checkpoint . >/dev/null 2>&1");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%s"), "checkpoint: unit passed");
+  let (code, said) = code_of(&dir, "$NV push .");
+  assert_eq!(code, 2, "{said}");
+  assert!(said.contains("provisional") && said.contains("nv rebuild") && said.contains("nv publish"), "{said}");
+  assert!(!said.contains("connect"), "refused before anything was sent: {said}");
+}
+
+/// `nv commit <dir> <message>` where the runner commits each state that passes: the commit the
+/// files are in is given the message, however it came to be made (twelfth round: the runner made
+/// it first, the message was dropped, and the command said it had nothing to commit).
+#[test]
+fn a_commit_given_a_message_has_it_where_the_runner_committed_first() {
+  let top = fresh("commit-message");
+  ok(
+    &top,
+    "git init -q -b main src && cd src && echo base > base.txt && printf 'auto = true\\n[checks.unit]\\nrun = \"true\"\\n[commit]\\neach = true\\n' > nv.toml && git add -A && git -c user.name=a -c user.email=a@x commit -qm conditions && cd .. && $NV git clone -q src ws",
+  );
+  let dir = top.join("ws");
+  // The runner behind the writes commits the files first, as it does when it is quicker.
+  let (code, said) = code_of(&dir, "echo 1 > m.txt && $NV checkpoint . >/dev/null 2>&1 && $NV commit . 'my message\n\nWhy it was made.'");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%B"), "my message\n\nWhy it was made.", "{said}");
+  assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "m.txt");
+  ok(&dir, "echo 2 > m.txt && $NV commit . 'second message'");
+  assert_eq!(ok(&dir, "$NV git log -2 --format=%s"), "second message\nmy message");
 }
 
 /// Where every state that passes is committed (`[commit] each`), `nv status` says that is what

@@ -399,28 +399,8 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
   workspace::snapshot(&mut store, &mut ws, author, Look::Everywhere)?;
   let state = ws.head.ok_or("there is nothing recorded to note")?;
   // Committed already, by the runner, under a message of its own making: that commit is renamed.
-  if let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) {
-    let chain = workspace::pending(&mut store, &ws)?;
-    let last = chain.last().map(|(id, _)| *id);
-    if last == Some(base) && String::from_utf8_lossy(&chain.last().expect("not empty").1.rest).contains(&format!("\n\n{PROVISIONAL}")) {
-      let plan: Vec<(Id, Vec<u8>)> = chain
-        .iter()
-        .map(|(id, commit)| {
-          if *id == base {
-            let said = String::from_utf8_lossy(&commit.rest).into_owned();
-            let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
-            (*id, format!("{head}\n\n{text}\n").into_bytes())
-          } else {
-            (*id, commit.rest.clone())
-          }
-        })
-        .collect();
-      let made = workspace::rebuild(&mut store, &mut ws, &plan, author)?;
-      if let Some(id) = made.last() {
-        let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(id).as_bytes());
-      }
-      return Ok(format!("the commit of these files, made already, is now \"{text}\""));
-    }
+  if rename_provisional(root, &mut store, &mut ws, text, author)?.is_some() {
+    return Ok(format!("the commit of these files, made already, is now \"{text}\""));
   }
   std::fs::create_dir_all(runs_dir(root)).map_err(|e| e.to_string())?;
   let mut all = notes(root);
@@ -429,6 +409,41 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
   let lines: String = all.into_iter().map(|(state, text)| format!("{state}\t{text}\n")).collect();
   crate::write_whole(&notes_file(root), lines.as_bytes())?;
   Ok(format!("noted: the next commit the conditions pass on, of these files or later ones, is \"{text}\""))
+}
+
+/// Where the files are, as recorded, a commit the runner made under its provisional message and
+/// the last not pushed: give it `message` (a summary line, and a body if there is one), keeping
+/// everything else of it. The commit made again, or `None` where there is no such commit.
+pub fn rename_provisional(root: &Path, store: &mut Store, ws: &mut Workspace, message: &str, author: &str) -> Result<Option<Id>> {
+  let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) else { return Ok(None) };
+  // Made again only where what is not pushed has an end, and not beside Git, where Git's own
+  // commands do that: elsewhere the commit keeps its message, and the caller says so.
+  if ws.pushed.or(ws.start).is_none() || crate::colocated::shared(&ws.root) {
+    return Ok(None);
+  }
+  let chain = workspace::pending(store, ws)?;
+  let Some((last, commit)) = chain.last() else { return Ok(None) };
+  if *last != base || !String::from_utf8_lossy(&commit.rest).contains(&format!("\n\n{PROVISIONAL}")) {
+    return Ok(None);
+  }
+  let plan: Vec<(Id, Vec<u8>)> = chain
+    .iter()
+    .map(|(id, commit)| {
+      if *id == base {
+        let said = String::from_utf8_lossy(&commit.rest).into_owned();
+        let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
+        (*id, format!("{head}\n\n{}\n", message.trim_end()).into_bytes())
+      } else {
+        (*id, commit.rest.clone())
+      }
+    })
+    .collect();
+  let made = workspace::rebuild(store, ws, &plan, author)?;
+  let renamed = made.last().copied();
+  if let Some(id) = renamed {
+    let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(&id).as_bytes());
+  }
+  Ok(renamed)
 }
 
 /// Whether this commit is one the conditions' runner made (`[commit] each`), as far as its note says.

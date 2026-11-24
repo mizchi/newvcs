@@ -511,11 +511,21 @@ fn run(args: &[String]) -> Result<()> {
         }
         // Committed already, by the runner behind writes (`[commit] each`): say so, and how to
         // give that commit the message this one was given.
-        None if GATED.get().is_some() && based.is_some_and(|b| newvcs::checks::committed_by_runner(&ws.root, &b)) => {
-          println!(
-            "nothing to commit: these files were committed already, as {}, behind the writes (`[commit] each`); `nv rebuild <dir> <n> <message>` gives that commit this message",
-            &hex(&based.unwrap_or_default())[..12]
-          )
+        // Committed already, by the runner behind writes (`[commit] each`), under its provisional
+        // message: that commit is given this one.
+        None if based.is_some_and(|b| newvcs::checks::committed_by_runner(&ws.root, &b)) => {
+          let root = ws.root.clone();
+          match newvcs::checks::rename_provisional(&root, &mut store, &mut ws, message, AUTHOR)? {
+            Some(id) => println!(
+              "{} in {:.0} ms (the commit the conditions' runner had made of these files, given this message)",
+              hex(&id),
+              ms(started)
+            ),
+            None => println!(
+              "nothing to commit: these files were committed already, as {}, behind the writes (`[commit] each`); `nv rebuild <dir> <n> <message>` gives that commit this message",
+              &hex(&based.unwrap_or_default())[..12]
+            ),
+          }
         }
         None => println!("nothing to commit"),
       }
@@ -857,6 +867,28 @@ fn run(args: &[String]) -> Result<()> {
     "push" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
       newvcs::colocated::locked(&ws.root)?;
+      // Commits the runner made under its provisional message are to be made again before anyone
+      // sees them (`[commit] each`): not pushed as they are.
+      if newvcs::checks::load(&ws.root).ok().flatten().is_some_and(|c| c.commit_each) {
+        let provisional: Vec<String> = workspace::pending(&mut store, &ws)?
+          .iter()
+          .map(|(_, c)| {
+            let said = String::from_utf8_lossy(&c.rest).into_owned();
+            said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or_default().to_string()
+          })
+          .filter(|subject| subject.starts_with(newvcs::checks::PROVISIONAL))
+          .collect();
+        if !provisional.is_empty() {
+          return Err(format!(
+            "not pushed: {} still under the provisional message the conditions' runner gave {} (\"{}\"). `nv rebuild <dir> <n> <message>` gives {} messages of {}, and `nv publish` makes them at the notes and pushes",
+            counted(provisional.len(), "commit"),
+            if provisional.len() == 1 { "it" } else { "them" },
+            provisional[0],
+            if provisional.len() == 1 { "it" } else { "them" },
+            if provisional.len() == 1 { "its own" } else { "their own" },
+          ));
+        }
+      }
       let done = remote::push(&mut store, &mut ws, AUTHOR)?;
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
