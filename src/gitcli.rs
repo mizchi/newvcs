@@ -1322,6 +1322,14 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
 fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   let [from_arg, to_arg] = positional("mv", args)[..] else { return unsupported("mv` without exactly a source and a destination") };
   let (from, mut to) = (repo.inside(from_arg)?, repo.inside(to_arg)?);
+  let shown = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
+  // The top of the tree is no source; nor, to Git, the directory the command is run from.
+  if from.is_empty() {
+    return fatal(128, format!("fatal: bad source, source=, destination={}", shown(&to)));
+  }
+  if !repo.prefix.is_empty() && from.as_slice() == repo.prefix.strip_suffix(b"/").unwrap_or(&repo.prefix) {
+    return fatal(128, format!("fatal: source directory is empty, source={}/, destination={}", shown(&from), shown(&to)));
+  }
   for (path, arg) in [(&from, from_arg), (&to, to_arg)] {
     if workspace::link_on_the_way(&repo.ws.root, path).is_some() {
       return unsupported(format_args!("mv {arg}` (a path beyond a symbolic link)"));
@@ -1356,13 +1364,22 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   // Into a directory that is there, under its own name.
   if full(&to).is_dir() {
     let name = from.rsplit(|&b| b == b'/').next().unwrap_or(&from).to_vec();
-    to = [to.as_slice(), b"/", &name].concat();
+    // The top of the tree is the empty path: its entries are their names alone. Joined with a
+    // `/`, the name was a path from the root of the file system, and the file went there.
+    to = if to.is_empty() { name } else { [to.as_slice(), b"/", &name].concat() };
+    if to == from {
+      return fatal(128, format!("fatal: can not move directory into itself, source={}, destination={}", shown(&from), shown(&to)));
+    }
   }
   if full(&to).exists() {
     return fatal(128, format!("fatal: destination exists, source={from_arg}, destination={to_arg}"));
   }
   if full(&to).parent().is_some_and(|parent| !parent.is_dir()) {
     return fatal(128, format!("fatal: renaming '{from_arg}' failed: No such file or directory"));
+  }
+  // Both ends inside the workspace, whatever was made of the names above.
+  if from.starts_with(b"/") || to.starts_with(b"/") || !full(&to).starts_with(&repo.ws.root) {
+    return unsupported(format_args!("mv {from_arg} {to_arg}` (a destination outside the workspace)"));
   }
   std::fs::rename(full(&from), full(&to)).map_err(|e| format!("renaming '{from_arg}' failed: {e}"))?;
   // The index entry moves with the file; edits not yet added stay not added, under the new name.
