@@ -669,9 +669,14 @@ pub(crate) fn unplace(root: &Path, path: &[u8]) -> bool {
   // Gone already is as good as removed; still there afterwards is not.
   let _ = std::fs::remove_file(&dest);
   let removed = std::fs::symlink_metadata(&dest).is_err();
+  // The directories it leaves empty go too, but not the one the command was run from, nor one
+  // above it: someone stands there, and Git leaves it (twelfth round: the caller's next command
+  // found its own directory gone).
+  let standing = std::env::current_dir().ok();
   let mut dir = dest.parent();
   while let Some(d) = dir.filter(|d| *d != root) {
-    if std::fs::remove_dir(d).is_err() {
+    let stood_in = standing.as_ref().is_some_and(|cwd| std::fs::canonicalize(d).is_ok_and(|d| cwd.starts_with(d)));
+    if stood_in || std::fs::remove_dir(d).is_err() {
       break;
     }
     dir = d.parent();
