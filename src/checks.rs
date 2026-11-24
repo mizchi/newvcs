@@ -96,6 +96,9 @@ impl Outcome {
 #[derive(Clone, Debug)]
 pub struct Run {
   pub state: Id,
+  /// The conditions it ran: those the files declared when the state was recorded, which may
+  /// not be those the caller read before.
+  pub config: Config,
   pub results: Vec<(String, Outcome, Duration)>,
   /// The files changed while it ran: what it found is about no recorded state.
   pub moved: bool,
@@ -128,6 +131,21 @@ impl Run {
 /// The conditions of the workspace at `root`, or `None` where it declares none.
 pub fn load(root: &Path) -> Result<Option<Config>> {
   let Ok(text) = std::fs::read_to_string(root.join(FILE)) else { return Ok(None) };
+  parse(&text).map(Some)
+}
+
+/// The conditions a recorded state declares: its own `nv.toml`, as the store has it; where it has
+/// none, one the workspace keeps out of what it records (ignored), as it is on disk. Without
+/// either, none, and no commits either.
+fn declared_by(root: &Path, store: &mut Store, state: &Id) -> Result<Config> {
+  let unrecorded = || Ok(load(root)?.unwrap_or_default());
+  let Some(tree) = root_of(store, state)? else { return unrecorded() };
+  let Some(entry) = crate::manifest::lookup(store, tree, FILE.as_bytes())?.filter(|e| !e.is_dir()) else { return unrecorded() };
+  let bytes = store.get(&entry.id)?.ok_or_else(|| format!("{FILE} of the state is not in the store"))?;
+  parse(&String::from_utf8_lossy(&bytes))
+}
+
+fn parse(text: &str) -> Result<Config> {
   let doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{FILE}: {e}"))?;
   let seconds = |item: Option<&toml_edit::Item>, default: u64| -> Result<Duration> {
     match item {
@@ -185,7 +203,7 @@ pub fn load(root: &Path) -> Result<Option<Config>> {
       Some(each) => each.as_bool().ok_or_else(|| format!("{FILE}: `each` of `commit` is true or false"))?,
     },
   };
-  Ok(Some(Config { checks: in_order(checks)?, message, body, auto, commit_each }))
+  Ok(Config { checks: in_order(checks)?, message, body, auto, commit_each })
 }
 
 /// Each condition after those it waits for, in the order declared otherwise.
@@ -225,10 +243,19 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
     Ok(ws.head)
   };
   let state = recorded(Look::Everywhere)?.ok_or("there is nothing recorded to run the conditions on")?;
+  // The conditions are the state's own, as it was recorded: the writer may have changed them
+  // since the caller read them. Changed again while they run, the files are no longer the state,
+  // and what is found is kept for none.
+  let _ = config;
+  let config = &{
+    let ws = Workspace::open(root)?;
+    let mut store = Store::open(&ws.store)?;
+    declared_by(root, &mut store, &state)?
+  };
   // A state they passed on before passes still: they are about the files, and the files are the same.
   if passed_on(root, config, &state) {
     let results = config.checks.iter().map(|c| (c.name.clone(), Outcome::Passed, Duration::ZERO)).collect();
-    return Ok(Run { state, results, moved: false });
+    return Ok(Run { state, config: config.clone(), results, moved: false });
   }
   let dir = runs_dir(root);
   std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -271,7 +298,7 @@ pub fn run(root: &Path, config: &Config, author: &str) -> Result<Run> {
     }
     None => true,
   };
-  let run = Run { state, results, moved };
+  let run = Run { state, config: config.clone(), results, moved };
   if !run.moved {
     let _held = workspace::lock(root)?;
     let ws = Workspace::open(root)?;
@@ -348,32 +375,42 @@ fn forget_notes(root: &Path, taken: &[String]) -> Result<()> {
   crate::write_whole(&notes_file(root), left.as_bytes())
 }
 
-/// The notes made on `state` or on a state recorded before it since the last commit, as one
-/// message (the first note its first line), and which they were.
+/// The notes waiting for a commit of `state`, as one line, and which they were: those made on it
+/// or on a state recorded before it since the last commit, the last commit included (a note
+/// given before anything was written); and those made on a state the workspace no longer stands
+/// on at all (the commits below it were made again since), which nothing else will take. Not
+/// those on work recorded after `state`: they wait for the commit of that work.
 fn notes_for(root: &Path, store: &mut Store, ws: &Workspace, state: &Id) -> Result<(Option<String>, Vec<String>)> {
   let waiting = notes(root);
   if waiting.is_empty() {
     return Ok((None, Vec::new()));
   }
-  let mut before: Vec<String> = Vec::new();
-  let mut at = Some(*state);
-  while let Some(id) = at.filter(|id| Some(*id) != ws.base) {
-    before.push(hex(&id));
-    if before.len() > 100_000 {
-      break;
+  // Back from `from` until `stop`, or until every note is found: the states met that are noted.
+  let chain = |store: &mut Store, from: Option<Id>, stop: Option<Id>| -> Result<std::collections::HashSet<String>> {
+    let mut left: std::collections::HashSet<&str> = waiting.iter().map(|(noted, _)| noted.as_str()).collect();
+    let mut found = std::collections::HashSet::new();
+    let (mut at, mut walked) = (from, 0);
+    while let Some(id) = at {
+      let id_hex = hex(&id);
+      if left.remove(id_hex.as_str()) {
+        found.insert(id_hex);
+      }
+      walked += 1;
+      if Some(id) == stop || walked > 100_000 || left.is_empty() {
+        break;
+      }
+      at = crate::commit::Commit::load(store, &id)?.parents.first().copied();
     }
-    at = crate::commit::Commit::load(store, &id)?.parents.first().copied();
-  }
-  let taken: Vec<(String, String)> = waiting.into_iter().filter(|(noted, _)| before.contains(noted)).collect();
+    Ok(found)
+  };
+  let mine = chain(store, Some(*state), ws.base)?;
+  let stood_on = chain(store, ws.head, None)?;
+  let taken: Vec<(String, String)> = waiting.into_iter().filter(|(noted, _)| mine.contains(noted) || !stood_on.contains(noted)).collect();
   if taken.is_empty() {
     return Ok((None, Vec::new()));
   }
-  let lines: Vec<&str> = taken.iter().map(|(_, text)| text.as_str()).collect();
-  let message = match lines.split_first() {
-    Some((first, [])) => first.to_string(),
-    Some((first, more)) => format!("{first}\n\n{}", more.join("\n")),
-    None => unreachable!("taken is not empty"),
-  };
+  // One line: a body is the `[body]` hook's to write, and written again, a body loses what was in it.
+  let message = taken.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("; ");
   Ok((Some(message), taken.into_iter().map(|(state, _)| state).collect()))
 }
 
@@ -392,28 +429,19 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
   workspace::snapshot(&mut store, &mut ws, author, Look::Everywhere)?;
   let state = ws.head.ok_or("there is nothing recorded to note")?;
   // Committed already, by the runner, under a message of its own making: that commit is renamed.
-  if let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) {
-    let chain = workspace::pending(&mut store, &ws)?;
-    let last = chain.last().map(|(id, _)| *id);
-    if last == Some(base) && String::from_utf8_lossy(&chain.last().expect("not empty").1.rest).contains(&format!("\n\n{PROVISIONAL}")) {
-      let plan: Vec<(Id, Vec<u8>)> = chain
-        .iter()
-        .map(|(id, commit)| {
-          if *id == base {
-            let said = String::from_utf8_lossy(&commit.rest).into_owned();
-            let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
-            (*id, format!("{head}\n\n{text}\n").into_bytes())
-          } else {
-            (*id, commit.rest.clone())
-          }
-        })
-        .collect();
-      let made = workspace::rebuild(&mut store, &mut ws, &plan, author)?;
-      if let Some(id) = made.last() {
-        let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(id).as_bytes());
-      }
-      return Ok(format!("the commit of these files, made already, is now \"{text}\""));
+  // Under a note already: this line joins it, as notes that wait together do.
+  if let Some(id) = rename_runner_commit(root, &mut store, &mut ws, author, |was| {
+    let (subject, body) = was.split_once('\n').unwrap_or((was, ""));
+    if subject.starts_with(PROVISIONAL) {
+      text.to_string()
+    } else {
+      format!("{subject}; {text}{}", if body.is_empty() { String::new() } else { format!("\n{body}") })
     }
+  })? {
+    let subject = crate::commit::Commit::load(&mut store, &id)?;
+    let said = String::from_utf8_lossy(&subject.rest).into_owned();
+    let line = said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or(text).to_string();
+    return Ok(format!("the commit of these files, made already, is now \"{line}\""));
   }
   std::fs::create_dir_all(runs_dir(root)).map_err(|e| e.to_string())?;
   let mut all = notes(root);
@@ -422,6 +450,60 @@ pub fn note(root: &Path, text: &str, author: &str) -> Result<String> {
   let lines: String = all.into_iter().map(|(state, text)| format!("{state}\t{text}\n")).collect();
   crate::write_whole(&notes_file(root), lines.as_bytes())?;
   Ok(format!("noted: the next commit the conditions pass on, of these files or later ones, is \"{text}\""))
+}
+
+/// Where the files are, as recorded, a commit the runner made under its provisional message and
+/// the last not pushed: give it `message` (a summary line, and a body if there is one), keeping
+/// everything else of it. The commit made again, or `None` where there is no such commit.
+pub fn rename_provisional(root: &Path, store: &mut Store, ws: &mut Workspace, message: &str, author: &str) -> Result<Option<Id>> {
+  let Some(base) = ws.base else { return Ok(None) };
+  let provisional = workspace::pending(store, ws)?
+    .last()
+    .is_some_and(|(id, c)| *id == base && String::from_utf8_lossy(&c.rest).contains(&format!("\n\n{PROVISIONAL}")));
+  if !provisional {
+    return Ok(None);
+  }
+  rename_runner_commit(root, store, ws, author, |_| message.to_string())
+}
+
+/// Where the files are, as recorded, the commit the runner made of them, the last not pushed: give
+/// it the message `message` makes of the one it has, keeping everything else of it.
+fn rename_runner_commit(
+  root: &Path,
+  store: &mut Store,
+  ws: &mut Workspace,
+  author: &str,
+  message: impl Fn(&str) -> String,
+) -> Result<Option<Id>> {
+  let Some(base) = ws.base.filter(|base| ws.head == Some(*base) && committed_by_runner(root, base)) else { return Ok(None) };
+  // Made again only where what is not pushed has an end, and not beside Git, where Git's own
+  // commands do that: elsewhere the commit keeps its message, and the caller says so.
+  if ws.pushed.or(ws.start).is_none() || crate::colocated::shared(&ws.root) {
+    return Ok(None);
+  }
+  let chain = workspace::pending(store, ws)?;
+  let Some((last, _)) = chain.last() else { return Ok(None) };
+  if *last != base {
+    return Ok(None);
+  }
+  let plan: Vec<(Id, Vec<u8>)> = chain
+    .iter()
+    .map(|(id, commit)| {
+      if *id == base {
+        let said = String::from_utf8_lossy(&commit.rest).into_owned();
+        let (head, was) = said.split_once("\n\n").unwrap_or((said.as_str(), ""));
+        (*id, format!("{head}\n\n{}\n", message(was.trim_end()).trim_end()).into_bytes())
+      } else {
+        (*id, commit.rest.clone())
+      }
+    })
+    .collect();
+  let made = workspace::rebuild(store, ws, &plan, author)?;
+  let renamed = made.last().copied();
+  if let Some(id) = renamed {
+    let _ = crate::write_whole(&runs_dir(root).join("committed"), hex(&id).as_bytes());
+  }
+  Ok(renamed)
 }
 
 /// Whether this commit is one the conditions' runner made (`[commit] each`), as far as its note says.
@@ -550,6 +632,8 @@ pub fn run_until_still(root: &Path, config: &Config, author: &str) -> Result<Opt
   for _ in 0..20 {
     let run = run(root, config, author)?;
     let moved = run.moved;
+    // What the run found is under the conditions it ran, not those this runner began with.
+    let config = &run.config;
     if run.passed()
       && let Some(hook) = &config.message
       && draft(root, &run.state).is_none()

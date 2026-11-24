@@ -534,13 +534,20 @@ impl Repo {
       if states.contains_key(&path) {
         continue;
       }
-      // Taken out of the index (`rm --cached`) and still on disk as the commit has it: a file
-      // Git does not track, unless its rules leave it out.
-      let disk = match (head, entry) {
-        (Some(_), None) if !crate::ignore::is_ignored(&self.ws.root, &path) => on_disk_as_is(&self.ws.root, &path),
-        _ => None,
+      let (disk, disk_is_index) = match (head, entry) {
+        // Taken out of the index (`rm --cached`) and still on disk as the commit has it: a file
+        // Git does not track, unless its rules leave it out.
+        (Some(_), None) if !crate::ignore::is_ignored(&self.ws.root, &path) => (on_disk_as_is(&self.ws.root, &path), false),
+        // Staged, and not reported by the look over the tree: under a directory the rules now
+        // leave out, or put back to what the last commit has. What it is, is the file's to say:
+        // read, not taken for gone. (Staged files are few.)
+        (_, Some(staged)) => match on_disk_as_is(&self.ws.root, &path) {
+          Some((mode, bytes)) if mode == staged.mode && crate::store::object_id(Kind::Blob, &bytes) == staged.id => (None, true),
+          other => (other, false),
+        },
+        _ => (None, head == entry),
       };
-      states.insert(path, State { head, index: entry, disk, disk_is_index: head == entry, unmerged: false });
+      states.insert(path, State { head, index: entry, disk, disk_is_index, unmerged: false });
     }
     // Unmerged whatever the file now holds, until it is added.
     for path in unmerged {
@@ -1114,7 +1121,12 @@ fn stage(repo: &mut Repo, states: &std::collections::BTreeMap<Vec<u8>, State>, p
       // Known only as staged (a removal, say), and there on disk: what the look over the files did
       // not list is as the last commit has it.
       // (A directory standing there is not the file.)
-      None if std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok_and(|meta| !meta.is_dir()) => {
+      // Unless the index had let it go and the rules now leave it out: then it stays out, as an
+      // untracked file the rules ignore is not added.
+      None
+        if std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok_and(|meta| !meta.is_dir())
+          && !(state.index.is_none() && crate::ignore::is_ignored(&repo.ws.root, path)) =>
+      {
         state.head
       }
       None => None,
@@ -1149,15 +1161,16 @@ fn add(mut repo: Repo, args: &[&str]) -> Res<i32> {
       return fatal(128, format!("fatal: pathspec '{arg}' is beyond a symbolic link"));
     }
   }
-  if has(args, "-A") || has(args, "--all") {
+  // `-A` alone is the whole tree; with paths, what is under them.
+  if (has(args, "-A") || has(args, "--all")) && paths.is_empty() {
     paths.push(Vec::new());
   }
   if paths.is_empty() {
     println!("Nothing specified, nothing added.");
     return Ok(0);
   }
-  // A path has to be something: on disk, or known and now gone.
-  let known: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).chain(repo.staged().into_keys()).collect();
+  // A path has to be something: on disk, or in the index and now gone.
+  let known = in_index(&repo);
   for (path, arg) in paths.iter().zip(&given) {
     let on_disk = std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(path))).is_ok();
     if !path.is_empty() && !on_disk && !known.iter().any(|k| under(std::slice::from_ref(path), k)) {
@@ -1322,6 +1335,14 @@ fn rm(repo: Repo, args: &[&str]) -> Res<i32> {
 fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   let [from_arg, to_arg] = positional("mv", args)[..] else { return unsupported("mv` without exactly a source and a destination") };
   let (from, mut to) = (repo.inside(from_arg)?, repo.inside(to_arg)?);
+  let shown = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
+  // The top of the tree is no source; nor, to Git, the directory the command is run from.
+  if from.is_empty() {
+    return fatal(128, format!("fatal: bad source, source=, destination={}", shown(&to)));
+  }
+  if !repo.prefix.is_empty() && from.as_slice() == repo.prefix.strip_suffix(b"/").unwrap_or(&repo.prefix) {
+    return fatal(128, format!("fatal: source directory is empty, source={}/, destination={}", shown(&from), shown(&to)));
+  }
   for (path, arg) in [(&from, from_arg), (&to, to_arg)] {
     if workspace::link_on_the_way(&repo.ws.root, path).is_some() {
       return unsupported(format_args!("mv {arg}` (a path beyond a symbolic link)"));
@@ -1356,7 +1377,12 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   // Into a directory that is there, under its own name.
   if full(&to).is_dir() {
     let name = from.rsplit(|&b| b == b'/').next().unwrap_or(&from).to_vec();
-    to = [to.as_slice(), b"/", &name].concat();
+    // The top of the tree is the empty path: its entries are their names alone. Joined with a
+    // `/`, the name was a path from the root of the file system, and the file went there.
+    to = if to.is_empty() { name } else { [to.as_slice(), b"/", &name].concat() };
+    if to == from {
+      return fatal(128, format!("fatal: can not move directory into itself, source={}, destination={}", shown(&from), shown(&to)));
+    }
   }
   if full(&to).exists() {
     return fatal(128, format!("fatal: destination exists, source={from_arg}, destination={to_arg}"));
@@ -1364,7 +1390,22 @@ fn mv(repo: Repo, args: &[&str]) -> Res<i32> {
   if full(&to).parent().is_some_and(|parent| !parent.is_dir()) {
     return fatal(128, format!("fatal: renaming '{from_arg}' failed: No such file or directory"));
   }
+  // Both ends inside the workspace, whatever was made of the names above.
+  if from.starts_with(b"/") || to.starts_with(b"/") || !full(&to).starts_with(&repo.ws.root) {
+    return unsupported(format_args!("mv {from_arg} {to_arg}` (a destination outside the workspace)"));
+  }
   std::fs::rename(full(&from), full(&to)).map_err(|e| format!("renaming '{from_arg}' failed: {e}"))?;
+  // What the index had at the destination, a tracked file gone from disk, is gone from the index:
+  // the moved files take its place.
+  for path in in_index(&repo) {
+    if under(std::slice::from_ref(&to), &path) && !under(std::slice::from_ref(&from), &path) {
+      if index.get(&path).is_some() {
+        staged.insert(path, None);
+      } else {
+        staged.remove(&path);
+      }
+    }
+  }
   // The index entry moves with the file; edits not yet added stay not added, under the new name.
   for (path, entry) in moving {
     let moved = [to.as_slice(), &path[from.len()..]].concat();
@@ -1417,10 +1458,19 @@ fn restore(mut repo: Repo, args: &[&str]) -> Res<i32> {
   put_back(&mut repo, &given, &paths)
 }
 
+/// The paths the index has now: HEAD's files and what was added, less what was taken out. A path
+/// whose removal is staged is not among them, as to Git it matches nothing.
+fn in_index(repo: &Repo) -> Vec<Vec<u8>> {
+  let staged = repo.staged();
+  let mut known: Vec<Vec<u8>> =
+    repo.ws.load_index().entries().into_iter().map(|(p, _)| p).filter(|p| staged.get(p) != Some(&None)).collect();
+  known.extend(staged.into_iter().filter(|(_, e)| e.is_some()).map(|(p, _)| p));
+  known
+}
+
 /// Files back to what the index has for them: what was added, or else what HEAD has.
 fn put_back(repo: &mut Repo, given: &[&str], paths: &[Vec<u8>]) -> Res<i32> {
-  let staged = repo.staged();
-  let known: Vec<Vec<u8>> = repo.ws.load_index().entries().into_iter().map(|(p, _)| p).chain(staged.keys().cloned()).collect();
+  let known = in_index(repo);
   for (path, arg) in paths.iter().zip(given) {
     if !known.iter().any(|k| under(std::slice::from_ref(path), k)) {
       return fatal(1, format!("error: pathspec '{arg}' did not match any file(s) known to git"));
@@ -1487,7 +1537,24 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
       // Nothing is discarded before it is known that the whole of it can be done.
       let going: Vec<Vec<u8>> =
         repo.states()?.into_iter().filter(|(_, state)| state.head.is_none() && state.staged().is_some()).map(|(path, _)| path).collect();
-      let blocking = workspace::hard_reset_blocked(&mut repo.store, &repo.ws, target, &going)?;
+      let mut blocking = workspace::hard_reset_blocked(&mut repo.store, &repo.ws, target, &going)?;
+      // A file of HEAD's the index let go of (`rm --cached`) is not tracked: where the commit has
+      // none it is left as it is, and where the commit has another, nv does not write over it.
+      let target_root = root(&mut repo.store, target)?;
+      let mut let_go: Vec<(Vec<u8>, u32, std::sync::Arc<Vec<u8>>)> = Vec::new();
+      for (path, state) in repo.states()? {
+        let (Some(_), None, Some((mode, bytes))) = (state.head, state.index, state.disk.clone()) else { continue };
+        let at = match target_root {
+          Some(root) => lookup(&mut repo.store, root, &path)?.filter(|e| !e.is_dir()),
+          None => None,
+        };
+        match at {
+          None => let_go.push((path, mode, bytes)),
+          Some(e) if e.mode == mode && e.id == crate::store::object_id(Kind::Blob, &bytes) => {}
+          Some(_) => blocking.push(String::from_utf8_lossy(&path).into_owned()),
+        }
+      }
+      blocking.sort();
       if let Some(first) = blocking.first() {
         return fatal(
           128,
@@ -1510,6 +1577,20 @@ fn reset(mut repo: Repo, args: &[&str]) -> Res<i32> {
       workspace::restore(&mut repo.store, &repo.ws, &[Vec::new()])?;
       if let Some(target) = target.filter(|t| Some(*t) != before) {
         workspace::switch(&mut repo.store, &mut repo.ws, target)?;
+      }
+      for (path, mode, bytes) in let_go {
+        use std::os::unix::fs::PermissionsExt;
+        let file = repo.ws.root.join(std::ffi::OsStr::from_bytes(&path));
+        if let Some(parent) = file.parent() {
+          std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if mode == MODE_LINK {
+          std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), &file).map_err(|e| e.to_string())?;
+          continue;
+        }
+        std::fs::write(&file, bytes.as_slice()).map_err(|e| e.to_string())?;
+        let bits = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(bits)).map_err(|e| e.to_string())?;
       }
     }
     "--soft" if repo.merging().is_some() => return fatal(128, "fatal: Cannot do a soft reset in the middle of a merge."),

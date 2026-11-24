@@ -45,6 +45,39 @@ async function push(name: string, ref: string, bytes: Uint8Array): Promise<Pushe
 }
 const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
 
+// ---------------------------------------------------------------- a push of many paths
+// The cost of a push grows with its paths, not with their square (twelfth round: 20,000 paths
+// took 17 s, 40,000 took 55 s, and every other repository waited). Four times the paths may take
+// some more than four times as long, not sixteen.
+{
+  const timed = async (n: number) => {
+    const name = `${repo}-wide-${n}`;
+    const paths = Array.from({ length: n }, (_, i) => `d${i % 50}/f${i}.txt`);
+    const started = Date.now();
+    const pushed = await push(name, "main", commit(null, paths, `${n} paths`));
+    assert.equal(pushed.status, "updated");
+    return Date.now() - started;
+  };
+  const [small, large] = [await timed(5_000), await timed(20_000)];
+  assert.ok(large < small * 8, `5,000 paths took ${small} ms and 20,000 took ${large} ms`);
+  console.log(`one push of 5,000 paths: ${small} ms; of 20,000: ${large} ms`);
+}
+
+// ---------------------------------------------------------------- one content asked for many times
+// Twelfth round: an id repeated in a fetch was answered once for every repeat, and a 26 KB
+// request had 419 MB back. Each content is in the answer once.
+{
+  const name = `${repo}-repeat`;
+  const one = commit(null, ["big.bin"], "one content");
+  assert.equal((await push(name, "main", one)).status, "updated");
+  const id = hex(decode(one).changes[0]!.entry!.id);
+  const answer = new Uint8Array(await (await fetch(`${server}/${name}/fetch/objects`, { method: "POST", body: `${id}\n`.repeat(1000) })).arrayBuffer());
+  const view = new DataView(answer.buffer);
+  let frames = 0;
+  for (let at = 0; at < answer.length; at += 4 + view.getUint32(at, true)) frames += 1;
+  assert.equal(frames, 3, "the answer's head, and the content's id and bytes once");
+}
+
 // ---------------------------------------------------------------- a push of several commits
 {
   const name = `${repo}-chain`;
@@ -78,7 +111,17 @@ const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
 
   // The writer never heard back and sends it again: the same answer, and nothing lands twice.
   const again = await chain("main", [cat1, cat2]);
-  assert.deepEqual([again.status, again.commit, again.seq, again.commits], [moved.status, moved.commit, moved.seq, moved.commits]);
+  // `behind` included (twelfth round: 1 the first time, 0 when sent again).
+  assert.deepEqual([again.status, again.commit, again.seq, again.commits, again.behind], [moved.status, moved.commit, moved.seq, moved.commits, moved.behind]);
+  assert.ok((moved.behind ?? 0) > 0);
+  // And one with no parent, which is put on the tip as if from the ref's start.
+  const orphans = `${name}-orphan`;
+  await push(orphans, "main", commit(null, ["start.txt"], "start"));
+  const orphan = commit(null, ["orphan.txt"], "orphan");
+  const orphanFirst = await push(orphans, "main", orphan);
+  const orphanAgain = await push(orphans, "main", orphan);
+  assert.equal(orphanFirst.status, "rebased");
+  assert.deepEqual([orphanAgain.commit, orphanAgain.behind], [orphanFirst.commit, orphanFirst.behind]);
   assert.deepEqual(await get(`${name}/refs/main`), { tip: moved.commit, seq: 4 });
   assert.equal(((await get(`${name}/divergent/main`)) as unknown[]).length, 1);
   // The same for one taken as it was.

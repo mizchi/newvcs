@@ -138,6 +138,11 @@ struct Tip {
 }
 
 /// Store the commits an answer carries (`since`), checking each against its id.
+/// The ids of the commits an answer says the ref went through.
+fn steps(answer: &serde_json::Value) -> impl Iterator<Item = Id> + '_ {
+  answer["since"].as_array().into_iter().flatten().filter_map(|step| id_of(&step["id"]).ok())
+}
+
 fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Result<usize> {
   let mut taken = 0;
   let mut dirs: Vec<Id> = Vec::new();
@@ -389,9 +394,12 @@ fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String
 /// went through meanwhile. On a conflict nothing of the workspace changes
 /// and the error names the paths; the server has kept the commit aside.
 pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushed> {
-  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
+  // An arrival a kill cut short is finished first: what it would leave unsettled is known only
+  // once it is (killed after noting it, the workspace could otherwise never be moved again).
+  resume(store, ws, &url, author)?;
+  settled(ws)?;
   let mut done = Pushed::default();
   let known = find_place(store, ws, &url, &name)?;
   // The published commits the ref has not seen, oldest first. A ref that does
@@ -539,8 +547,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   }
   // Its own commits as they landed: taken with the others', and not counted among them.
   done.landed = answer["commits"].as_array().into_iter().flatten().filter_map(|id| id_of(id).ok()).collect();
-  let own_new = done.landed.iter().filter(|id| !store.contains(id)).count();
-  done.synced.commits += take_commits(store, &url, &answer)?.saturating_sub(own_new);
+  take_commits(store, &url, &answer)?;
+  // The ref's commits since the workspace last looked, less its own: counted whether or not the
+  // store had them already, as a store shared with other workspaces does (twelfth round).
+  done.synced.commits += steps(&answer).filter(|id| !done.landed.contains(id)).count();
   let landed = id_of(&answer["commit"])?;
   // What the push landed as stands on where the ref was when the workspace last saw it.
   if let Err(why) = forward(store, seen_before, &landed) {
@@ -580,6 +590,8 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Synced {
+  /// How many of the ref's commits the arrival found to be this workspace's own, landed.
+  pub own_landed: usize,
   /// What the commits of others this workspace's own commit was put on, and that change files it
   /// changes, say of themselves: its message was written before them.
   pub moved_under: Vec<String>,
@@ -611,9 +623,17 @@ pub struct Synced {
 /// top. One request for the commits, and one for the contents of the files
 /// that changed inside the view, if any did.
 pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synced> {
-  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
+  // An arrival a kill cut short is finished first, and where it leaves files with both versions,
+  // that is what this sync did.
+  if let Some(done) = resume(store, ws, &url, author)?
+    && !done.conflicts.is_empty()
+  {
+    return Ok(done);
+  }
+  settled(ws)?;
+  let knew = ws.pushed;
   if !find_place(store, ws, &url, &name)? {
     return Ok(Synced::default());
   }
@@ -625,12 +645,31 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   let answer = json(&answer)?;
   let tip = Tip { id: id_of(&answer["tip"])?, seq: answer["seq"].as_u64().unwrap_or(0) };
   if Some(tip.id) == ws.pushed {
+    // Nothing came, though the workspace may have learnt where it stands: kept. And a push not
+    // heard back from whose last commit the ref has, landed.
+    if ws.pushed != knew {
+      ws.save()?;
+    }
+    if let Some((_, last)) = workspace::unheard_push(ws) {
+      let mut at = Some(tip.id);
+      let mut walked = 0;
+      while let Some(id) = at.filter(|_| walked < 10_000) {
+        if id == last {
+          let _ = std::fs::remove_file(workspace::unheard(ws));
+          break;
+        }
+        at = Commit::load(store, &id)?.parents.first().copied();
+        walked += 1;
+      }
+    }
     return Ok(Synced::default());
   }
-  let commits = take_commits(store, &url, &answer)?;
+  take_commits(store, &url, &answer)?;
   forward(store, ws.pushed, &tip.id)?;
+  let came = steps(&answer).count();
   let mut done = arrive(store, ws, &url, tip, author)?;
-  done.commits = commits;
+  // Those of the ref's commits since the workspace last looked that are not its own, landed.
+  done.commits = came.saturating_sub(done.own_landed);
   Ok(done)
 }
 
@@ -723,23 +762,75 @@ fn arriving(ws: &Workspace) -> std::path::PathBuf {
   workspace::arriving(ws)
 }
 
+/// What the one commit the workspace's own commits not pushed become, `last` and the `count - 1`
+/// before it, says of itself: the last one's author and committer, and the lines of all of them
+/// (a summary line each, joined by `; `, the bodies one after another). Under the last one's
+/// message alone, the others' lines were lost (twelfth round: notes `nv publish` had made).
+/// Provisional lines, the runner's, say nothing where there are others.
+fn folded_rest(store: &mut Store, last: Id, count: usize, common: Option<Id>) -> Result<Vec<u8>> {
+  let commit = Commit::load(store, &last)?;
+  if count <= 1 {
+    return Ok(commit.rest);
+  }
+  let mut messages = Vec::new();
+  let mut at = Some(last);
+  while let Some(id) = at.filter(|id| Some(*id) != common && messages.len() < count) {
+    let c = Commit::load(store, &id)?;
+    let said = String::from_utf8_lossy(&c.rest).into_owned();
+    messages.push(said.split_once("\n\n").map(|(_, m)| m.trim_end().to_string()).unwrap_or_default());
+    at = c.parents.first().copied();
+  }
+  messages.reverse();
+  let said = String::from_utf8_lossy(&commit.rest).into_owned();
+  let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h).to_string();
+  let mut subjects: Vec<String> = Vec::new();
+  let mut bodies: Vec<String> = Vec::new();
+  for message in &messages {
+    let (subject, body) = message.split_once("\n\n").unwrap_or((message.as_str(), ""));
+    let subject = subject.lines().next().unwrap_or_default().trim().to_string();
+    if !subject.is_empty() && !subjects.contains(&subject) {
+      subjects.push(subject);
+    }
+    if !body.trim().is_empty() {
+      bodies.push(body.trim().to_string());
+    }
+  }
+  if subjects.iter().any(|s| !s.starts_with(crate::checks::PROVISIONAL)) {
+    subjects.retain(|s| !s.starts_with(crate::checks::PROVISIONAL));
+  }
+  let mut message = subjects.join("; ");
+  if !bodies.is_empty() {
+    message = format!("{message}\n\n{}", bodies.join("\n\n"));
+  }
+  Ok(format!("{head}\n\n{message}\n").into_bytes())
+}
+
 /// Finish an arrival that a killed process left half done. Its files may be
 /// partly written, so the disk is not looked at: what the workspace had
 /// recorded when that arrival began is what it brings along.
-fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Result<()> {
-  let Ok(text) = std::fs::read_to_string(arriving(ws)) else { return Ok(()) };
+fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Result<Option<Synced>> {
+  let Ok(text) = std::fs::read_to_string(arriving(ws)) else { return Ok(None) };
   let mut fields = text.split_whitespace();
   let tip = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok());
   let seq = fields.next().and_then(|seq| seq.parse().ok());
   match (tip, seq) {
-    (Some(id), Some(seq)) if store.get(&id)?.is_some() => arrive_from(store, ws, url, Tip { id, seq }, author, true).map(|_| ()),
-    _ => std::fs::remove_file(arriving(ws)).map_err(|e| e.to_string()),
+    // Killed after the workspace stood where the arrival went: done, all but the note of it.
+    // Worked out again from there, it would find nothing to settle and forget what is.
+    (Some(id), Some(seq)) if ws.pushed == Some(id) && ws.seq == seq => {
+      std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string())
+    }
+    (Some(id), Some(seq)) if store.get(&id)?.is_some() => arrive_from(store, ws, url, Tip { id, seq }, author, true).map(Some),
+    _ => std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string()),
   }
 }
 
 /// Move the workspace to `tip`, whose commits the store already has.
 fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str) -> Result<Synced> {
-  resume(store, ws, url, author)?;
+  if let Some(done) = resume(store, ws, url, author)?
+    && !done.conflicts.is_empty()
+  {
+    return Ok(done);
+  }
   arrive_from(store, ws, url, tip, author, false)
 }
 
@@ -1109,12 +1200,101 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     // The merged commit's, where the two commits were merged in this file.
     let new = merged_published.get(&path).map_or(new, |merged| Some(*merged));
     let on_disk = at(store, head_root, &path)?;
+    // Finishing an arrival a kill cut short: a file that is now neither what the workspace had nor
+    // what the arrival brings was written after the kill, on top of either. It is the writer's,
+    // and is merged with what arrives, never written over.
+    if resuming {
+      let target = match outcome.get(&path) {
+        Some(Outcome::Both(text, mode)) => Some((*mode, Some(crate::store::object_id(Kind::Blob, text)))),
+        Some(Outcome::Pending(wanted)) => Some((wanted.map_or(0, |e| e.mode), wanted.map(|e| e.id))),
+        None => Some((new.map_or(0, |e| e.mode), new.map(|e| e.id))),
+      };
+      let disk = workspace::content_at(&ws.root, &path);
+      // What cannot be read may be the writer's, edited since: not written over, and said.
+      if disk == Err(workspace::Unknown::Unreadable) {
+        return Err(format!(
+          "{} cannot be read, and may have been written since a sync was cut short: nothing more is written until it can be",
+          name(&path)
+        ));
+      }
+      if let (Ok(disk), Some(target)) = (disk, target) {
+        let disk_id = disk.as_ref().map(|(mode, bytes)| (*mode, crate::store::object_id(Kind::Blob, bytes)));
+        let is = |entry: Option<(u32, Option<Id>)>| match (entry, disk_id) {
+          (Some((_, None)), None) => true,
+          (Some((mode, Some(id))), Some((disk_mode, disk_id))) => mode == disk_mode && id == disk_id,
+          _ => false,
+        };
+        let was = Some((on_disk.map_or(0, |e| e.mode), on_disk.map(|e| e.id)));
+        if !is(was) && !is(Some(target)) {
+          let wanted = match outcome.remove(&path) {
+            Some(Outcome::Pending(wanted)) => wanted,
+            Some(Outcome::Both(..)) => {
+              // A file left for a person, then edited: the edit stands, and it is still to be settled.
+              match new {
+                Some(new) => index.insert(path.clone(), crate::index::Indexed { entry: new, size: 0, mtime: 0, ctime: 0 }),
+                None => index.remove(&path),
+              }
+              done.conflicts.push(name(&path));
+              continue;
+            }
+            None => new,
+          };
+          let ours = match &disk {
+            Some((mode, bytes)) => Some(Entry { mode: *mode, id: store.put(Kind::Blob, bytes, on_disk.map(|e| e.id))? }),
+            None => None,
+          };
+          // Text is merged; a link is not, and its target is never written through.
+          let merged = match (ours, wanted) {
+            (Some(ours), Some(theirs)) if ours.mode != crate::manifest::MODE_LINK && theirs.mode != crate::manifest::MODE_LINK => {
+              three_way(store, &path, on_disk, ours, theirs)?
+            }
+            _ => None,
+          };
+          match merged {
+            Some((text, true, mode)) => {
+              let entry = Entry { mode, id: store.put(Kind::Blob, &text, ours.map(|e| e.id))? };
+              if Some(entry) != ours {
+                placed.add(path.clone(), workspace::place(store, &ws.root, &path, entry)?);
+              }
+              if Some(entry) != new {
+                pending.push((path.clone(), Some(entry)));
+              }
+            }
+            // Both changed the same lines: both versions, as a sync leaves them, for a person.
+            Some((text, false, _)) => {
+              let file = ws.root.join(workspace::to_path(&path));
+              if std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+              }
+              std::fs::write(&file, text).map_err(|e| e.to_string())?;
+              match new {
+                Some(new) => index.insert(path.clone(), crate::index::Indexed { entry: new, size: 0, mtime: 0, ctime: 0 }),
+                None => index.remove(&path),
+              }
+              done.conflicts.push(name(&path));
+            }
+            // Removed on one side and written on the other, or not text: the file as the writer
+            // left it, a change of the workspace's own on top of what arrives.
+            None => {
+              if ours != new {
+                pending.push((path.clone(), ours));
+              }
+            }
+          }
+          continue;
+        }
+      }
+    }
     match outcome.remove(&path) {
       // Both versions between markers, on disk and not recorded: theirs is what the workspace is on.
       Some(Outcome::Both(text, mode)) => {
         let file = ws.root.join(workspace::to_path(&path));
         if let Some(parent) = file.parent() {
           std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // A link standing there makes way: the text is never written through it.
+        if std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+          std::fs::remove_file(&file).map_err(|e| e.to_string())?;
         }
         std::fs::write(&file, text).map_err(|e| e.to_string())?;
         // The text is for a person to settle; the mode is settled already, and is on the file.
@@ -1177,7 +1357,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // what it had only recorded stays recorded on top of that.
   let base = match (published.is_empty(), ws.base) {
     (false, Some(was)) => {
-      let rest = Commit::load(store, &was)?.rest;
+      let rest = folded_rest(store, was, still_mine, common)?;
       let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
       root_of(store, &id)?;
       // A commit of this workspace's own, like the one it stands for: logged once it is stored.
@@ -1189,13 +1369,9 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   };
   let head = if pending.is_empty() { base } else { workspace::carry(store, base, pending, author)? };
   store.flush()?;
-  let based = ws.base;
-  (ws.pushed, ws.seq, ws.base, ws.head) = (Some(tip), seq, Some(base), Some(head));
-  placed.into_index(&mut index);
-  ws.adopt(&mut index)?;
-  workspace::take_branch_along(store, ws, based)?;
-  workspace::Standing::arrived_at(ws, base);
-  let _ = std::fs::remove_file(arriving(ws));
+  // What the workspace is to know of this arrival is written before the workspace stands on it:
+  // killed in between, the arrival is finished again and writes them again; killed after, they
+  // are there. Written after, a kill between left a file with both versions that nothing knew of.
   if done.merged > 0 || !done.conflicts.is_empty() {
     done.before = before;
   }
@@ -1233,6 +1409,14 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
     workspace::set_moved(ws, (!over.is_empty()).then_some(base), &over)?;
     done.moved_under = over;
   }
+  workspace::Standing::arrived_at(ws, base);
+  let based = ws.base;
+  (ws.pushed, ws.seq, ws.base, ws.head) = (Some(tip), seq, Some(base), Some(head));
+  placed.into_index(&mut index);
+  ws.adopt(&mut index)?;
+  workspace::take_branch_along(store, ws, based)?;
+  let _ = std::fs::remove_file(arriving(ws));
+  done.own_landed = own_landed.map_or(0, |(_, _, count)| count);
   // A push that was not heard back from, found on the ref: the workspace knows now.
   if let Some((sent, last)) = workspace::unheard_push(ws)
     && let Some((own, _, count)) = own_landed

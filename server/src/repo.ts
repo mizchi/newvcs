@@ -163,7 +163,13 @@ export class Repo extends DurableObject<Env> {
         const landed = new Uint8Array(before.landed);
         const seq = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, landed).toArray()[0]!.seq;
         const ids = sql.exec<{ id: ArrayBuffer }>("SELECT id FROM history WHERE ref = ? AND seq > ? AND seq <= ? ORDER BY seq", ref, seq - chain.length, seq).toArray();
-        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind: 0, since: since() };
+        // How far behind it was, as it was told the first time: from where its base was to where
+        // the chain was put (twelfth round: sent again, it was told 0).
+        const parent = first.parents[0];
+        // A chain with no parent was put on the tip as from the ref's start, as the first time.
+        const base = parent ? sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, parent).toArray()[0]?.seq : 0;
+        const behind = before.moved && base !== undefined ? Math.max(0, seq - chain.length - base) : 0;
+        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind, since: since() };
       }
 
       const parent = first.parents[0] ?? null;
@@ -367,8 +373,11 @@ export class Repo extends DurableObject<Env> {
   /// directories on the way count, and so do the entries of a directory set whole.
   private spell(ref: string, path: string, entry: { mode: number; id: Uint8Array } | null): void {
     const sql = this.ctx.storage.sql;
-    // What was at the path, and below it, is gone: replaced or removed.
-    sql.exec("DELETE FROM live WHERE ref = ? AND (path = ? OR (path > ? AND path < ?))", ref, path, path + "/", path + "0");
+    // What was at the path, and below it, is gone: replaced or removed. Two statements, each on
+    // the index by path: joined by `OR`, the delete read the whole table, once for every path of
+    // a push, and a push of many paths took the square of their number (twelfth round).
+    sql.exec("DELETE FROM live WHERE ref = ? AND path = ?", ref, path);
+    sql.exec("DELETE FROM live WHERE ref = ? AND path > ? AND path < ?", ref, path + "/", path + "0");
     const parts = path.split("/");
     if (!entry) {
       // A directory left with nothing in it is gone as well.

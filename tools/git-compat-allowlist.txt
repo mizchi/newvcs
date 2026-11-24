@@ -37,3 +37,8 @@
 35-paths-of-show-and-diff.sh
 36-diff-a-revision-against-the-files.sh
 37-rm-cached.sh
+38-mv-to-the-top.sh
+39-untracked-by-rm-cached.sh
+40-paths-the-index-let-go.sh
+41-staged-files-nobody-walks-to.sh
+42-reset-hard-from-a-directory.sh

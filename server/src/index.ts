@@ -334,7 +334,7 @@ export default {
           const packs = new Map<string, Uint8Array>();
           const out: Uint8Array[] = [];
           const seen = new Set<string>();
-          let level = (await request.text()).split("\n").filter(Boolean).map(unhex);
+          let level = [...new Set((await request.text()).split("\n").filter(Boolean))].map(unhex);
           while (level.length > 0) {
             const found = await repo.where(level);
             const asTrees = await repo.trees(level);
@@ -358,7 +358,9 @@ export default {
           return new Response(framed(out));
         }
         if (what === "fetch") {
-          const ids = (await request.text()).split("\n").filter(Boolean).map(unhex);
+          // Each content once, however often it is asked for: an answer is no larger than what the
+          // repository holds (twelfth round: one id a thousand times was a thousand copies).
+          const ids = [...new Set((await request.text()).split("\n").filter(Boolean))].map(unhex);
           const found = await repo.where(ids);
           // By pack: one read of the bucket for each, and of only the bytes wanted when it is one content.
           const packs = new Map<string, Placed[]>();

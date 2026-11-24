@@ -669,9 +669,14 @@ pub(crate) fn unplace(root: &Path, path: &[u8]) -> bool {
   // Gone already is as good as removed; still there afterwards is not.
   let _ = std::fs::remove_file(&dest);
   let removed = std::fs::symlink_metadata(&dest).is_err();
+  // The directories it leaves empty go too, but not the one the command was run from, nor one
+  // above it: someone stands there, and Git leaves it (twelfth round: the caller's next command
+  // found its own directory gone).
+  let standing = std::env::current_dir().ok();
   let mut dir = dest.parent();
   while let Some(d) = dir.filter(|d| *d != root) {
-    if std::fs::remove_dir(d).is_err() {
+    let stood_in = standing.as_ref().is_some_and(|cwd| std::fs::canonicalize(d).is_ok_and(|d| cwd.starts_with(d)));
+    if stood_in || std::fs::remove_dir(d).is_err() {
       break;
     }
     dir = d.parent();
@@ -1189,6 +1194,31 @@ pub struct Looked {
   pub reads: usize,
   /// Files that had to be read and may not be: left out of what is recorded.
   pub unreadable: Vec<Vec<u8>>,
+}
+
+/// Why what is at a path is not known.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unknown {
+  /// Beyond a link: no file of this workspace's is there.
+  BeyondLink,
+  /// Something is there that is neither a file nor a link (a pipe, a device), or cannot be read.
+  Unreadable,
+}
+
+/// What is at `path` in the workspace: a file or a link, read; `None` where nothing is, or a
+/// directory. Nothing else is read: a pipe would be waited on for ever.
+pub(crate) fn content_at(root: &Path, path: &[u8]) -> std::result::Result<Option<Content>, Unknown> {
+  if link_on_the_way(root, path).is_some() {
+    return Err(Unknown::BeyondLink);
+  }
+  let full = root.join(to_path(path));
+  match std::fs::symlink_metadata(&full) {
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(_) => Err(Unknown::Unreadable),
+    Ok(meta) if meta.is_dir() => Ok(None),
+    Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => read_content(&full, &meta).map(Some).map_err(|_| Unknown::Unreadable),
+    Ok(_) => Err(Unknown::Unreadable),
+  }
 }
 
 fn read_content(path: &Path, meta: &std::fs::Metadata) -> Result<Content> {
@@ -3311,4 +3341,30 @@ pub fn fork(from: &Path, to: &Path) -> Result<()> {
   // The note of which directory the index is about, written last and saying "a copy": every file
   // of the fork changed, to the file system, before this did, and one that changes later is an edit.
   crate::write_whole(&to.join(META).join("index.root"), "a copy")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// What is at a path, for finishing an arrival: a file or a link is read, nothing else is (a
+  /// pipe would be waited on for ever), and what cannot be read is said apart from what is not
+  /// there (reviewed with the twelfth round's fixes).
+  #[test]
+  fn content_at_reads_files_and_links_and_nothing_else() {
+    let root = std::env::temp_dir().join(format!("nv-content-at-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::write(root.join("f"), b"text").unwrap();
+    std::os::unix::fs::symlink("f", root.join("l")).unwrap();
+    let fifo = std::ffi::CString::new(root.join("p").as_os_str().as_bytes()).unwrap();
+    // SAFETY: a path the test owns.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    assert_eq!(content_at(&root, b"f"), Ok(Some((0o100644, b"text".to_vec()))));
+    assert_eq!(content_at(&root, b"l"), Ok(Some((MODE_LINK, b"f".to_vec()))));
+    assert_eq!(content_at(&root, b"gone"), Ok(None));
+    assert_eq!(content_at(&root, b"d"), Ok(None));
+    assert_eq!(content_at(&root, b"p"), Err(Unknown::Unreadable));
+    let _ = std::fs::remove_dir_all(&root);
+  }
 }

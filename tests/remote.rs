@@ -1667,3 +1667,278 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   assert_eq!(run("cat", "$NV git log --format=%s -2").1, "checkpoint: unit passed\nAdd b\n");
   assert_eq!(run("cat", "$NV git show --name-only --format= HEAD~1").1, "README.md\nb.py\n", "Bob's commit is as he pushed it");
 }
+
+/// What a twelfth-round reviewer lost by killing a sync: an arrival cut short is finished by the
+/// next command from what was recorded, and that wrote over a file the killed sync had already
+/// written and the writer had edited since. Both kills are made here as a kill leaves them.
+#[test]
+fn finishing_an_arrival_keeps_what_was_written_after_the_kill() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-arrival-killed");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/arrival-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'one\ntwo\nthree\n' > f.txt && printf 'x\n' > g.txt
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  // Ann changes the first line; Bob's store, which is Ann's, has her commit, and Bob's sync to it is killed after
+  // it wrote f.txt. Bob goes on working, in f.txt, before anything finishes the arrival.
+  let (code, said) = run("ann", "sed -i 's/^one$/ONE/' f.txt && $NV commit . 'Ann edits f' >/dev/null && $NV push .");
+  assert_eq!(code, 0, "{said}");
+  let field = |name: &str| run("ann", &format!("sed -n 's/^{name} //p' .nv/workspace")).1.trim().to_string();
+  let (tip, seq) = (field("pushed"), field("seq"));
+  run("bob", &format!("printf '{tip} {seq}\\n' > .nv/arriving && printf 'ONE\\ntwo\\nthree\\n' > f.txt && echo bob-after-kill >> f.txt"));
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "cat f.txt").1, "ONE\ntwo\nthree\nbob-after-kill\n", "the edit made after the kill is kept: {said}");
+  assert!(run("bob", "$NV since . base").1.contains("M f.txt"), "and is the workspace's own, not yet committed");
+  // Killed later, once the workspace stood on the new commit and before it noted the files the
+  // sync left with both versions: finishing must not take the conflict for settled.
+  run("ann", "sed -i 's/^two$/ann-two/' f.txt && $NV commit . 'Ann edits two' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run("bob", "sed -i 's/^two$/bob-two/' f.txt && $NV commit . 'Bob edits two' >/dev/null && $NV push . ; $NV sync .");
+  assert_ne!(code, 0, "{said}");
+  let (tip, seq) = (field("pushed"), field("seq"));
+  run("bob", &format!("printf '{tip} {seq}\\n' > .nv/arriving"));
+  let (code, said) = run("bob", "$NV push .");
+  assert_ne!(code, 0, "a file still holding both versions is not pushed: {said}");
+  assert!(run("bob", "cat .nv/conflicts").1.contains("f.txt"), "and the sync still knows it left it so");
+  // Killed after it noted the file left with both versions and before the workspace stood on
+  // the new commit: the next sync finishes the arrival before it asks for the file to be
+  // settled, or nothing could ever finish it (`nv commit` waits for the sync).
+  run("bob", "$NV restore . before-sync >/dev/null");
+  run("ann", "sed -i 's/^ann-two$/ann-again/' f.txt && $NV commit . 'Ann again' >/dev/null && $NV push . >/dev/null");
+  let (tip, seq) = (field("pushed"), field("seq"));
+  run("bob", &format!("printf '{tip} {seq}\\n' > .nv/arriving && printf 'f.txt\\n' > .nv/conflicts"));
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 1, "the arrival is finished, and the clash said: {said}");
+  assert!(run("bob", "ls .nv").1.lines().all(|f| f != "arriving"), "{said}");
+  assert!(run("bob", "grep -c '^<<<<<<< yours' f.txt").1.trim() == "1", "{said}");
+}
+
+/// A sync that clashes, killed at random moments, and finished by the next: wherever the kill
+/// fell, a file left with both versions is one the workspace knows it left so, and is not pushed.
+/// (Twelfth round: killed after the workspace stood on the new commit and before it noted the
+/// file, the next push went through with the markers in it.)
+#[test]
+fn a_clashing_sync_killed_anywhere_still_knows_what_it_left_unsettled() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-clash-killed");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/clash-killed-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'one\ntwo\nthree\n' > f.txt && git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null)
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", "w")
+        .env("GIT_AUTHOR_EMAIL", "w@example.com")
+        .env("GIT_COMMITTER_NAME", "w")
+        .env("GIT_COMMITTER_EMAIL", "w@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  let mut unsettled_seen = 0;
+  for round in 0..40 {
+    let bob = format!("bob{round}");
+    run(".", &format!("$NV fork ann {bob} >/dev/null"));
+    run(&bob, &format!("sed -i 's/^two.*/bob {round}/' f.txt && $NV commit . 'Bob {round}' >/dev/null"));
+    run("ann", &format!("sed -i 's/^two.*/ann {round}/' f.txt && $NV commit . 'Ann {round}' >/dev/null && $NV push . >/dev/null"));
+    let pause = 5 + (round * 37) % 60;
+    run(
+      &bob,
+      &format!(
+        "$NV sync . >/dev/null 2>&1 & pid=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; true"
+      ),
+    );
+    // Whatever the kill left, the next command finishes it.
+    run(&bob, "$NV sync . >/dev/null 2>&1; true");
+    if run(&bob, "grep -c '^<<<<<<< yours' f.txt").1.trim() != "0" {
+      unsettled_seen += 1;
+      let (code, said) = run(&bob, "$NV push .");
+      assert_ne!(code, 0, "round {round}: a file holding both versions was pushed: {said}");
+      assert!(run(&bob, "cat .nv/conflicts").1.contains("f.txt"), "round {round}: the sync forgot it left f.txt unsettled");
+    }
+    // Ann is the ref's tip again for the next round.
+    run("ann", "$NV sync . >/dev/null 2>&1; true");
+  }
+  assert!(unsettled_seen > 0, "no round left a file unsettled: the test tried nothing");
+}
+
+/// A push whose answer was never heard (a publish killed after the push landed): `nv publish`
+/// finds out where it stands and goes on, and a sync that finds the ref at the workspace's own
+/// last commit says the push landed. (Twelfth round: every later publish and note was refused,
+/// and the sync said nothing came.) The kill is made here as it leaves things.
+#[test]
+fn a_publish_after_a_push_never_heard_finds_where_it_stands() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-unheard-publish");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/unheard-publish-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && echo start > a && printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ws >/dev/null && {nv} remote ws {url} main
+      (cd ws && {nv} push . >/dev/null)
+      "##
+    ),
+  );
+  let run = |script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join("ws"))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", "dev")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "dev")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  // Made again and pushed; the push lands, and its answer is lost: the workspace is as it was
+  // before the push, with the note a push leaves until it hears back.
+  let unheard = |name: &str| {
+    run(&format!(
+      "echo {name} > {name} && $NV checkpoint . >/dev/null 2>&1 && $NV rebuild . 1 'Add {name}' >/dev/null && cp .nv/workspace ../before"
+    ));
+    let base = run("sed -n 's/^base //p' .nv/workspace").1.trim().to_string();
+    let (code, said) = run("$NV push .");
+    assert_eq!(code, 0, "{said}");
+    run(&format!("cp ../before .nv/workspace && printf '1 {base}\\n' > .nv/pushing"));
+  };
+  unheard("b");
+  let (code, said) = run("echo c > c && $NV note . 'Add c' >/dev/null; $NV checkpoint . >/dev/null 2>&1; $NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("$NV git log --format=%s -3").1, "Add c\nAdd b\nseed\n", "{said}");
+  assert!(run("ls .nv").1.lines().all(|f| f != "pushing"), "the push is known to have landed");
+  // Pointed at the ref anew, the workspace locates itself on it: the ref's tip is its own last
+  // commit, and the sync says the push landed rather than leaving everything refused.
+  unheard("d");
+  let (code, said) = run(&format!("$NV remote . {url} main && $NV sync ."));
+  assert_eq!(code, 0, "{said}");
+  assert!(run("ls .nv").1.lines().all(|f| f != "pushing"), "the sync found the push on the ref: {said}");
+  let (code, said) = run("$NV pending .");
+  assert!(code == 0 && said.starts_with("nothing committed here that is not pushed"), "{said}");
+}
+
+/// Commits of one's own that a sync makes one, on the ref's newer tip, keep every line they had
+/// (twelfth round: `nv publish` caught up and published two noted steps under the second alone).
+#[test]
+fn commits_a_sync_makes_one_keep_all_their_lines() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-fold-lines");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/fold-lines-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '1\n2\n3\n4\n5\n' > f && git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "sed -i 's/^5$/ann/' f && $NV commit . 'Ann edits five' >/dev/null && $NV push . >/dev/null");
+  run(
+    "bob",
+    "sed -i 's/^1$/bob/' f && $NV commit . 'Step A\n\nWhy A.' >/dev/null && echo g > g && $NV commit . 'Step B\n\nWhy B.' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step A; Step B\nAnn edits five\n", "{said}");
+  assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why A.\n\nWhy B.");
+  assert!(said.contains("under the lines of all of them"), "{said}");
+  // Commits that came are counted though the store, which Ann's fork shares, had them already
+  // (twelfth round: "caught up 0 commits", from two reviewers).
+  run(
+    "ann",
+    "$NV sync . >/dev/null; echo 7 > h && $NV commit . 'Ann adds h' >/dev/null && echo 8 > i && $NV commit . 'Ann adds i' >/dev/null && $NV push . >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 2 commits"), "{said}");
+  run("ann", "echo 9 > j && $NV commit . 'Ann adds j' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 1 commit"), "{said}");
+}

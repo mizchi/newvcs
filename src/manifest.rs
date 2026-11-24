@@ -52,6 +52,11 @@ pub const MAX_PATH: usize = 1024;
 /// refused, never less.
 pub fn fold_name(name: &[u8]) -> Vec<u8> {
   use unicode_normalization::UnicodeNormalization;
+  // To NTFS a name ends at a `:` (what follows names a stream of the file) and without the dots
+  // and spaces at its end: `a`, `a.`, `a ` and `a::$DATA` are one file.
+  let stem = name.split(|&b| b == b':').next().unwrap_or(name);
+  let trimmed = stem.iter().rposition(|&b| b != b'.' && b != b' ').map_or(&stem[..0], |last| &stem[..=last]);
+  let name = if trimmed.is_empty() { name } else { trimmed };
   match std::str::from_utf8(name) {
     Ok(text) if !name.is_ascii() => {
       let once: String = text.nfc().collect::<String>().to_lowercase().to_uppercase().to_lowercase();
@@ -118,7 +123,27 @@ pub fn folded_twins_within(store: &mut Store, root: Id, at: &[u8], longest: usiz
 /// what a checkout would write into Git's directory or nv's own through, from a tree that came
 /// from somebody else.
 pub fn name_ok(name: &[u8]) -> bool {
-  !name.is_empty() && name.len() <= 255 && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0) && !reserved(name)
+  !name.is_empty()
+    && name.len() <= 255
+    && name != b"."
+    && name != b".."
+    && !name.contains(&b'/')
+    && !name.contains(&0)
+    && !reserved(name)
+    && windows_ok(name)
+}
+
+/// What Windows makes of a name: a backslash is a separator there, and a name ends at a `:`
+/// (what follows names a stream of the file), so `.git::$INDEX_ALLOCATION` is the directory
+/// `.git` and `..\\x` is outside. Each part, up to its `:`, may be neither `.git` nor `.nv`, nor a
+/// parent or the directory itself; with a backslash, no part is empty.
+fn windows_ok(name: &[u8]) -> bool {
+  let parted = name.contains(&b'\\');
+  name.split(|&b| b == b'\\').all(|part| {
+    let stem = part.split(|&b| b == b':').next().unwrap_or(part);
+    let spaced = stem.iter().rposition(|&b| b != b' ').map_or(&stem[..0], |last| &stem[..=last]);
+    !(parted && part.is_empty()) && spaced != b"." && spaced != b".." && !reserved(stem)
+  })
 }
 
 /// A name that is `.git` or `.nv` to some file system: in any case; with characters HFS+ ignores
@@ -421,6 +446,39 @@ mod tests {
 
   fn change(path: &str, entry: Option<Entry>) -> Change {
     (path.as_bytes().to_vec(), entry)
+  }
+
+  /// Twelfth round: names Windows takes for `.git`, `.nv` or a parent directory were taken, and
+  /// pairs it takes for one file. A name is what comes before a `:` (what follows names a stream
+  /// of the file), each part between backslashes, and without the dots and spaces at its end.
+  #[test]
+  fn names_windows_takes_for_others_are_refused_or_folded() {
+    for name in [
+      &b".git::$INDEX_ALLOCATION"[..],
+      b".nv::$INDEX_ALLOCATION",
+      b".git:x",
+      b"nv~1:x",
+      b".GIT :stream",
+      b".git\\config",
+      b".nv\\x",
+      b"..\\..\\x",
+      b"\\abs",
+      b"a\\..",
+      b"..:x",
+      b".. ",
+    ] {
+      assert!(!name_ok(name), "{:?} was taken as a name", String::from_utf8_lossy(name));
+    }
+    for name in [&b"a:b"[..], b"a\\b", b"...", b"x.git", b"git"] {
+      assert!(name_ok(name), "{:?} was refused", String::from_utf8_lossy(name));
+    }
+    for (one, other) in [(&b"a"[..], &b"a::$DATA"[..]), (b"a", b"a."), (b"a", b"a "), (b"a", b"A.")] {
+      assert_eq!(fold_name(one), fold_name(other), "{:?} and {:?}", String::from_utf8_lossy(one), String::from_utf8_lossy(other));
+    }
+    // `a:b` is a stream of the file `a` to NTFS: the same file.
+    assert_eq!(fold_name(b"a:b"), fold_name(b"a"));
+    // A name that is dots and spaces up to its `:` is folded whole, as the server folds it.
+    assert_eq!(fold_name(b". :x"), b". :x".to_vec());
   }
 
   #[test]

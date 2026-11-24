@@ -575,7 +575,12 @@ again before anyone else sees them:
   conditions pass on is made under that line, and where the runner has
   committed those files already under a message of its own, that commit
   is renamed. A writer that notes each step it finishes has said where
-  commits end without ever committing.
+  commits end without ever committing. A note waits for a commit however
+  the work goes meanwhile (a state that fails, commits below it made
+  again); notes that wait together, because the conditions passed on
+  none of the states in between, are one commit, under their lines
+  joined by `; `, as is a line given for files committed under a note
+  already. Only a state the conditions passed on is a commit's end.
 - `nv publish <dir> [--message <line>]` waits as `nv pending --wait` does,
   makes the commits again with one ending at each note (what came after
   the last, under `--message`), and pushes. A `[body]` hook
@@ -1825,6 +1830,71 @@ workspace of one directory with nothing else on disk; forks that carry
 build output; a directory of another repository standing in this one as
 an ordinary directory, by its id.
 
+**The twelfth round** was given the build that added server-side union
+merges, `nv note` and `nv publish`, and the new `nv git` paths. Four
+reviewers: one with the server's address alone, sending what a client
+never would (about 15,000 requests); three writing random testers with an
+oracle of their own: many writers on one ref with kills and lost answers
+(8,666 steps, 453 kills); a developer that never commits, with
+`nv publish` and kills (2,520 steps, 523 kills); and `nv git` against
+real Git in a twin directory (95,411 steps). What they found, each fixed
+with a test or a Git case that failed first, most severe first:
+
+- **A sync killed while it wrote files, then finished by the next
+  command, wrote over what was edited after the kill**: 7 losses in 86
+  killed syncs, the edit in no recorded state. A file that is neither what
+  the workspace had nor what arrives is now merged with what arrives.
+  Killed later, after the workspace stood on the new commit, a clashing
+  sync forgot the file it left with both versions, and the next push went
+  through with the markers: what the sync knows is now written first.
+- **`nv git mv f ..` (and `mv f .` at the top) moved the file to the root
+  of the file system**, and `mv . ..` a whole directory. A name moved into
+  the top is the name alone; a destination outside the workspace is
+  refused (case 38).
+- **`reset --hard` removed a file `rm --cached` had let go of**, edits and
+  all; `restore -- b d` with `d` a staged removal put `b` back over an
+  edit; a file staged under a directory then ignored, or put back to the
+  commit after `add`, was shown as gone and left out of the next commit;
+  `mv` onto a tracked file already gone dropped the files moved from the
+  next commit; `add -A <path>` staged the whole tree; `rm --cached` and
+  `.gitignore` did not stop a file being tracked (cases 39 to 41).
+- **A commit that fails its conditions landed marked as passing**: the
+  runner kept the conditions it started with when the writer changed them.
+  A run reads them again once its state is recorded.
+- **Provisional messages reached the ref**: `nv commit <dir> <message>`
+  dropped the message where the runner had committed first, and `nv push`,
+  which nv's refusals named, pushed `checkpoint:` commits as they were.
+  The runner's commit takes the message; under `[commit] each`, a push
+  refuses provisional messages.
+- **Notes were lost**: 110 of 184 reached no commit. A note now waits for
+  the next commit the conditions pass on, whatever happens between; notes
+  waiting together are one line joined by `; `; and commits a sync makes
+  one keep all their lines.
+- **A publish killed after its push landed left every later publish
+  refused**, and `nv sync` said nothing came. A sync that finds its push on
+  the ref says so; a publish after an unheard push syncs first.
+- **The server**: one 2 MB push of 40,000 paths took 55 s and stalled
+  every repository (a delete that read the whole table for each path: now
+  4 s); a fetch answered every repeat of an id with another copy (419 MB
+  for 26 KB asked); one commit could set `l` as a link and `l/x` as a file,
+  which a client taking changes in order writes through; a change's kind
+  byte was read as true or false, so one commit had 255 ids; names NTFS
+  reads as `.git`, as a parent or as one another were taken
+  (`.git::$INDEX_ALLOCATION`, `..\x`, `a` beside `a.`); a push sent again
+  was told it had not been behind.
+- Counts: "caught up 0 commits" where a fork's shared store had them;
+  "0 of linked directories" where there are no links.
+
+Not fixed, and in `TODO.md`: what the twelfth round found of `nv git`'s
+output beside Git's (rename pairing and score, the order of mode lines in
+a rename, `--stat` names, quoting, several stderr wordings, `mv` and
+refusals that differ either way), a push the server merged not warning of
+a message written before the commits it now sits on, and the reviewers'
+timings: on a generated tree of 20,000 files, under other load, `nv git
+status` took 1.3 to 1.75 times `git status`, where on oxc it is ahead, and
+a history with one commit of 20,000 files makes every full `nv git log`
+take 33 ms against Git's 2.1.
+
 ## Why these choices
 
 Measured on real histories before any of this was written (the tools are
@@ -2028,7 +2098,8 @@ stops.
   met by a real file of a gigabyte. Nothing yet fetches a large file only
   when it is opened.
 - A workspace with several unpushed commits that has to catch up first gets
-  them back as one commit, under the message of the last; the sync says so.
+  them back as one commit, under the lines of all of them (their summary
+  lines joined by `; `, their bodies one after another); the sync says so.
 - The server compares paths. Two changes to different functions of one file
   need a sync and a second push from one of the writers; the merge is the
   client's. A push that was refused stays on the server as a row nobody
