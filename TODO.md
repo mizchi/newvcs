@@ -64,6 +64,10 @@ scripts against the binary; each item gets a failing test or Git case before its
   that parent finds itself in the history), and then nobody without that parent can sync it.
   Say so where a ref is started, or refuse where the parent is nobody's.
 
+- [ ] The names on a ref the server keeps for collisions (`live`) are folded as they were when
+  each was written; the twelfth round's NTFS folding is newer. Before a server holding older refs
+  is deployed with it, rebuild that table with the fold as it is.
+
 ### Seen, not reproduced
 
 - [ ] Through a proxy that dropped answers, a fork that synced cleanly then could not `nv git log`:
