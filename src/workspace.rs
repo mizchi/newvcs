@@ -1191,6 +1191,21 @@ pub struct Looked {
   pub unreadable: Vec<Vec<u8>>,
 }
 
+/// What is at `path` in the workspace, if it is a file (or a link) that can be read, and is not
+/// beyond a link; `Err` where that cannot be known.
+pub(crate) fn content_at(root: &Path, path: &[u8]) -> std::result::Result<Option<Content>, ()> {
+  if link_on_the_way(root, path).is_some() {
+    return Err(());
+  }
+  let full = root.join(to_path(path));
+  match std::fs::symlink_metadata(&full) {
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(_) => Err(()),
+    Ok(meta) if meta.is_dir() => Ok(None),
+    Ok(meta) => read_content(&full, &meta).map(Some).map_err(|_| ()),
+  }
+}
+
 fn read_content(path: &Path, meta: &std::fs::Metadata) -> Result<Content> {
   if meta.file_type().is_symlink() {
     let to = std::fs::read_link(path).map_err(|e| e.to_string())?;
