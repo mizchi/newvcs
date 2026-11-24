@@ -111,7 +111,9 @@ const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
 
   // The writer never heard back and sends it again: the same answer, and nothing lands twice.
   const again = await chain("main", [cat1, cat2]);
-  assert.deepEqual([again.status, again.commit, again.seq, again.commits], [moved.status, moved.commit, moved.seq, moved.commits]);
+  // `behind` included (twelfth round: 1 the first time, 0 when sent again).
+  assert.deepEqual([again.status, again.commit, again.seq, again.commits, again.behind], [moved.status, moved.commit, moved.seq, moved.commits, moved.behind]);
+  assert.ok((moved.behind ?? 0) > 0);
   assert.deepEqual(await get(`${name}/refs/main`), { tip: moved.commit, seq: 4 });
   assert.equal(((await get(`${name}/divergent/main`)) as unknown[]).length, 1);
   // The same for one taken as it was.

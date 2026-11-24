@@ -163,7 +163,12 @@ export class Repo extends DurableObject<Env> {
         const landed = new Uint8Array(before.landed);
         const seq = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, landed).toArray()[0]!.seq;
         const ids = sql.exec<{ id: ArrayBuffer }>("SELECT id FROM history WHERE ref = ? AND seq > ? AND seq <= ? ORDER BY seq", ref, seq - chain.length, seq).toArray();
-        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind: 0, since: since() };
+        // How far behind it was, as it was told the first time: from where its base was to where
+        // the chain was put (twelfth round: sent again, it was told 0).
+        const parent = first.parents[0];
+        const base = parent ? sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, parent).toArray()[0]?.seq : undefined;
+        const behind = before.moved && base !== undefined ? Math.max(0, seq - chain.length - base) : 0;
+        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind, since: since() };
       }
 
       const parent = first.parents[0] ?? null;
