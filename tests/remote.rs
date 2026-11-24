@@ -1730,6 +1730,17 @@ fn finishing_an_arrival_keeps_what_was_written_after_the_kill() {
   let (code, said) = run("bob", "$NV push .");
   assert_ne!(code, 0, "a file still holding both versions is not pushed: {said}");
   assert!(run("bob", "cat .nv/conflicts").1.contains("f.txt"), "and the sync still knows it left it so");
+  // Killed after it noted the file left with both versions and before the workspace stood on
+  // the new commit: the next sync finishes the arrival before it asks for the file to be
+  // settled, or nothing could ever finish it (`nv commit` waits for the sync).
+  run("bob", "$NV restore . before-sync >/dev/null");
+  run("ann", "sed -i 's/^ann-two$/ann-again/' f.txt && $NV commit . 'Ann again' >/dev/null && $NV push . >/dev/null");
+  let (tip, seq) = (field("pushed"), field("seq"));
+  run("bob", &format!("printf '{tip} {seq}\\n' > .nv/arriving && printf 'f.txt\\n' > .nv/conflicts"));
+  let (code, said) = run("bob", "$NV sync .");
+  assert_eq!(code, 1, "the arrival is finished, and the clash said: {said}");
+  assert!(run("bob", "ls .nv").1.lines().all(|f| f != "arriving"), "{said}");
+  assert!(run("bob", "grep -c '^<<<<<<< yours' f.txt").1.trim() == "1", "{said}");
 }
 
 /// A sync that clashes, killed at random moments, and finished by the next: wherever the kill

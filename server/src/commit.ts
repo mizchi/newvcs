@@ -143,7 +143,8 @@ function partOk(part: string): boolean {
 export function nameOk(name: Uint8Array): boolean {
   if (name.length === 0 || name.includes(0)) return false;
   try {
-    return partOk(utf8.decode(name));
+    const text = utf8.decode(name);
+    return partOk(text) && windowsOk(text);
   } catch {
     return false;
   }

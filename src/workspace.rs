@@ -1196,18 +1196,28 @@ pub struct Looked {
   pub unreadable: Vec<Vec<u8>>,
 }
 
-/// What is at `path` in the workspace, if it is a file (or a link) that can be read, and is not
-/// beyond a link; `Err` where that cannot be known.
-pub(crate) fn content_at(root: &Path, path: &[u8]) -> std::result::Result<Option<Content>, ()> {
+/// Why what is at a path is not known.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unknown {
+  /// Beyond a link: no file of this workspace's is there.
+  BeyondLink,
+  /// Something is there that is neither a file nor a link (a pipe, a device), or cannot be read.
+  Unreadable,
+}
+
+/// What is at `path` in the workspace: a file or a link, read; `None` where nothing is, or a
+/// directory. Nothing else is read: a pipe would be waited on for ever.
+pub(crate) fn content_at(root: &Path, path: &[u8]) -> std::result::Result<Option<Content>, Unknown> {
   if link_on_the_way(root, path).is_some() {
-    return Err(());
+    return Err(Unknown::BeyondLink);
   }
   let full = root.join(to_path(path));
   match std::fs::symlink_metadata(&full) {
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-    Err(_) => Err(()),
+    Err(_) => Err(Unknown::Unreadable),
     Ok(meta) if meta.is_dir() => Ok(None),
-    Ok(meta) => read_content(&full, &meta).map(Some).map_err(|_| ()),
+    Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => read_content(&full, &meta).map(Some).map_err(|_| Unknown::Unreadable),
+    Ok(_) => Err(Unknown::Unreadable),
   }
 }
 
@@ -3331,4 +3341,30 @@ pub fn fork(from: &Path, to: &Path) -> Result<()> {
   // The note of which directory the index is about, written last and saying "a copy": every file
   // of the fork changed, to the file system, before this did, and one that changes later is an edit.
   crate::write_whole(&to.join(META).join("index.root"), "a copy")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// What is at a path, for finishing an arrival: a file or a link is read, nothing else is (a
+  /// pipe would be waited on for ever), and what cannot be read is said apart from what is not
+  /// there (reviewed with the twelfth round's fixes).
+  #[test]
+  fn content_at_reads_files_and_links_and_nothing_else() {
+    let root = std::env::temp_dir().join(format!("nv-content-at-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::write(root.join("f"), b"text").unwrap();
+    std::os::unix::fs::symlink("f", root.join("l")).unwrap();
+    let fifo = std::ffi::CString::new(root.join("p").as_os_str().as_bytes()).unwrap();
+    // SAFETY: a path the test owns.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    assert_eq!(content_at(&root, b"f"), Ok(Some((0o100644, b"text".to_vec()))));
+    assert_eq!(content_at(&root, b"l"), Ok(Some((MODE_LINK, b"f".to_vec()))));
+    assert_eq!(content_at(&root, b"gone"), Ok(None));
+    assert_eq!(content_at(&root, b"d"), Ok(None));
+    assert_eq!(content_at(&root, b"p"), Err(Unknown::Unreadable));
+    let _ = std::fs::remove_dir_all(&root);
+  }
 }

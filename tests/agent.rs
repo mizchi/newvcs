@@ -1432,6 +1432,12 @@ fn a_commit_given_a_message_has_it_where_the_runner_committed_first() {
   assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "m.txt");
   ok(&dir, "echo 2 > m.txt && $NV commit . 'second message'");
   assert_eq!(ok(&dir, "$NV git log -2 --format=%s"), "second message\nmy message");
+  // A note for files committed under a message with a body joins its line and keeps the body.
+  ok(
+    &dir,
+    "echo 3 > m.txt && $NV checkpoint . >/dev/null 2>&1 && $NV commit . 'third\n\nIts body.' >/dev/null && $NV note . 'and more' >/dev/null",
+  );
+  assert_eq!(ok(&dir, "$NV git log -1 --format=%B"), "third; and more\n\nIts body.");
 }
 
 /// Where every state that passes is committed (`[commit] each`), `nv status` says that is what

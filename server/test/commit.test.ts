@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { conflicts, decode, encode, folded, hex, idOf, pathOk, pathsConflict, type Commit } from "../src/commit.ts";
+import { conflicts, decode, encode, folded, hex, idOf, nameOk, pathOk, pathsConflict, type Commit } from "../src/commit.ts";
 
 const text = (s: string) => new TextEncoder().encode(s);
 
@@ -49,6 +49,9 @@ test("names Windows takes for others are refused, or folded together", () => {
     assert.ok(!pathOk(text(name)), name);
   }
   for (const name of ["a:b", "a\\b", "...", "x.git", "git"]) assert.ok(pathOk(text(name)), name);
+  // A tree's entries as strictly as a commit's paths: a directory set whole is written where its names say.
+  for (const name of [".git:x", ".nv::$INDEX_ALLOCATION", "..\\x"]) assert.ok(!nameOk(text(name)), name);
+  for (const name of ["a:b", "a\\b"]) assert.ok(nameOk(text(name)), name);
   for (const [one, other] of [["a", "a::$DATA"], ["a", "a."], ["a", "a "], ["a", "A."], ["a", "a:b"], ["d/a", "d/a."]]) {
     assert.equal(folded(one!), folded(other!), `${one} and ${other}`);
   }

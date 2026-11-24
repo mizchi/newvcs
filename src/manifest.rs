@@ -55,7 +55,7 @@ pub fn fold_name(name: &[u8]) -> Vec<u8> {
   // To NTFS a name ends at a `:` (what follows names a stream of the file) and without the dots
   // and spaces at its end: `a`, `a.`, `a ` and `a::$DATA` are one file.
   let stem = name.split(|&b| b == b':').next().unwrap_or(name);
-  let trimmed = stem.iter().rposition(|&b| b != b'.' && b != b' ').map_or(stem, |last| &stem[..=last]);
+  let trimmed = stem.iter().rposition(|&b| b != b'.' && b != b' ').map_or(&stem[..0], |last| &stem[..=last]);
   let name = if trimmed.is_empty() { name } else { trimmed };
   match std::str::from_utf8(name) {
     Ok(text) if !name.is_ascii() => {
@@ -477,6 +477,8 @@ mod tests {
     }
     // `a:b` is a stream of the file `a` to NTFS: the same file.
     assert_eq!(fold_name(b"a:b"), fold_name(b"a"));
+    // A name that is dots and spaces up to its `:` is folded whole, as the server folds it.
+    assert_eq!(fold_name(b". :x"), b". :x".to_vec());
   }
 
   #[test]

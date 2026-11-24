@@ -394,9 +394,12 @@ fn union_statement(store: &mut Store, chain: &[Commit]) -> Result<(Option<String
 /// went through meanwhile. On a conflict nothing of the workspace changes
 /// and the error names the paths; the server has kept the commit aside.
 pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushed> {
-  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
+  // An arrival a kill cut short is finished first: what it would leave unsettled is known only
+  // once it is (killed after noting it, the workspace could otherwise never be moved again).
+  resume(store, ws, &url, author)?;
+  settled(ws)?;
   let mut done = Pushed::default();
   let known = find_place(store, ws, &url, &name)?;
   // The published commits the ref has not seen, oldest first. A ref that does
@@ -620,9 +623,16 @@ pub struct Synced {
 /// top. One request for the commits, and one for the contents of the files
 /// that changed inside the view, if any did.
 pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synced> {
-  settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
+  // An arrival a kill cut short is finished first, and where it leaves files with both versions,
+  // that is what this sync did.
+  if let Some(done) = resume(store, ws, &url, author)?
+    && !done.conflicts.is_empty()
+  {
+    return Ok(done);
+  }
+  settled(ws)?;
   let knew = ws.pushed;
   if !find_place(store, ws, &url, &name)? {
     return Ok(Synced::default());
@@ -798,20 +808,29 @@ fn folded_rest(store: &mut Store, last: Id, count: usize, common: Option<Id>) ->
 /// Finish an arrival that a killed process left half done. Its files may be
 /// partly written, so the disk is not looked at: what the workspace had
 /// recorded when that arrival began is what it brings along.
-fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Result<()> {
-  let Ok(text) = std::fs::read_to_string(arriving(ws)) else { return Ok(()) };
+fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Result<Option<Synced>> {
+  let Ok(text) = std::fs::read_to_string(arriving(ws)) else { return Ok(None) };
   let mut fields = text.split_whitespace();
   let tip = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok());
   let seq = fields.next().and_then(|seq| seq.parse().ok());
   match (tip, seq) {
-    (Some(id), Some(seq)) if store.get(&id)?.is_some() => arrive_from(store, ws, url, Tip { id, seq }, author, true).map(|_| ()),
-    _ => std::fs::remove_file(arriving(ws)).map_err(|e| e.to_string()),
+    // Killed after the workspace stood where the arrival went: done, all but the note of it.
+    // Worked out again from there, it would find nothing to settle and forget what is.
+    (Some(id), Some(seq)) if ws.pushed == Some(id) && ws.seq == seq => {
+      std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string())
+    }
+    (Some(id), Some(seq)) if store.get(&id)?.is_some() => arrive_from(store, ws, url, Tip { id, seq }, author, true).map(Some),
+    _ => std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string()),
   }
 }
 
 /// Move the workspace to `tip`, whose commits the store already has.
 fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str) -> Result<Synced> {
-  resume(store, ws, url, author)?;
+  if let Some(done) = resume(store, ws, url, author)?
+    && !done.conflicts.is_empty()
+  {
+    return Ok(done);
+  }
   arrive_from(store, ws, url, tip, author, false)
 }
 
@@ -1190,7 +1209,15 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
         Some(Outcome::Pending(wanted)) => Some((wanted.map_or(0, |e| e.mode), wanted.map(|e| e.id))),
         None => Some((new.map_or(0, |e| e.mode), new.map(|e| e.id))),
       };
-      if let (Ok(disk), Some(target)) = (workspace::content_at(&ws.root, &path), target) {
+      let disk = workspace::content_at(&ws.root, &path);
+      // What cannot be read may be the writer's, edited since: not written over, and said.
+      if disk == Err(workspace::Unknown::Unreadable) {
+        return Err(format!(
+          "{} cannot be read, and may have been written since a sync was cut short: nothing more is written until it can be",
+          name(&path)
+        ));
+      }
+      if let (Ok(disk), Some(target)) = (disk, target) {
         let disk_id = disk.as_ref().map(|(mode, bytes)| (*mode, crate::store::object_id(Kind::Blob, bytes)));
         let is = |entry: Option<(u32, Option<Id>)>| match (entry, disk_id) {
           (Some((_, None)), None) => true,
@@ -1216,8 +1243,11 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
             Some((mode, bytes)) => Some(Entry { mode: *mode, id: store.put(Kind::Blob, bytes, on_disk.map(|e| e.id))? }),
             None => None,
           };
+          // Text is merged; a link is not, and its target is never written through.
           let merged = match (ours, wanted) {
-            (Some(ours), Some(theirs)) => three_way(store, &path, on_disk, ours, theirs)?,
+            (Some(ours), Some(theirs)) if ours.mode != crate::manifest::MODE_LINK && theirs.mode != crate::manifest::MODE_LINK => {
+              three_way(store, &path, on_disk, ours, theirs)?
+            }
             _ => None,
           };
           match merged {
@@ -1232,7 +1262,11 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
             }
             // Both changed the same lines: both versions, as a sync leaves them, for a person.
             Some((text, false, _)) => {
-              std::fs::write(ws.root.join(workspace::to_path(&path)), text).map_err(|e| e.to_string())?;
+              let file = ws.root.join(workspace::to_path(&path));
+              if std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+              }
+              std::fs::write(&file, text).map_err(|e| e.to_string())?;
               match new {
                 Some(new) => index.insert(path.clone(), crate::index::Indexed { entry: new, size: 0, mtime: 0, ctime: 0 }),
                 None => index.remove(&path),
@@ -1257,6 +1291,10 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
         let file = ws.root.join(workspace::to_path(&path));
         if let Some(parent) = file.parent() {
           std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // A link standing there makes way: the text is never written through it.
+        if std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+          std::fs::remove_file(&file).map_err(|e| e.to_string())?;
         }
         std::fs::write(&file, text).map_err(|e| e.to_string())?;
         // The text is for a person to settle; the mode is settled already, and is on the file.

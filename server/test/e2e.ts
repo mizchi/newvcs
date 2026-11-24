@@ -114,6 +114,14 @@ const get = async (path: string) => (await fetch(`${server}/${path}`)).json();
   // `behind` included (twelfth round: 1 the first time, 0 when sent again).
   assert.deepEqual([again.status, again.commit, again.seq, again.commits, again.behind], [moved.status, moved.commit, moved.seq, moved.commits, moved.behind]);
   assert.ok((moved.behind ?? 0) > 0);
+  // And one with no parent, which is put on the tip as if from the ref's start.
+  const orphans = `${name}-orphan`;
+  await push(orphans, "main", commit(null, ["start.txt"], "start"));
+  const orphan = commit(null, ["orphan.txt"], "orphan");
+  const orphanFirst = await push(orphans, "main", orphan);
+  const orphanAgain = await push(orphans, "main", orphan);
+  assert.equal(orphanFirst.status, "rebased");
+  assert.deepEqual([orphanAgain.commit, orphanAgain.behind], [orphanFirst.commit, orphanFirst.behind]);
   assert.deepEqual(await get(`${name}/refs/main`), { tip: moved.commit, seq: 4 });
   assert.equal(((await get(`${name}/divergent/main`)) as unknown[]).length, 1);
   // The same for one taken as it was.

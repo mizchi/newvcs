@@ -147,6 +147,17 @@ fn each_run_is_of_the_conditions_its_state_declares() {
   let committed = ok(&dir, "for c in $($NV git log --format=%h); do $NV git show $c:nv.toml; done");
   assert!(!committed.contains("false"), "a state that declares `false` was committed as passing:\n{committed}");
   assert_eq!(code_of(&dir, "$NV checkpoint . 2>&1").0, 1);
+  // A state that declares no conditions at all, `nv.toml` gone, declares no commits either: it
+  // is not committed under what the runner began with.
+  let gone = workspace("declared-none", "[checks.unit]\nrun = \"sleep 1; true\"\n\n[commit]\neach = true\n");
+  let before = ok(&gone, "$NV git log --format=%h | wc -l");
+  ok(
+    &gone,
+    "echo b > b.txt && { $NV checkpoint . --until-still >runner.out 2>&1 & pid=$!; } && sleep 0.4 && rm nv.toml && echo c > c.txt && wait $pid",
+  );
+  let committed = ok(&gone, "for c in $($NV git log --format=%h); do $NV git show --name-only --format= $c; done");
+  assert!(!committed.contains("c.txt"), "a state with no nv.toml was committed:\n{committed}");
+  let _ = before;
 }
 
 #[test]

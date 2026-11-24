@@ -16,3 +16,7 @@ git add -A && git commit -q -m untrack
 echo '== committed'; git show --name-status --format=%s HEAD; git status --porcelain; ls
 mkdir -p d && echo x > d/x && git add d && git commit -q -m d && git rm -r -q --cached d && echo d/ >> .gitignore
 echo '== an ignored directory'; git status --porcelain
+# Let go of and ignored as well, it is still not reset --hard's to remove.
+git add -A && git commit -q -m gitignore && echo s > s.log && git add s.log && git commit -q -m slog
+git rm -q --cached s.log && echo s.log >> .gitignore && echo more >> s.log
+echo '== ignored and let go'; git reset -q --hard HEAD~1; echo "exit $?"; cat s.log; git status --porcelain
