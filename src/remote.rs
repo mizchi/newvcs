@@ -614,6 +614,7 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   settled(ws)?;
   let (url, name) = remote_of(ws)?;
   let (url, name) = (url.to_string(), name.to_string());
+  let knew = ws.pushed;
   if !find_place(store, ws, &url, &name)? {
     return Ok(Synced::default());
   }
@@ -625,6 +626,23 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   let answer = json(&answer)?;
   let tip = Tip { id: id_of(&answer["tip"])?, seq: answer["seq"].as_u64().unwrap_or(0) };
   if Some(tip.id) == ws.pushed {
+    // Nothing came, though the workspace may have learnt where it stands: kept. And a push not
+    // heard back from whose last commit the ref has, landed.
+    if ws.pushed != knew {
+      ws.save()?;
+    }
+    if let Some((_, last)) = workspace::unheard_push(ws) {
+      let mut at = Some(tip.id);
+      let mut walked = 0;
+      while let Some(id) = at.filter(|_| walked < 10_000) {
+        if id == last {
+          let _ = std::fs::remove_file(workspace::unheard(ws));
+          break;
+        }
+        at = Commit::load(store, &id)?.parents.first().copied();
+        walked += 1;
+      }
+    }
     return Ok(Synced::default());
   }
   let commits = take_commits(store, &url, &answer)?;

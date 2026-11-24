@@ -573,6 +573,19 @@ fn run(args: &[String]) -> Result<()> {
       if let Some(settled) = SETTLED.get() {
         println!("{settled}");
       }
+      // The last push was not heard back from, and may have landed: where the workspace stands is
+      // found out first, as `nv sync` finds it, so that nothing is made again that the ref has.
+      if workspace::unheard_push(&ws).is_some() {
+        let synced = remote::sync(&mut store, &mut ws, AUTHOR)?;
+        println!("{}", describe(&synced, &ws.root));
+        if !synced.conflicts.is_empty() {
+          eprintln!("nv: settle those files, then `nv publish` again");
+          std::process::exit(1);
+        }
+        if workspace::unheard_push(&ws).is_some() {
+          return Err("the last push from this workspace was not heard back from, and the ref does not say whether it landed: `nv push <dir>` sends it again".to_string());
+        }
+      }
       let chain = workspace::pending(&mut store, &ws)?;
       if chain.is_empty() {
         println!("nothing to publish: every commit made here is pushed");

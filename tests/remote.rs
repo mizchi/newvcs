@@ -1799,3 +1799,71 @@ fn a_clashing_sync_killed_anywhere_still_knows_what_it_left_unsettled() {
   }
   assert!(unsettled_seen > 0, "no round left a file unsettled: the test tried nothing");
 }
+
+/// A push whose answer was never heard (a publish killed after the push landed): `nv publish`
+/// finds out where it stands and goes on, and a sync that finds the ref at the workspace's own
+/// last commit says the push landed. (Twelfth round: every later publish and note was refused,
+/// and the sync said nothing came.) The kill is made here as it leaves things.
+#[test]
+fn a_publish_after_a_push_never_heard_finds_where_it_stands() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-unheard-publish");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/unheard-publish-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && echo start > a && printf '[checks.unit]\nrun = "true"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ws >/dev/null && {nv} remote ws {url} main
+      (cd ws && {nv} push . >/dev/null)
+      "##
+    ),
+  );
+  let run = |script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join("ws"))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", "dev")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "dev")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  // Made again and pushed; the push lands, and its answer is lost: the workspace is as it was
+  // before the push, with the note a push leaves until it hears back.
+  let unheard = |name: &str| {
+    run(&format!(
+      "echo {name} > {name} && $NV checkpoint . >/dev/null 2>&1 && $NV rebuild . 1 'Add {name}' >/dev/null && cp .nv/workspace ../before"
+    ));
+    let base = run("sed -n 's/^base //p' .nv/workspace").1.trim().to_string();
+    let (code, said) = run("$NV push .");
+    assert_eq!(code, 0, "{said}");
+    run(&format!("cp ../before .nv/workspace && printf '1 {base}\\n' > .nv/pushing"));
+  };
+  unheard("b");
+  let (code, said) = run("echo c > c && $NV note . 'Add c' >/dev/null; $NV checkpoint . >/dev/null 2>&1; $NV publish .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("$NV git log --format=%s -3").1, "Add c\nAdd b\nseed\n", "{said}");
+  assert!(run("ls .nv").1.lines().all(|f| f != "pushing"), "the push is known to have landed");
+  // Pointed at the ref anew, the workspace locates itself on it: the ref's tip is its own last
+  // commit, and the sync says the push landed rather than leaving everything refused.
+  unheard("d");
+  let (code, said) = run(&format!("$NV remote . {url} main && $NV sync ."));
+  assert_eq!(code, 0, "{said}");
+  assert!(run("ls .nv").1.lines().all(|f| f != "pushing"), "the sync found the push on the ref: {said}");
+  let (code, said) = run("$NV pending .");
+  assert!(code == 0 && said.starts_with("nothing committed here that is not pushed"), "{said}");
+}
