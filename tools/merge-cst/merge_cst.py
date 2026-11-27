@@ -38,7 +38,96 @@ class Conflict(Exception):
     pass
 
 
+# Lean, with no grammar: a file is a list of commands, each beginning at the start of a line
+# with one of these words (or a doc comment or an attribute that goes with the next), and known
+# by its kind and the name it declares.
+LEAN_COMMANDS = (
+    "theorem", "lemma", "def", "abbrev", "instance", "structure", "inductive", "class", "example",
+    "axiom", "opaque", "namespace", "section", "end", "open", "variable", "universe", "set_option",
+    "import", "noncomputable", "private", "protected", "partial", "unsafe", "macro", "syntax",
+    "notation", "infix", "infixl", "infixr", "prefix", "postfix", "attribute", "deriving", "mutual",
+    "termination_by", "#eval", "#check", "#print",
+)
+LEAN_MODIFIERS = {"noncomputable", "private", "protected", "partial", "unsafe"}
+LEAN_NAMED = {"theorem", "lemma", "def", "abbrev", "instance", "structure", "inductive", "class", "axiom", "opaque"}
+
+
+class LeanParser:
+    """Stands for a tree-sitter parser where there is no grammar: `units` is all it is used for."""
+
+
+def lean_starts(line):
+    if line.startswith(("/--", "@[")):
+        return True
+    word = line.split(None, 1)[0] if line.strip() else ""
+    return word in LEAN_COMMANDS
+
+
+def lean_units(src):
+    text = src.decode("utf-8", "surrogateescape")
+    lines = text.splitlines(keepends=True)
+    out, current, pending = [], [], []
+    # A doc comment or attribute, and blank lines, wait for the command they go with.
+
+    def flush():
+        if current:
+            body = "".join(current)
+            out.append(body)
+            current.clear()
+
+    in_doc = False
+    for line in lines:
+        if in_doc:
+            pending.append(line)
+            if "-/" in line:
+                in_doc = False
+            continue
+        if line.startswith("/--") or line.startswith("@["):
+            flush()
+            pending.append(line)
+            in_doc = line.startswith("/--") and "-/" not in line
+            continue
+        if not line.strip() or line.startswith("--"):
+            # Blank lines and comments go with what is before them, or wait with a doc comment.
+            (pending if pending else current).append(line)
+            continue
+        if lean_starts(line):
+            flush()
+            current.extend(pending)
+            pending.clear()
+            current.append(line)
+        else:
+            current.extend(pending)
+            pending.clear()
+            current.append(line)
+    current.extend(pending)
+    flush()
+    units, seen = [], {}
+    for body in out:
+        key = lean_key(body)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            key = f"{key}#{seen[key]}"
+        units.append(Unit(key, body, "lean-command"))
+    return units
+
+
+def lean_key(body):
+    for line in body.splitlines():
+        if not line.strip() or line.startswith(("--", "/--", "@[", " ", "\t")) or line.rstrip().endswith("-/"):
+            continue
+        words = line.split()
+        while words and words[0] in LEAN_MODIFIERS:
+            words = words[1:]
+        if len(words) >= 2 and words[0] in LEAN_NAMED:
+            return f"{words[0]}:{words[1]}"
+        return "text:" + body.strip()
+    return "text:" + body.strip()
+
+
 def parser_for(path):
+    if os.path.splitext(path)[1].lower() == ".lean":
+        return LeanParser(), "lean"
     try:
         from tree_sitter import Language, Parser
     except ImportError:
@@ -245,6 +334,9 @@ def merge_units(base, ours, theirs):
 
 
 def merge_source(parser, language, base, ours, theirs):
+    if language == "lean":
+        parts = [lean_units(v) for v in (base, ours, theirs)]
+        return "".join(u.render() for u in merge_units(*parts)).encode("utf-8", "surrogateescape")
     trees = [parser.parse(v) for v in (base, ours, theirs)]
     if any(tree.root_node.has_error for tree in trees):
         raise Conflict("a version does not parse")
