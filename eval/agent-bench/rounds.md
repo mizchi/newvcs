@@ -177,6 +177,7 @@ by `tools/merge-cst`. 11 acceptance tests. nv at 3c58494 (short `nv help`).
 | nv | 3 | 121.1, 127.2, 134.1 | 1.50 to 1.56 | 43 to 45 | 4 each | 1 each | 1 each |
 | nv, a commit of clashed files alone kept (0a48480) | 3 | **105.1, 110.1, 117.1** | 1.45 to 1.70 | 40 to 50 | 3 to 7 | 0 to 1 | **0** |
 | nv, Git's verbs toward the ref (99416be) | 3 | **91.0, 91.1, 103.1** | 1.38 to 1.54 | 37 to 45 | 3 to 6 | 0 | 0 |
+| nv-git: the Git prompt, `git` being nv's (b929317) | 3 | 88.0, 95.0, 101.1 | 1.37 to 1.49 | 40 to 46 | 2 to 5 | 0 | 0 |
 | supervisor | 1 | 200.2 | 1.89 | 53 | 3 | 0 | 0 |
 | parallel | 1 | 190.3 | 2.55 | 60 | 4 | 3 | 1 |
 
@@ -209,6 +210,15 @@ reference: the longest a developer took was 134 s.
   quicker (91 to 103 s, median 91, against Git's 111 to 113) and a little cheaper (mean 1.47
   against 1.54 before, Git 1.37), with 10 or 11 commits as Git's; none of it is from the verbs,
   and three rounds do not separate it from the order pushes arrived in.
+- **Given the Git prompt, with `git` on the path being nv's** (pattern `nv-git`, the Git
+  writers' prompt but for a line saying whose `git` it is), no writer looked nv up: 0 lookups,
+  against 3 to 5 a round. They committed, pushed and pulled with `--rebase` as Git's writers do
+  (`git rebase --continue`, made to finish a stopped pull, went unused: each settled by a commit).
+  The turns went instead to Git commands nv does not speak, each refused and tried again
+  otherwise: `commit` with a second `-m` (7 times in three rounds), `commit -F` from a file or
+  standard input (6), `diff` of a path named without `--` and `diff --diff-filter=U` (5), and
+  `fetch` toward the ref (4, refused by design). The rounds were as quick as nv's (median 95 s,
+  Git's 113) at what nv's cost (mean 1.45, nv's 1.47, Git's 1.37).
 
 ## Counting Git's refusals
 
