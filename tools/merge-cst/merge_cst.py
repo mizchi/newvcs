@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""merge_cst.py: a Git merge driver that merges by the syntax tree, for Python and Markdown.
+
+    git config merge.cst.driver 'python3 tools/merge-cst/merge_cst.py %O %A %B %P %X %Y %L'
+    echo '*.py merge=cst' >> .gitattributes        # nv git config ... for an nv workspace
+
+Each version is parsed with tree-sitter and cut into units: a Python module into its top-level
+statements, a Markdown document into its sections, and a section into its heading, blocks and
+the sections under it, a list into its items. A unit is known by a key (the name a definition
+or a class defines, a heading's text, an item's or a statement's own text), and the three
+versions are merged unit by unit:
+
+- what one side changed and the other did not is taken from the side that changed it;
+- what both removed, or one removed and the other left as it was, is removed;
+- what both inserted at one place is kept, ours first, theirs after;
+- a unit both changed is merged within, where it is of a kind that has units (a section, a
+  list); otherwise it is a conflict.
+
+Where anything is a conflict, or a version does not parse, or is of a language it does not
+know, it does what Git would do without it: `git merge-file` (both versions between markers,
+named %X and %Y), exit 1. Where Git is not there either, it leaves %A as it was and exits 1, for
+the caller's own merge (`nv sync` merges as text where a driver leaves no markers).
+
+It assumes what it merges is checked afterwards: two units inserted at one place, or one side's
+change to a unit the other moved, can be wrong together though each was right. Where the tests
+run on what a sync made (`auto` in nv.toml) and a commit is made only of a state they pass on,
+what this driver gets wrong is caught there.
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+EXIT_CLEAN, EXIT_CONFLICT = 0, 1
+
+
+class Conflict(Exception):
+    pass
+
+
+def parser_for(path):
+    try:
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return None, None
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".py":
+            import tree_sitter_python as grammar
+
+            return Parser(Language(grammar.language())), "python"
+        if ext in (".md", ".markdown"):
+            import tree_sitter_markdown as grammar
+
+            return Parser(Language(grammar.language())), "markdown"
+    except ImportError:
+        return None, None
+    return None, None
+
+
+class Unit:
+    """A span of the source, the gap before it included, with a key and, where it has them,
+    units of its own."""
+
+    def __init__(self, key, text, kind, parts=None, head="", tail=""):
+        self.key, self.text, self.kind, self.parts, self.head, self.tail = key, text, kind, parts, head, tail
+
+    def render(self):
+        if self.parts is None:
+            return self.text
+        return self.head + "".join(p.render() for p in self.parts) + self.tail
+
+
+def node_text(src, node):
+    return src[node.start_byte : node.end_byte].decode("utf-8", "surrogateescape")
+
+
+def python_key(src, node):
+    kind = node.type
+    inner = node
+    if kind == "decorated_definition":
+        inner = node.child_by_field_name("definition") or node
+    if inner.type in ("function_definition", "class_definition"):
+        name = inner.child_by_field_name("name")
+        return f"{inner.type}:{node_text(src, name)}"
+    if kind == "expression_statement" and node.named_child_count == 1 and node.named_children[0].type == "assignment":
+        left = node.named_children[0].child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            return f"assign:{node_text(src, left)}"
+    return f"{kind}:{node_text(src, node).strip()}"
+
+
+def markdown_key(src, node):
+    if node.type == "section":
+        heading = next((c for c in node.children if c.type in ("atx_heading", "setext_heading")), None)
+        return "section:" + (node_text(src, heading).strip() if heading else "")
+    if node.type == "list":
+        return "list"
+    return f"{node.type}:{node_text(src, node).strip()}"
+
+
+# Units that are one of many alike, which two sides may each replace with their own.
+COLLECTION_ITEMS = {"list_item"}
+
+# Which Markdown nodes are merged within: their children are units.
+MARKDOWN_WITHIN = {"document", "section", "list"}
+
+
+def units(src, node, language, start, end):
+    """The children of `node` as units, each with the gap before it, between `start` and `end`."""
+    out, at, seen = [], start, {}
+    key_of = python_key if language == "python" else markdown_key
+    for child in node.children:
+        if child.end_byte <= at:
+            continue
+        key = key_of(src, child)
+        # Keys are unique among siblings: a second of the same is known by its place among them.
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            key = f"{key}#{seen[key]}"
+        text_start = at
+        child_end = child.end_byte
+        if language == "markdown" and child.type in MARKDOWN_WITHIN:
+            parts = units(src, child, language, child.start_byte, child.end_byte)
+            head = src[text_start : child.start_byte].decode("utf-8", "surrogateescape")
+            unit = Unit(key, src[text_start : child.end_byte].decode("utf-8", "surrogateescape"), child.type, parts, head=head)
+        else:
+            end_at = child.end_byte
+            if child.type in COLLECTION_ITEMS:
+                # Blank lines after an item are the list's, not the item's: an item put in after
+                # it would bring them along twice.
+                while end_at - 2 >= text_start and src[end_at - 1 : end_at] == b"\n" and src[end_at - 2 : end_at - 1] == b"\n":
+                    end_at -= 1
+            unit = Unit(key, src[text_start:end_at].decode("utf-8", "surrogateescape"), child.type)
+            child_end = end_at
+        out.append(unit)
+        at = child_end if not (language == "markdown" and child.type in MARKDOWN_WITHIN) else child.end_byte
+    if at < end:
+        out.append(Unit("<tail>", src[at:end].decode("utf-8", "surrogateescape"), "<tail>"))
+    return out
+
+
+def merge_units(base, ours, theirs):
+    """Three-way merge of sibling units, by key."""
+    b = {u.key: u for u in base}
+    o = {u.key: u for u in ours}
+    t = {u.key: u for u in theirs}
+
+    def same(x, y):
+        return x.render() == y.render()
+
+    def merged(key):
+        x, y, z = b.get(key), o.get(key), t.get(key)
+        if x is not None:
+            if y is None and z is None:
+                return None
+            if y is None:
+                if same(z, x):
+                    return None
+                raise Conflict(f"ours removed {key}, theirs changed it")
+            if z is None:
+                if same(y, x):
+                    return None
+                raise Conflict(f"theirs removed {key}, ours changed it")
+            if same(y, x):
+                return z
+            if same(z, x) or same(y, z):
+                return y
+            return within(x, y, z)
+        # New on one side or both.
+        if y is not None and z is not None:
+            return y if same(y, z) else within(None, y, z)
+        return y if y is not None else z
+
+    def within(x, y, z):
+        if y.parts is None or z.parts is None or y.kind != z.kind or (x is not None and x.parts is None):
+            raise Conflict(f"both changed {y.key}")
+        parts = merge_units(x.parts if x is not None else [], y.parts, z.parts)
+        return Unit(y.key, None, y.kind, parts, head=y.head, tail=y.tail)
+
+    # A unit known by its own text that both sides took out and put something else in the place
+    # of is a unit both changed, unless it is one item of many (a list's): a conflict.
+    base_keys = [u.key for u in base]
+
+    def anchor(side, i):
+        while i > 0:
+            i -= 1
+            if side[i].key in b:
+                return side[i].key
+        return None
+
+    def replaced(side, keys):
+        put = {}
+        for i, u in enumerate(side):
+            if u.key not in b:
+                put.setdefault(anchor(side, i), []).append(u.render())
+        out = {}
+        for j, k in enumerate(base_keys):
+            if k in keys:
+                continue
+            before = next((base_keys[m] for m in range(j - 1, -1, -1) if base_keys[m] in keys), None)
+            if before in put:
+                out[k] = put[before]
+        return out
+
+    by_ours, by_theirs = replaced(ours, o), replaced(theirs, t)
+    for k, unit in b.items():
+        # Blank space between units goes with the unit after it, and moves as they are put in.
+        if unit.kind in COLLECTION_ITEMS or not unit.render().strip() or k not in by_ours or k not in by_theirs:
+            continue
+        if by_ours[k] != by_theirs[k]:
+            raise Conflict(f"both replaced {k}")
+
+    # Ours in order, then each of theirs new to both others placed after the unit before it in
+    # theirs, past what ours inserted at that place.
+    out = []
+    for u in ours:
+        m = merged(u.key)
+        if m is not None:
+            out.append((u.key, m))
+    keys = [k for k, _ in out]
+    ours_new = {u.key for u in ours if u.key not in b and u.key not in t}
+    previous = None
+    for u in theirs:
+        if u.key in o:
+            previous = u.key
+            continue
+        m = merged(u.key)
+        if m is None:
+            continue
+        if u.key in b:
+            # Ours removed it and theirs left it: removed (merged gave None) or a conflict.
+            previous = u.key
+            continue
+        at = keys.index(previous) + 1 if previous in keys else 0
+        while at < len(keys) and keys[at] in ours_new:
+            at += 1
+        # The tail stays last.
+        if at == len(keys) or (at > 0 and keys[at - 1] == "<tail>"):
+            at = keys.index("<tail>") if "<tail>" in keys else len(keys)
+        out.insert(at, (u.key, m))
+        keys.insert(at, u.key)
+        previous = u.key
+    return [m for _, m in out]
+
+
+def merge_source(parser, language, base, ours, theirs):
+    trees = [parser.parse(v) for v in (base, ours, theirs)]
+    if any(tree.root_node.has_error for tree in trees):
+        raise Conflict("a version does not parse")
+    parts = [units(v, tree.root_node, language, 0, len(v)) for v, tree in zip((base, ours, theirs), trees)]
+    return "".join(u.render() for u in merge_units(*parts)).encode("utf-8", "surrogateescape")
+
+
+def fall_back(a, o, b, labels, size):
+    git = shutil.which("git")
+    if git is None:
+        return EXIT_CONFLICT
+    with open(a, "rb") as f:
+        ours = f.read()
+    out = subprocess.run(
+        [git, "merge-file", "-p", f"--marker-size={size}", "-L", labels[0], "-L", "base", "-L", labels[1], a, o, b],
+        capture_output=True,
+    )
+    if out.returncode < 0 or out.returncode > 127:
+        return EXIT_CONFLICT
+    with open(a, "wb") as f:
+        f.write(out.stdout if out.stdout or not ours else ours)
+    return EXIT_CLEAN if out.returncode == 0 else EXIT_CONFLICT
+
+
+def main(argv):
+    if len(argv) < 4:
+        print(__doc__.split("\n")[0], file=sys.stderr)
+        return 2
+    o, a, b, path = argv[:4]
+    labels = (argv[4] if len(argv) > 4 else "ours", argv[5] if len(argv) > 5 else "theirs")
+    size = argv[6] if len(argv) > 6 else "7"
+    parser, language = parser_for(path)
+    if parser is not None:
+        try:
+            versions = []
+            for f in (o, a, b):
+                with open(f, "rb") as h:
+                    versions.append(h.read())
+            result = merge_source(parser, language, *versions)
+            with open(a, "wb") as h:
+                h.write(result)
+            return EXIT_CLEAN
+        except Conflict as why:
+            if os.environ.get("MERGE_CST_VERBOSE"):
+                print(f"merge_cst: {path}: {why}; merging as text", file=sys.stderr)
+    return fall_back(a, o, b, labels, size)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -35,6 +35,10 @@ implementation the acceptance tests pass on, which checks the tests, not the age
 `strkit-union` is `strkit` with `merge=union` for every file the parts meet in: what is left of
 the work when no clash needs settling.
 
+`strkit-cst` is `strkit` with `errors.py`, the README and the changelog merged by
+`tools/merge-cst` (`merge=cst`), defined in every workspace or clone; `--python` names a Python
+with `tree-sitter`, `tree-sitter-python` and `tree-sitter-markdown`.
+
 `strkit` has four parts, independent in code (durations, Roman numerals, versions, templates)
 and meeting in five files: the package's `__init__.py` (a union), `errors.py`, the README's list
 of functions and its sections, and the changelog. Its 28 acceptance tests are each part's

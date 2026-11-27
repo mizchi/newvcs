@@ -309,6 +309,11 @@ all of Git has it by keeping Git in the directory.
   is not believed to have left something to settle by, and the file is
   merged as text instead. The server runs no driver: a push that the ref
   clashes with on such a path is refused, and the sync runs it.
+  `tools/merge-cst` is one such driver, optional and outside nv: it merges
+  Python and Markdown by their syntax trees (tree-sitter), unit by unit
+  (top-level statements, sections, list items), and merges as text, with
+  markers, whatever it cannot decide. It assumes what it merged is tested
+  afterwards, as the conditions behind writes test what a sync made.
   Line endings are read as Git does with `core.autocrlf` unset on a
   system whose line ending is LF. Filters, `ident` and
   `working-tree-encoding` are not applied. A file under `text=auto` that

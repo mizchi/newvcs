@@ -94,6 +94,7 @@ class Round:
             sh(["git", "push", "-q", str(w / "origin.git"), "main"], seed, e)
             for i, d in enumerate(self.dirs(), 1):
                 sh(["git", "clone", "-q", str(w / "origin.git"), d.name], w, e)
+            self.drivers(lambda d, key, value: sh(["git", "config", key, value], d, e))
             return
         self.url = f"{self.a.server.rstrip('/')}/bench/{self.task['name']}-{time.time_ns()}"
         sh([self.nv, "git", "clone", "-q", "seed", "base"], w, e)
@@ -104,6 +105,22 @@ class Round:
             if self.a.pattern in ("supervisor", "parallel"):
                 sh([self.nv, "watch", d.name, "--start"], w, e)
         sh([self.nv, "fork", "base", "observer"], w, e)
+        self.drivers(lambda d, key, value: sh([self.nv, "git", "config", key, value], d, e))
+
+    # The merge drivers the task's attributes name, defined in every workspace or clone, as the
+    # configuration of whoever merges (never the repository's): a copy of the tools, so that a
+    # change made while the round runs does not change it.
+    def drivers(self, define):
+        drivers = self.task.get("drivers", {})
+        if not drivers:
+            return
+        tools = self.work / "tools"
+        if not tools.exists():
+            shutil.copytree(HERE.parent.parent / "tools" / "merge-cst", tools / "merge-cst", ignore=shutil.ignore_patterns("__pycache__", "test_*"))
+        for name, command in drivers.items():
+            line = fill(command, {"PYTHON": self.a.python, "TOOLS": str(tools)})
+            for d in self.dirs():
+                define(d, f"merge.{name}.driver", line)
 
     def prompts(self):
         common, test = self.task["common"], self.task["test"]
@@ -272,6 +289,7 @@ def main():
     p.add_argument("--out", required=True, help="the TSV a row is appended to")
     p.add_argument("--label", default="", help="what to call this binary in the results")
     p.add_argument("--model", default="")
+    p.add_argument("--python", default=sys.executable, help="the Python a task's merge drivers run with (one with tree-sitter for merge-cst)")
     p.add_argument("--dry", action="store_true", help="set up and read the ref, with no agents: to try the harness")
     p.add_argument("--timeout", type=int, default=2400, help="seconds before every agent still running is stopped")
     a = p.parse_args()
