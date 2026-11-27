@@ -114,6 +114,15 @@ class Markdown(unittest.TestCase):
         code, step = merge("README.md", first, ours, step)
         self.assertEqual(step, want)
 
+    def test_items_ticked_after_all_of_ours_stay_after_them(self):
+        base = "# p\n\n" + "".join(f"- [ ] `t{i}`\n" for i in range(1, 8)) + "\n## Building\n"
+        tick = lambda text, *ns: [text := text.replace(f"- [ ] `t{n}`", f"- [x] `t{n}`") for n in ns][-1]
+        code, out = merge("README.md", base, tick(base, 1, 2, 3), tick(base, 4, 5))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, tick(base, 1, 2, 3, 4, 5))
+        code, out = merge("README.md", base, tick(base, 4, 5), tick(base, 1, 2, 3))
+        self.assertEqual(out, tick(base, 1, 2, 3, 4, 5))
+
     def test_changelog_lines_from_both(self):
         ours = CHANGELOG + "- Add strkit.parse_duration.\n- Add strkit.format_duration.\n"
         theirs = CHANGELOG + "- Add strkit.render.\n"

@@ -300,40 +300,31 @@ def merge_units(base, ours, theirs):
         if by_ours[k] != by_theirs[k]:
             raise Conflict(f"both replaced {k}")
 
-    # Ours in order, then each of theirs new to both others placed after its anchor (the unit of
-    # the base it follows in theirs), past what either side put in after that same anchor: what
-    # ours put in elsewhere stays where ours put it.
-    out = []
-    for u in ours:
+    # Every unit in the order of the base: a unit of the base where it was, one put in after the
+    # unit of the base it follows on its side (its anchor), ours before theirs where both put
+    # something after the same one, each side's in its own order. A unit one side moved goes back
+    # to where the base had it.
+    place = {k: i for i, k in enumerate(base_keys)}
+
+    def after_anchor(side, i, rank):
+        a = anchor(side, i)
+        return (place[a] + 1 if a is not None else 0, rank, i)
+
+    placed = []
+    for i, u in enumerate(ours):
         m = merged(u.key)
         if m is not None:
-            out.append((u.key, m))
-    keys = [k for k, _ in out]
-    ours_new = {u.key for u in ours if u.key not in b and u.key not in t}
-    anchored = {u.key: anchor(ours, i) for i, u in enumerate(ours) if u.key in ours_new}
+            placed.append(((place[u.key], 2, i) if u.key in b else after_anchor(ours, i, 0), m))
     for i, u in enumerate(theirs):
         if u.key in o or u.key in b:
             # Theirs of a unit ours has too, or one ours removed: merged above, or removed.
             continue
         m = merged(u.key)
-        if m is None:
-            continue
-        at_anchor = anchor(theirs, i)
-        at = 0
-        # The anchor, or the nearest unit of the base before it still there.
-        for k in [at_anchor] + ([] if at_anchor is None else base_keys[: base_keys.index(at_anchor)][::-1]):
-            if k is not None and k in keys:
-                at = keys.index(k) + 1
-                break
-        while at < len(keys) and keys[at] in anchored and anchored[keys[at]] == at_anchor:
-            at += 1
-        # The tail stays last.
-        if "<tail>" in keys and at > keys.index("<tail>"):
-            at = keys.index("<tail>")
-        out.insert(at, (u.key, m))
-        keys.insert(at, u.key)
-        anchored[u.key] = at_anchor
-    return [m for _, m in out]
+        if m is not None:
+            placed.append((after_anchor(theirs, i, 1), m))
+    # What follows the last unit stays last.
+    placed.sort(key=lambda p: (p[1].key == "<tail>", p[0]))
+    return [m for _, m in placed]
 
 
 def merge_source(parser, language, base, ours, theirs):
