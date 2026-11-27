@@ -387,6 +387,45 @@ reviewer reading for maintenance counted against the message, for want of saying
 Not done: a trailer that says what it is (in Git's own words, a conflict and its resolution),
 and a judge given that history again.
 
+## Round 17 (2026-11-27): one supervisor for every developer, made to clash
+
+The pattern of a supervisor in the manner of tj-loop, given the commits as well: one agent
+(`supervisor.md`) reads the three tasks before anyone starts, tells each developer what will keep
+their work apart (`nv tell`, read by the developer with `nv inbox` and in the answer to
+`nv note`), writes a ready file, and only then are the developers (`worker-supervised.md`: the
+noting developer of C+D, who also reads what it is told) started. As each finishes, the
+supervisor makes its commits again, pushes, syncs and settles where the ref moved, and notes the
+time. No body hook: it writes the messages. `CONFLICT=1`, as rounds 12 to 16.
+
+| | 15 (A) | 16 (C+D) | 17 (supervisor) |
+| --- | ---: | ---: | ---: |
+| launch to the last push, s | 142.7 | 106.8 | 267.3 |
+| developer done to the ref, median, s | 51.5 | 38.8 | 57.5 |
+| version control's tokens above starts | 50,794 | 32,113 | 32,655 |
+| total tokens | 474,294 | 394,119 | 331,843 |
+| version control's tool calls | 37 | 17 | 23 |
+| judge, boundary / message | 5.0 / 5.0 | 5.0 / 4.33, then 5.0 / 5.0 | 5.0 / 5.0 |
+
+(Judged X round 16, Y round 17: "the same", 5.0 on every commit of both. The judge of round 16
+against 13 had taken a point off each `Settled:` trailer; this one, with trailers on both sides,
+called them "meaningless to a reader who doesn't use nv" and took nothing off.) The reader of
+round 17's history answered five of six, question 5 by the trailers, as round 16's did.
+
+- **The cheapest round of any**: one agent's start for all three developers' version control,
+  and no resolver. Its tokens above the start (32,655) are those of round 16's two resolvers and
+  body hook together.
+- **The slowest**: 66 s of planning before any developer started, and one queue: task 3, done
+  last, waited 97 s for its push. The developers were 5 to 10 s apart; the supervisor took them
+  one by one.
+- **What it told them** made the clash mechanical, not absent: `__init__.py` one line to a name
+  (the union merge), tests in files of their own, the README's Functions lines in a fixed form to
+  be put in alphabetical order when merged, the Usage section at the end of the file. Both pushes
+  after the first were refused over the README and settled by the supervisor in one try each.
+- **What it could not do**: task 3's two noted steps (word_count, then reading_time), which it had
+  rebuilt as two commits, were made one by the sync that caught up ("now one commit"), and could
+  not be split again. Its report said the rebuild had dropped the `Settled:` trailer; the trailer
+  is on the commit (`nv rebuild` keeps it), and the report was wrong.
+
 ## Readers (2026-11-23): the history as memory for the next writer
 
 A fresh agent given only a bare Git repository of a round's history and `reader.md` (six questions:
