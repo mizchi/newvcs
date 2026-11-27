@@ -119,7 +119,7 @@ Git 2.43 running the same driver on its pulls.
 
 - **No clash in any round needed settling**: every file both sides changed was merged by the
   driver, and every round reached all 28 acceptance tests. Against `strkit` (text merges), the
-  nv pattern is 25% quicker (100 to 78 s, medians) and 11% cheaper, with 16% fewer tool calls.
+  nv pattern is 22% quicker (100 to 78 s, medians) and 11% cheaper, with 16% fewer tool calls.
 - **nv against Git, with the same driver, no longer overlaps**: the slowest nv round (84 s) is
   quicker than the quickest Git round (97 s), at fewer tokens and calls in every round. A push
   refused costs either a sync or a pull and a second push; Git's writers made more of them, and
