@@ -175,6 +175,7 @@ by `tools/merge-cst`. 11 acceptance tests. nv at 3c58494 (short `nv help`).
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | git | 3 | 111.1, 113.1, 113.3 | 1.29 to 1.42 | 37 to 42 | 3 to 4 | 1 each | 0 |
 | nv | 3 | 121.1, 127.2, 134.1 | 1.50 to 1.56 | 43 to 45 | 4 each | 1 each | 1 each |
+| nv, a commit of clashed files alone kept (0a48480) | 3 | **105.1, 110.1, 117.1** | 1.45 to 1.70 | 40 to 50 | 3 to 7 | 0 to 1 | **0** |
 | supervisor | 1 | 200.2 | 1.89 | 53 | 3 | 0 | 0 |
 | parallel | 1 | 190.3 | 2.55 | 60 | 4 | 3 | 1 |
 
@@ -189,6 +190,12 @@ reference: the longest a developer took was 134 s.
   "Not done"); Git's rebase stops at that commit instead, and it is settled there. Nobody redid
   anything by hand, but the history is coarser than Git's (7 to 9 commits against 10 to 11),
   and each nv round took a little longer and cost a little more.
+- **Kept through the sync** (0a48480: such a commit is on the tip with nothing in it until the
+  settling gives it its version), no round folded, and nv's rounds took 105 to 117 s against
+  Git's 111 to 113, at a little more cost (median 1.47 against 1.40) and with 8 or 9 commits
+  against 10 or 11: the writers made fewer. One writer, finding its shared lemma already on the
+  ref under the same name, set its work aside and made its commits again without it: what a
+  Git writer amends.
 
 ## Counting Git's refusals
 
