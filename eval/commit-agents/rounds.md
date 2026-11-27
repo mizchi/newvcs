@@ -352,6 +352,41 @@ What the committers found:
 - Not done: `nv git show <rev> -- <path>`, `nv git diff <rev>` against the files, `nv since` that
   prints nothing when nothing differs.
 
+## Round 16 (2026-11-27): made to clash, C+D, after the twelfth round
+
+Round 13 again (C+D with the body hook, `CONFLICT=1`), on nv after the twelfth round's fixes: a
+body written again after catching up, notes kept on their way to a commit, and the commit that
+settles a clash ending with a `Settled:` trailer naming the file and the commits of others' it
+was settled against. Tasks 2 and 3 stopped on the README; the agent given `resolver.md` settled
+each, task 2's twice (task 3 landed in between). Times count from the developer's done file to
+the end of the resolver's publish, without the wait before the resolver was started.
+
+| | 13 (before) | 16 (after) |
+| --- | ---: | ---: |
+| makespan, s | 80.4 | 106.8 |
+| latency, s | 36.6 | 38.8 |
+| version control's tokens | 32,075 | 32,113 |
+| total tokens | 391,292 | 394,119 |
+| version control's tool calls | 21 | 17 |
+| judge, boundary | 5.0 | 5.0 |
+| judge, message | 5.0 | 4.33 |
+| judge prefers | 13 | |
+
+(Judged X round 16, Y round 13.) The makespan is task 2's second settling. What the judge took
+off was the trailers and nothing else: "not wrong, but noise to a maintainer, and nothing
+explains what 'Settled' means", a point off each of the two commits that have them.
+
+The reader given round 16's history alone (`reader.md`, as in "Readers" below) answered question
+5 from it: both commits that reconciled two writers' changes, the file, and the sides, by the
+trailers; where the three readers of rounds 13 to 15 had said "not recorded". It still found
+two things nowhere: each writer's README before it was settled, and the union merges of
+`textkit/__init__.py`, which every writer changed and nobody had to judge.
+
+So the two readings pull apart: what a reader asking "where did two writers meet" needs, a
+reviewer reading for maintenance counted against the message, for want of saying what it is.
+Not done: a trailer that says what it is (in Git's own words, a conflict and its resolution),
+and a judge given that history again.
+
 ## Readers (2026-11-23): the history as memory for the next writer
 
 A fresh agent given only a bare Git repository of a round's history and `reader.md` (six questions:
