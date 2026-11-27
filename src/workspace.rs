@@ -2052,30 +2052,50 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
   // under its message: not a commit of its own after one that falls short of what it says.
   let id = match incomplete(store, ws)? {
     Some((short, paths)) if changes.iter().all(|(path, _)| paths.contains(path)) => {
-      let was = Commit::load(store, &short)?;
-      let mut whole = was.changes.clone();
-      for (path, entry) in changes {
-        match whole.iter_mut().find(|(p, _)| *p == path) {
-          Some(change) => change.1 = entry,
-          None => whole.push((path, entry)),
+      let chain = pending(store, ws)?;
+      let at_short = chain.iter().position(|(id, _)| *id == short).ok_or("the commit a settling completes is not here")?;
+      // The commits before it that changed a settled file have it too: their own version of it,
+      // with what the settling brought in that the last version did not have, where that merges
+      // clean. As a rebase that stopped at each of them would have them settled.
+      let earlier = earlier_settled(store, ws, &chain[..at_short], short, &changes)?;
+      let first = earlier.iter().position(|e| !e.is_empty()).unwrap_or(at_short);
+      let lines = settling_lines(ws, &changes);
+      let mut parents = chain[first].1.parents.clone();
+      let mut made = None;
+      for (j, (_, c)) in chain.iter().enumerate().skip(first) {
+        let add: &[Change] = if j < at_short {
+          &earlier[j]
+        } else if j == at_short {
+          &changes
+        } else {
+          &[]
+        };
+        let mut whole = c.changes.clone();
+        for (path, entry) in add {
+          match whole.iter_mut().find(|(p, _)| p == path) {
+            Some(change) => change.1 = *entry,
+            None => whole.push((path.clone(), *entry)),
+          }
         }
+        whole.sort_by(|a, b| a.0.cmp(&b.0));
+        let rest = if add.is_empty() {
+          c.rest.clone()
+        } else {
+          let said: Vec<String> =
+            lines.iter().filter(|(path, _)| add.iter().any(|(p, _)| p.as_slice() == path.as_bytes())).map(|(_, l)| l.clone()).collect();
+          with_trailers(c.rest.clone(), &said)
+        };
+        let id = Commit { parents, rest, changes: whole }.store(store)?;
+        root_of(store, &id)?;
+        parents = vec![id];
+        made = Some(id);
       }
-      whole.sort_by(|a, b| a.0.cmp(&b.0));
-      let _ = std::fs::remove_file(incomplete_file(ws));
-      let rest = with_settled(store, ws, was.rest.clone(), &whole)?;
-      let mut made = Commit { parents: was.parents.clone(), rest, changes: whole }.store(store)?;
-      root_of(store, &made)?;
-      // Those after it, made again on top as they were: none of them changed what was settled.
-      let after: Vec<Commit> = {
-        let chain = pending(store, ws)?;
-        let at = chain.iter().position(|(id, _)| *id == short).map_or(chain.len(), |i| i + 1);
-        chain[at..].iter().map(|(_, c)| c.clone()).collect()
-      };
+      let made = made.ok_or("nothing was made of the settling")?;
+      // Spent: the note of what was settled against, and of what the commits were made from.
+      let left = unsettled(ws);
+      set_settling(ws, &settling(ws).into_iter().filter(|(path, _)| left.contains(path)).collect::<Vec<_>>())?;
+      set_incomplete(ws, None, &[])?;
       let last_was = ws.base;
-      for later in after {
-        made = Commit { parents: vec![made], rest: later.rest, changes: later.changes }.store(store)?;
-        root_of(store, &made)?;
-      }
       // The settling does not answer for the message: what was said of its base still stands.
       if let Some((_, under)) = moved_under(ws).filter(|(id, _)| Some(*id) == last_was || *id == short) {
         set_moved(ws, Some(made), &under)?;
@@ -2811,6 +2831,61 @@ fn with_settled(_store: &mut Store, ws: &Workspace, rest: Vec<u8>, changes: &[Ch
   Ok(with_trailers(rest, &lines))
 }
 
+/// The trailer of each file settled among these changes, by path: what `with_settled` would add.
+fn settling_lines(ws: &Workspace, changes: &[Change]) -> Vec<(String, String)> {
+  let left = unsettled(ws);
+  settling(ws)
+    .into_iter()
+    .filter(|(path, _)| !left.contains(path) && changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()))
+    .map(|(path, against)| {
+      let line = if against.is_empty() { format!("Settled: {path}") } else { format!("Settled: {path} with {}", against.join(", ")) };
+      (path, line)
+    })
+    .collect()
+}
+
+/// For each of the commits before the one a settling completes, the settled files it changed
+/// before the sync, as it would have them settled: three-way, from the version the last of them
+/// had, to this commit's own, and to the settling. A file that does not merge clean is left as
+/// the tip has it, as before: those commits are what the sync made of them.
+fn earlier_settled(store: &mut Store, ws: &Workspace, earlier: &[(Id, Commit)], short: Id, settled: &[Change]) -> Result<Vec<Vec<Change>>> {
+  let mut out = vec![Vec::new(); earlier.len()];
+  let from = made_from(ws);
+  let Some(last) = from.get(&short).copied() else { return Ok(out) };
+  let last_root = root_of(store, &last)?;
+  let content = |store: &mut Store, entry: Option<Entry>| -> Result<std::sync::Arc<Vec<u8>>> {
+    match entry {
+      Some(entry) => store.get(&entry.id)?.ok_or_else(|| format!("the content {} is missing", hex(&entry.id))),
+      None => Ok(Default::default()),
+    }
+  };
+  for (path, entry) in settled {
+    let Some(settling) = entry.filter(|e| e.mode & 0o170000 == 0o100000) else { continue };
+    let had = match last_root {
+      Some(root) => crate::manifest::lookup(store, root, path)?,
+      None => None,
+    };
+    for (k, (id, _)) in earlier.iter().enumerate() {
+      let Some(origin) = from.get(id) else { continue };
+      let Some((_, Some(own))) = Commit::load(store, origin)?.changes.into_iter().find(|(p, _)| p == path) else { continue };
+      if own.mode & 0o170000 != 0o100000 {
+        continue;
+      }
+      let (base, ours, theirs) = (content(store, had)?, content(store, Some(own))?, content(store, Some(settling))?);
+      if base.contains(&0) || ours.contains(&0) || theirs.contains(&0) {
+        continue;
+      }
+      let union = crate::eol::merges_by_union(&ws.root, path);
+      let (text, clean) = crate::gitcli::merge_text_named(&base, &ours, &theirs, "yours", "theirs", union);
+      if clean {
+        let id = store.put(Kind::Blob, &text, Some(own.id))?;
+        out[k].push((path.clone(), Some(Entry { mode: own.mode, id })));
+      }
+    }
+  }
+  Ok(out)
+}
+
 /// `rest` with these lines at the end of its message, as Git's trailers are, those it has already
 /// left out.
 pub(crate) fn with_trailers(rest: Vec<u8>, lines: &[String]) -> Vec<u8> {
@@ -2872,9 +2947,33 @@ pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String
     Some(id) => crate::write_whole(&incomplete_file(ws), format!("{}\n{}\n", hex(&id), paths.join("\n"))),
     None => {
       let _ = std::fs::remove_file(incomplete_file(ws));
+      let _ = std::fs::remove_file(made_from_file(ws));
       Ok(())
     }
   }
+}
+
+fn made_from_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("incomplete-from")
+}
+
+/// Note which commit of this workspace's own each commit a sync put on the tip was made from,
+/// for a settling to give the earlier ones their versions of the files it settles.
+pub(crate) fn set_made_from(ws: &Workspace, pairs: &[(Id, Id)]) -> Result<()> {
+  if pairs.is_empty() {
+    let _ = std::fs::remove_file(made_from_file(ws));
+    return Ok(());
+  }
+  crate::write_whole(&made_from_file(ws), pairs.iter().map(|(made, from)| format!("{} {}\n", hex(made), hex(from))).collect::<String>())
+}
+
+fn made_from(ws: &Workspace) -> std::collections::HashMap<Id, Id> {
+  let id = |text: &str| unhex(text).and_then(|b| <Id>::try_from(b.as_slice()).ok());
+  std::fs::read_to_string(made_from_file(ws))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.split_once(' ').and_then(|(made, from)| Some((id(made)?, id(from)?))))
+    .collect()
 }
 
 /// The commit a settling is noted to complete, as noted: whether it still can is `incomplete`'s.

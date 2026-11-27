@@ -2124,9 +2124,12 @@ stops.
   each merges as a sync merges and the last comes to the same files as one
   commit would; a file left with both versions belongs to the last commit
   that changed it, and its settling goes into that commit, those after it
-  made again on top. Those before it are made without their changes to
-  that file (the tip's version stays), and nothing says of their messages
-  that what they describe of it moved to a later commit. Where that cannot
+  made again on top. Those before it that changed the file are held out of
+  it too, and when it is settled each is given its own version with what
+  the settling brought in (three-way: from the last commit's version, to
+  its own and to the settled one), and the same trailer, as a rebase
+  stopped at each would have them; where that does not merge clean, the
+  commit keeps the tip's version and nothing says so. Where that cannot
   be (a commit clashes with the ref on the way though the commits together
   do not; a commit changed nothing but files left with both versions; a
   directory set whole), they are one commit,

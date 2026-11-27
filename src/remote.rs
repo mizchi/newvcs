@@ -839,6 +839,10 @@ fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &s
   arrive_from(store, ws, url, tip, author, false)
 }
 
+/// Commits put on the tip one by one: what was made, the one a clash belongs to, and which
+/// commit each was made from.
+type Replayed = (Vec<Id>, Option<Id>, Vec<(Id, Id)>);
+
 const MODE_KIND: u32 = 0o170000;
 const MODE_FILE: u32 = 0o100000;
 
@@ -1365,10 +1369,11 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // files as the one commit would. A clash is the last commit's that changed the file; its
   // settling goes into that commit. Where any of this is not so, they are one commit.
   let mut settles_into: Option<Id> = None;
+  let mut origins: Vec<(Id, Id)> = Vec::new();
   let base = match (published.is_empty(), ws.base) {
     (false, Some(was)) => {
-      let replayed: Option<(Vec<Id>, Option<Id>)> = if still_mine > 1 {
-        (|| -> Result<Option<(Vec<Id>, Option<Id>)>> {
+      let replayed: Option<Replayed> = if still_mine > 1 {
+        (|| -> Result<Option<Replayed>> {
           let mut own = Vec::new();
           let mut at_id = Some(was);
           for _ in 0..still_mine {
@@ -1392,6 +1397,8 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
           let mut prev = tip;
           let mut made = Vec::new();
           let mut owned = None;
+          // Which commit each was made from: a settling gives the earlier ones their versions.
+          let mut origins = Vec::new();
           for (i, c) in commits.iter().enumerate() {
             let (parent_root, running_root) = (root(store, c.parents.first().copied())?, root(store, Some(prev))?);
             let mut changes = Vec::new();
@@ -1433,6 +1440,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
               owned = Some(id);
             }
             made.push(id);
+            origins.push((id, own[i]));
             prev = id;
           }
           // The same files as the one commit, or not at all.
@@ -1440,13 +1448,14 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
           if root(store, Some(prev))? != root(store, Some(one))? || made.is_empty() {
             return Ok(None);
           }
-          Ok(Some((made, owned)))
+          Ok(Some((made, owned, origins)))
         })()?
       } else {
         None
       };
       match replayed {
-        Some((made, owned)) => {
+        Some((made, owned, made_from)) => {
+          origins = made_from;
           store.flush()?;
           for id in &made {
             ws.log("commit", id)?;
@@ -1488,6 +1497,7 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // has one: their settling goes into it (`commit_state`).
   let own = Some(base) != Some(tip) && !done.conflicts.is_empty();
   workspace::set_incomplete(ws, own.then_some(settles_into.unwrap_or(base)), &done.conflicts)?;
+  workspace::set_made_from(ws, if own { &origins } else { &[] })?;
   // A commit of this workspace's own put on commits of others that change files it changes: its
   // message was written on another base, and what it says of what was there may not hold.
   if Some(base) != standing.base {

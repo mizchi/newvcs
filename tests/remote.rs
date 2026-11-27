@@ -2102,6 +2102,11 @@ fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
   assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n");
   assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
   assert!(run("bob", "$NV git log -1 --format=%B").1.contains("Settled: README.md with"));
+  // The earlier commit is not left without its line: it has the file as the settling has it, less
+  // what the later commit added, and says it was settled as well.
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann\n- x\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"));
   assert_eq!(run("bob", "$NV git status --porcelain").1, "");
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
@@ -2171,10 +2176,11 @@ fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   let (_, said) = run("bob", "$NV pending .");
   assert_eq!(said.matches("  git ").count(), 2, "{said}");
   assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n", "{said}");
-  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "x.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann\n- x\n");
   assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
   assert!(run("bob", "$NV git log -1 --format=%B HEAD").1.contains("Settled: README.md with"), "the trailer is on the commit it settled");
-  assert!(!run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled:"));
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"));
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
   // A commit that changed nothing but such a file would be left with nothing: they are one
