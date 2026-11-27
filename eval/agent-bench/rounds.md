@@ -164,6 +164,32 @@ supervisor round of `stackc-cst`, before either change: 120.3 s and 165.1 s, $2.
   a round read 20 to 29 thousand, and nv's rounds became the quickest of any pattern here, at
   Git's cost.
 
+## A larger proof (`bst-cst`)
+
+Binary search trees in Lean 4's core library: insertion, search, deletion through `removeMin`
+and `join`, and a tree sort; eight theorems in four files, about 250 lines of proof in the
+reference, meeting in the shared lemmas, the README's checklist and the changelog, all merged
+by `tools/merge-cst`. 11 acceptance tests. nv at 3c58494 (short `nv help`).
+
+| | rounds | last agent done, s | cost, USD | tool calls | refused | clashes | commits folded |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| git | 3 | 111.1, 113.1, 113.3 | 1.29 to 1.42 | 37 to 42 | 3 to 4 | 1 each | 0 |
+| nv | 3 | 121.1, 127.2, 134.1 | 1.50 to 1.56 | 43 to 45 | 4 each | 1 each | 1 each |
+| supervisor | 1 | 200.2 | 1.89 | 53 | 3 | 0 | 0 |
+| parallel | 1 | 190.3 | 2.55 | 60 | 4 | 3 | 1 |
+
+Every round reached 11 of 11. It was not as large to the writers as to whoever wrote the
+reference: the longest a developer took was 134 s.
+
+- **Every round met one clash nothing merges**: two developers wrote a lemma of one name in
+  `Bst/Lemmas.lean`, each its own way (Git's rebase stopped on it as nv's sync did).
+- **In every nv round that clash folded the writer's commits into one**, and the sync said both
+  that each commit would get its own version of the file and that they were now one commit. One
+  of the commits changed nothing but the shared lemmas, which is a case the sync folds (README,
+  "Not done"); Git's rebase stops at that commit instead, and it is settled there. Nobody redid
+  anything by hand, but the history is coarser than Git's (7 to 9 commits against 10 to 11),
+  and each nv round took a little longer and cost a little more.
+
 ## Counting Git's refusals
 
 Until 952150c, a refusal and a clash were counted by the first lines Git prints of them
