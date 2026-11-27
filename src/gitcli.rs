@@ -1704,7 +1704,7 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
       );
     }
     let last_waits = workspace::pending(&mut repo.store, &repo.ws)?.last().is_some_and(|(_, c)| c.changes.is_empty());
-    if messages.first().is_some() && !last_waits {
+    if !messages.is_empty() && !last_waits {
       return fatal(
         128,
         format!(
