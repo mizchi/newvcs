@@ -1362,6 +1362,34 @@ fn a_note_names_the_next_commit_the_conditions_pass_on() {
   assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
 }
 
+/// A supervisor's line to a writer that runs no version control (`nv tell`): it reaches the writer
+/// the next time anything of nv's speaks to it there, once: `nv inbox`, `nv note`, or the hook
+/// behind each of a Claude Code session's tool calls.
+#[test]
+fn a_line_told_to_a_writer_reaches_it_once() {
+  let dir = workspace("inbox");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  ok(&dir, "$NV tell . 'Leave README.md to me' && $NV tell . 'wrap goes first'");
+  assert_eq!(ok(&dir, "$NV inbox ."), "told: Leave README.md to me\ntold: wrap goes first");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  // A note says what it did, and then what was told.
+  ok(&dir, "$NV tell . 'Stop after this step'");
+  let said = ok(&dir, "echo 2 > two && $NV note . 'Add two'");
+  assert!(said.ends_with("told: Stop after this step"), "{said}");
+  assert!(!ok(&dir, "$NV note . 'Add two again'").contains("told:"));
+  // The hook hands it to the session as context for its next turn.
+  ok(&dir, "$NV tell . 'Run the tests'");
+  let event = format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"cwd":"{}"}}"#, dir.display());
+  let said = ok(&dir, &format!("printf '%s' '{event}' | $NV hook claude"));
+  let answer: serde_json::Value = serde_json::from_str(&said).unwrap_or_else(|e| panic!("{e}: {said}"));
+  assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+  assert!(answer["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Run the tests"), "{said}");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  // A line is one line that says something.
+  assert_ne!(code_of(&dir, "$NV tell . ' '").0, 0);
+  assert_ne!(code_of(&dir, "$NV tell . \"two\nlines\"").0, 0);
+}
+
 /// Every note a writer gives reaches a commit (twelfth round: 110 of 184 did not). A note waits
 /// for the next commit the conditions pass on, however the work went in between, and notes that
 /// wait together are that commit's line together.

@@ -599,6 +599,12 @@ file, and the commits of others' it was settled against, as
 else in a history says that two writers' work met there, and a reader of
 it could not tell (`eval/commit-agents`, "Readers").
 
+A writer that runs no version control can still be told things by
+whoever supervises it: `nv tell <dir> <line>` leaves a line in that
+workspace, which the writer is given once, the next time nv speaks to it
+there (`nv inbox <dir>`, the answer to `nv note`, or the hook behind a
+Claude Code session's tool calls, as context for its next turn).
+
 A commit's message is written of what was there when it was made. When a
 sync or a push puts it on top of other writers' commits that change the
 same files, `nv sync`, `nv push` and `nv pending` name those commits and

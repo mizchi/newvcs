@@ -47,6 +47,12 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Say in a line what was just done: the next commit the conditions
         pass on (`[commit] each`), of these files or later ones, is made
         under it. Where that commit was made already, it is renamed
+  nv tell <dir> <line>
+        Leave a line for the writer of a workspace, from whoever supervises
+        it: it is given once, the next time `nv inbox`, `nv note` or the
+        hook behind its tool calls speaks to it there
+  nv inbox <dir>
+        The lines told here and not yet read, which are read now
   nv pending <dir> [--wait]
         The commits made here and not pushed, oldest first: each with its
         number, its Git id and nv's, message, the conditions its files
@@ -190,6 +196,12 @@ fn claude_hook() -> Option<()> {
   workspace::snapshot(&mut store, &mut ws, AUTHOR, look).ok()?;
   // Where the repository declares conditions to run behind writes, they are started here.
   newvcs::checks::start_behind(&root);
+  // What a supervisor told this writer goes to the session, as context for its next turn.
+  let told = newvcs::checks::take_told(&root);
+  if !told.is_empty() {
+    let context = told.iter().map(|line| format!("told by the supervisor of this workspace: {line}")).collect::<Vec<_>>().join("\n");
+    println!("{}", serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": context } }));
+  }
   Some(())
 }
 
@@ -700,7 +712,25 @@ fn run(args: &[String]) -> Result<()> {
     "note" => {
       let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
       println!("{}", newvcs::checks::note(&root, arg(2)?, AUTHOR)?);
+      // What a supervisor told this writer, with the answer to what the writer said.
+      for line in newvcs::checks::take_told(&root) {
+        println!("told: {line}");
+      }
       newvcs::checks::start_behind(&root);
+    }
+    "tell" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      newvcs::checks::tell(&root, arg(2)?)?;
+    }
+    "inbox" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      let told = newvcs::checks::take_told(&root);
+      if told.is_empty() {
+        println!("nothing has been told here");
+      }
+      for line in told {
+        println!("told: {line}");
+      }
     }
     "pending" => {
       let (ws, mut store) = opened(arg(1)?)?;
@@ -1155,6 +1185,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
   ("checkpoint", 1, 1, &["--until-still"]),
   ("note", 2, 2, &[]),
+  ("tell", 2, 2, &[]),
+  ("inbox", 1, 1, &[]),
   ("publish", 1, 2, &["--message"]),
   ("pending", 1, 1, &["--wait"]),
   ("rebuild", 3, usize::MAX, &[]),

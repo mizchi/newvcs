@@ -506,6 +506,31 @@ fn rename_runner_commit(
   Ok(renamed)
 }
 
+/// A supervisor's lines for the writer of this workspace (`nv tell`), waiting to be read.
+fn inbox_file(root: &Path) -> PathBuf {
+  root.join(".nv").join("inbox")
+}
+
+/// Leave a line for the writer of this workspace: it is given the next time `nv inbox`, `nv note`
+/// or the hook behind its tool calls speaks to it there. Run with the workspace held.
+pub fn tell(root: &Path, text: &str) -> Result<()> {
+  let text = text.trim();
+  if text.is_empty() || text.contains('\n') {
+    return Err("what is told is one line that says something".to_string());
+  }
+  let mut lines = std::fs::read_to_string(inbox_file(root)).unwrap_or_default();
+  lines.push_str(text);
+  lines.push('\n');
+  crate::write_whole(&inbox_file(root), lines.as_bytes())
+}
+
+/// The lines told here and not yet read, which are read now: given once. Run with the workspace held.
+pub fn take_told(root: &Path) -> Vec<String> {
+  let Ok(text) = std::fs::read_to_string(inbox_file(root)) else { return Vec::new() };
+  let _ = std::fs::remove_file(inbox_file(root));
+  text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
 /// Whether this commit is one the conditions' runner made (`[commit] each`), as far as its note says.
 pub fn committed_by_runner(root: &Path, id: &Id) -> bool {
   std::fs::read_to_string(runs_dir(root).join("committed")).is_ok_and(|said| said.trim() == hex(id))
