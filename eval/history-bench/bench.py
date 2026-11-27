@@ -171,15 +171,14 @@ def one(nv: str, scenario: dict, work: Path, server: str) -> dict:
 
     obs = work / "observer"
     run.nv_("sync", obs)
-    log = run.nv_("git", "-C", obs, "log", "--format=%H%x00%s%x00%b%x01").stdout
+    log = run.nv_("git", "-C", obs, "log", "--format=%H %s").stdout
     start = run.sh(["git", "rev-parse", "HEAD"], cwd=seed).stdout.strip()
     commits = []
-    for entry in log.split("\x01"):
-        if not entry.strip():
-            continue
-        oid, subject, body = entry.strip("\n").split("\x00")
+    for line in log.splitlines():
+        oid, _, subject = line.partition(" ")
         if oid == start:
             break
+        body = run.nv_("git", "-C", obs, "log", "-1", "--format=%B", oid).stdout
         commits.append((oid, subject, body))
     # Which commit brought in each line at the tip: the oldest whose diff adds it.
     added = {}
@@ -191,7 +190,12 @@ def one(nv: str, scenario: dict, work: Path, server: str) -> dict:
                 file = line[6:] if line.startswith("+++ b/") else None
             elif line.startswith("+") and file and not line.startswith("+++"):
                 added.setdefault((file, line[1:]), subject)
-    at_tip = [(f, line, note) for f, line, note in written if (obs / f).exists() and line in (obs / f).read_text().splitlines()]
+    # A line that is in a file at the tip once: which step wrote one of several the same is not
+    # something a history can say.
+    def once(f, line):
+        return (obs / f).exists() and (obs / f).read_text().splitlines().count(line) == 1
+
+    at_tip = [(f, line, note) for f, line, note in written if once(f, line) and sum(1 for g, l, _ in written if (g, l) == (f, line)) == 1]
     right = sum(1 for f, line, note in at_tip if added.get((f, line)) == note)
     return {
         "commits": len(commits),

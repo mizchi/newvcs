@@ -1,0 +1,169 @@
+{
+ "name": "union-only",
+ "seed": {
+  "README.md": "# kit\n\n## Functions\n\n- (none yet)\n\n## Notes\n\nNothing yet.\n",
+  "kit/__init__.py": "__all__ = [\n]\n",
+  ".gitattributes": "kit/__init__.py merge=union\n"
+ },
+ "writers": [
+  {
+   "name": "ann",
+   "steps": [
+    {
+     "note": "Add ann_a",
+     "edits": [
+      {
+       "file": "kit/ann.py",
+       "append": "def ann_a():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .ann import ann_a\n__all__ = [\n    \"ann_a\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add ann_b",
+     "edits": [
+      {
+       "file": "kit/ann.py",
+       "append": "def ann_b():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .ann import ann_b\n__all__ = [\n    \"ann_b\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add ann_c",
+     "edits": [
+      {
+       "file": "kit/ann.py",
+       "append": "def ann_c():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .ann import ann_c\n__all__ = [\n    \"ann_c\",\n"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "steps": [
+    {
+     "note": "Add bob_a",
+     "edits": [
+      {
+       "file": "kit/bob.py",
+       "append": "def bob_a():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .bob import bob_a\n__all__ = [\n    \"bob_a\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add bob_b",
+     "edits": [
+      {
+       "file": "kit/bob.py",
+       "append": "def bob_b():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .bob import bob_b\n__all__ = [\n    \"bob_b\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add bob_c",
+     "edits": [
+      {
+       "file": "kit/bob.py",
+       "append": "def bob_c():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .bob import bob_c\n__all__ = [\n    \"bob_c\",\n"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "cy",
+   "steps": [
+    {
+     "note": "Add cy_a",
+     "edits": [
+      {
+       "file": "kit/cy.py",
+       "append": "def cy_a():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .cy import cy_a\n__all__ = [\n    \"cy_a\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add cy_b",
+     "edits": [
+      {
+       "file": "kit/cy.py",
+       "append": "def cy_b():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .cy import cy_b\n__all__ = [\n    \"cy_b\",\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add cy_c",
+     "edits": [
+      {
+       "file": "kit/cy.py",
+       "append": "def cy_c():\n    pass\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .cy import cy_c\n__all__ = [\n    \"cy_c\",\n"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

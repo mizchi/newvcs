@@ -1,0 +1,61 @@
+{
+ "name": "clash-only-step",
+ "seed": {
+  "README.md": "# kit\n\n## Functions\n\n- (none yet)\n\n## Notes\n\nNothing yet.\n",
+  "kit/__init__.py": "__all__ = [\n]\n",
+  ".gitattributes": "kit/__init__.py merge=union\n"
+ },
+ "settle": "both",
+ "writers": [
+  {
+   "name": "ann",
+   "steps": [
+    {
+     "note": "List slugify",
+     "edits": [
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- slugify(text)\n"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "steps": [
+    {
+     "note": "Plan wrap in the README",
+     "edits": [
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- wrap(text, width)\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add wrap",
+     "edits": [
+      {
+       "file": "kit/wrap.py",
+       "write": "def wrap(t, w):\n    return [t]\n"
+      },
+      {
+       "file": "README.md",
+       "replace": [
+        "Nothing yet.\n",
+        "wrap is greedy.\n"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
