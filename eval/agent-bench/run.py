@@ -156,7 +156,9 @@ class Round:
         if self.a.model:
             cmd += ["--model", self.a.model]
         out = open(self.work / f"agent-{name}.jsonl", "w")
-        env = dict(self.env, GIT_AUTHOR_NAME=name, GIT_COMMITTER_NAME=name)
+        env = dict(self.env, GIT_AUTHOR_NAME=name, GIT_COMMITTER_NAME=name, PWD=str(cwd))
+        # Nothing of where the harness was run from: an agent's `$OLDPWD/..` wrote into the repository.
+        env.pop("OLDPWD", None)
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
         return {"proc": proc, "started": time.time(), "ended": None}
 
