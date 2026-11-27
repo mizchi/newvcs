@@ -98,6 +98,22 @@ class Markdown(unittest.TestCase):
         headings = [line for line in out.splitlines() if line.startswith("#")]
         self.assertEqual(headings, ["# strkit", "## Functions", "## Durations", "## Roman numerals", "## Errors"])
 
+    def test_items_ticked_by_both_stay_where_they_were(self):
+        base = "# p\n\n## Proved\n\n" + "".join(f"- [ ] `t{i}`\n" for i in range(1, 7)) + "\n## Building\n"
+        ours = base.replace("- [ ] `t5`", "- [x] `t5`").replace("- [ ] `t6`", "- [x] `t6`")
+        theirs = base.replace("- [ ] `t3`", "- [x] `t3`").replace("- [ ] `t4`", "- [x] `t4`")
+        want = base
+        for i in (3, 4, 5, 6):
+            want = want.replace(f"- [ ] `t{i}`", f"- [x] `t{i}`")
+        code, out = merge("README.md", base, ours, theirs)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, want)
+        # One step at a time, as a sync puts commits on a tip one by one, comes to the same.
+        first = base.replace("- [ ] `t5`", "- [x] `t5`")
+        code, step = merge("README.md", base, first, theirs)
+        code, step = merge("README.md", first, ours, step)
+        self.assertEqual(step, want)
+
     def test_changelog_lines_from_both(self):
         ours = CHANGELOG + "- Add strkit.parse_duration.\n- Add strkit.format_duration.\n"
         theirs = CHANGELOG + "- Add strkit.render.\n"

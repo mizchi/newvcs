@@ -39,8 +39,10 @@ FIELDS = [
     "tokens", "output_tokens", "cost_usd", "turns", "tool_calls", "vcs_calls", "refused", "clashes",
     "commits", "commits_passing", "provisional", "markers", "timed_out", "agents",
 ]
-REFUSED = ("the push was refused", "[rejected]", "! [remote rejected]")
-CLASHED = ("both sides changed the same lines", "CONFLICT (")
+# What a refused push and a clash say, in whatever part of it an agent kept (they cut Git's
+# output with `tail`, which leaves its hints and not its first lines).
+REFUSED = ("the push was refused", "[rejected]", "! [remote rejected]", "Updates were rejected", "'git pull' before pushing again")
+CLASHED = ("both sides changed the same lines", "CONFLICT (", "Could not apply", "Resolve all conflicts manually", "fix conflicts and then commit")
 
 
 def sh(args, cwd, env, ok=(0,), timeout=600):

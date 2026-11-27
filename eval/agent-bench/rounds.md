@@ -84,11 +84,11 @@ settling: the server merges such paths itself, Git's pull merges them. One round
 | --- | ---: | ---: | ---: | ---: |
 | last agent done, s | 103.1 | 99.1 | 220.1 | 289.2, 179.1 |
 | cost, USD | 1.75 | 1.76 | 2.24 | 3.74, 2.87 |
-| pushes refused | 5 | 0 | 0 | 0, 0 |
+| pushes refused | 8 | 0 | 0 | 0, 0 |
 | commits on the ref | 8 | 14 | 11 | 14, 10 |
 
 - **nv's pushes were never refused**: the server merged what the writers had in common. Git's
-  were refused five times, each a pull that merged without a word, and the time came out the
+  were refused eight times, each a pull that merged without a word, and the time came out the
   same.
 - **The supervisor patterns were slower with nothing to settle than with clashes.** The
   planner's rules said what order the shared lines go in; a union keeps both sides' lines in
@@ -113,7 +113,7 @@ Git 2.43 running the same driver on its pulls.
 | tokens | 2.12 to 2.28 M | **1.60 M** | 2.76 M | 3.00, 3.11 M |
 | cost, USD | 1.54 to 1.65 | **1.36 to 1.38** | 1.93 | 2.61, 2.68 |
 | tool calls | 44 to 48 | **32** | 65 | 68, 63 |
-| pushes refused | 4 to 6 | 3 | 3 | 5, 4 |
+| pushes refused | 5 to 7 | 3 | 3 | 5, 4 |
 | files left with both versions | 0 | 0 | 0 | 0 |
 | commits, all passing their tests | 8 to 10 | 8 | 12 | 5, 7 |
 
@@ -128,6 +128,15 @@ Git 2.43 running the same driver on its pulls.
   turns, not settling. The parallel one still has its integrators refused over each other
   (the server runs no driver, and a refusal is a sync and a push of an agent's), and the planner
   still holds everyone for 35 to 40 s.
+
+## Counting Git's refusals
+
+Until 952150c, a refusal and a clash were counted by the first lines Git prints of them
+(`[rejected]`, `CONFLICT (`). Git's writers cut its output with `tail`, which keeps the hints
+and drops those lines, so Git's were undercounted: now its hints count too (`Updates were
+rejected`, `Could not apply`). The tables above are counted again from the transcripts; nv's
+were counted right, and of Git's only the refusals of `strkit-union` (5 to 8) and
+`strkit-cst` (4 to 6, now 5 to 7) changed, and one round's clashes in `strkit` (4 to 5).
 
 ## Not yet known
 
