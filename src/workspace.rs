@@ -2878,9 +2878,32 @@ pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String
 }
 
 /// The commit a settling is noted to complete, as noted: whether it still can is `incomplete`'s.
-pub fn settles_into(ws: &Workspace) -> Option<Id> {
-  let text = std::fs::read_to_string(incomplete_file(ws)).ok()?;
+pub fn settles_into(root: &Path) -> Option<Id> {
+  let text = std::fs::read_to_string(root.join(META).join("incomplete")).ok()?;
   text.lines().next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())
+}
+
+/// For `nv commit` given no message: where a sync left files out of a commit of this workspace's
+/// own and the files now differ from that commit's only in those, they complete it, under its
+/// message, as `git rebase --continue` keeps the message of the commit that stopped. `Ok(None)`
+/// where there is no such commit; an error that names them where other files changed too.
+pub fn complete_settling(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Option<Id>> {
+  let Some((_, paths)) = incomplete(store, ws)? else { return Ok(None) };
+  snapshot(store, ws, author, look)?;
+  let state = ws.head.ok_or("nothing to commit")?;
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let (from, to) = (tree(store, ws.base)?, tree(store, Some(state))?);
+  let whole = whole_since(store, Some(state), ws.base)?;
+  let changes = crate::manifest::diff_keeping(store, from, to, &whole)?;
+  let other: Vec<String> =
+    changes.iter().filter(|(path, _)| !paths.contains(path)).map(|(path, _)| String::from_utf8_lossy(path).into_owned()).collect();
+  if !other.is_empty() {
+    return Err(format!(
+      "a commit needs a message: given none, a commit completes the one a sync left the settling out of, with nothing else, and these changed besides: {}",
+      other.join(", ")
+    ));
+  }
+  commit_state(store, ws, state, Vec::new(), author)
 }
 
 /// The commit a settling completes, and the paths it was left without, while that commit is

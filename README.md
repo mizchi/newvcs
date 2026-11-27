@@ -591,6 +591,14 @@ again before anyone else sees them:
   a file with both versions, it stops with exit 1 and says so, and the
   note of a commit the files held is kept for when they are settled.
 
+A file a sync left with both versions is held out of the commit of the
+workspace's own that changed it, and its settling completes that commit:
+committed by the runner behind writes, or by `nv commit <dir>` given no
+message, which keeps the message of the commit it completes, as
+`git rebase --continue` does, and puts those after it on top again.
+Given a message, `nv commit` makes the settling a commit of its own, and
+the commits below it are on the ref without it.
+
 A file a sync left with both versions is settled by whoever settles it,
 and the commit that holds the settling says so, as a Git trailer: which
 file, and the commits of others' it was settled against, as

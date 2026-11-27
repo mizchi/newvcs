@@ -2041,6 +2041,76 @@ fn a_settling_goes_into_the_commit_that_changed_the_file() {
   assert_eq!(code, 0, "{said}");
 }
 
+/// Without a runner behind writes, `nv commit` given no message is how a settling completes the
+/// commit it belongs to, as `git rebase --continue` keeps the message of the commit that stopped:
+/// no commit is left on the ref without the files the sync held out of it (`eval/agent-bench`,
+/// where a writer that gave a message made a commit of the settling after two that fail).
+#[test]
+fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-by-commit");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-by-commit-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf '# list\\n- ann\\n' > README.md && $NV commit . 'Add a' >/dev/null && $NV push . >/dev/null");
+  run(
+    "bob",
+    "printf '# list\\n- x\\n' > README.md && echo x > x.py && $NV commit . 'Add x' >/dev/null \
+     && printf '# list\\n- x\\n- y\\n' > README.md && echo y > y.py && $NV commit . 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("`nv commit <dir>` with no message"), "the sync says how: {said}");
+  // Given no message with nothing to complete, or with more than the settling, it still asks for one.
+  let (code, said) = run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && echo z > z.py && $NV commit .");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("a commit needs a message") && said.contains("z.py"), "{said}");
+  let (code, said) = run("bob", "rm z.py && $NV commit .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("completes Add y"), "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B").1.contains("Settled: README.md with"));
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // With nothing left to complete, a commit needs a message as ever.
+  let (code, said) = run("bob", "echo w > w.py && $NV commit .");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("a commit needs a message"), "{said}");
+}
+
 #[test]
 fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   let Ok(server) = std::env::var("NV_SERVER") else {

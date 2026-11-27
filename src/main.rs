@@ -467,6 +467,25 @@ fn run(args: &[String]) -> Result<()> {
       // The message given, or else the one drafted for the state this commit is of.
       let given = args.get(2).filter(|a| !["--recorded", "--tracked", "--no-checks"].contains(&a.as_str()));
       let config = newvcs::checks::load(&ws.root)?;
+      // Given none, the settling of what a sync held out of a commit of this workspace's own
+      // completes that commit, under its message.
+      if given.is_none() && !newvcs::colocated::shared(&ws.root) && workspace::settles_into(&ws.root).is_some() {
+        let what = match workspace::settles_into(&ws.root).map(|id| newvcs::commit::Commit::load(&mut store, &id)) {
+          Some(Ok(commit)) => {
+            let said = String::from_utf8_lossy(&commit.rest).into_owned();
+            said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+          }
+          _ => String::new(),
+        };
+        if let Some(id) = workspace::complete_settling(&mut store, &mut ws, AUTHOR, look(3))? {
+          println!(
+            "{} in {:.0} ms: the settling completes {what}, under its message, and what came after it is on top",
+            hex(&id),
+            ms(started)
+          );
+          return Ok(());
+        }
+      }
       // Refused before anything is recorded: a refused command changes nothing.
       if given.is_none() && config.as_ref().is_none_or(|c| c.message.is_none()) {
         return Err("a commit needs a message: give one, or declare a [message] hook in nv.toml to draft one".into());
@@ -775,7 +794,7 @@ fn run(args: &[String]) -> Result<()> {
       if !unsettled.is_empty() {
         // The commit they complete: the last of this workspace's that changed them, which need
         // not be the last made here.
-        let into = workspace::settles_into(&ws).and_then(|id| chain.iter().find(|(c, _)| *c == id)).map(|(_, commit)| {
+        let into = workspace::settles_into(&ws.root).and_then(|id| chain.iter().find(|(c, _)| *c == id)).map(|(_, commit)| {
           let said = String::from_utf8_lossy(&commit.rest).into_owned();
           said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
         });
@@ -1139,7 +1158,11 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
       if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
         "Edit them: once the conditions pass on them, they go into the commit of yours put on the tip, which they complete (where you have none, they are a commit of their own). Then `nv push`."
       } else {
-        "Edit them, then `nv commit` and `nv push`."
+        if newvcs::workspace::settles_into(root).is_some() {
+          "Edit them, then `nv commit <dir>` with no message: they complete the commit of yours put on the tip that changed them, under its message, and those after it stay on top. Then `nv push`."
+        } else {
+          "Edit them, then `nv commit` and `nv push`."
+        }
       }
     ));
   }
