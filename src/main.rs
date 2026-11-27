@@ -1527,7 +1527,7 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
     rest = more;
   }
   let Some((verb, options)) = rest.split_first() else { return Ok(None) };
-  if !matches!(verb.as_str(), "push" | "pull" | "fetch") {
+  if !matches!(verb.as_str(), "push" | "pull" | "fetch" | "rebase") {
     return Ok(None);
   }
   let Some(root) = workspace::top_of(&at) else { return Ok(None) };
@@ -1536,6 +1536,17 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
   }
   let Ok(ws) = workspace::Workspace::open(&root) else { return Ok(None) };
   let (Some(_), Some(ref_name)) = (ws.remote.as_ref(), ws.remote_ref.as_ref()) else { return Ok(None) };
+  // The rebase a pull with --rebase began, where its settling waits: finished by committing the
+  // settling, under the message of the commit it completes, or undone as the sync is undone.
+  if verb == "rebase" {
+    let waiting = workspace::settles_into(&root).is_some() || !workspace::unsettled(&ws).is_empty();
+    let dir = root.to_string_lossy().into_owned();
+    return match options.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+      ["--continue"] if waiting => Ok(Some(vec!["commit".into(), dir])),
+      ["--abort"] if waiting => Ok(Some(vec!["restore".into(), dir, "before-sync".into()])),
+      _ => Ok(None),
+    };
+  }
   let quiet = |o: &str| o == "-q" || o == "--quiet";
   let plain: Vec<&str> = options.iter().map(String::as_str).filter(|o| !quiet(o)).collect();
   let rebase = |o: &str| o == "--rebase" || o == "-r";

@@ -2866,14 +2866,12 @@ fn joined_rest(first: &[u8], second: &[u8]) -> Vec<u8> {
 /// The commits a sync put on the tip with nothing in them until the files it held out of them
 /// are settled: what a settling made a commit of its own would leave empty.
 pub fn waiting_on_settling(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
-  if settles_into(&ws.root).is_none() {
-    return Ok(Vec::new());
-  }
+  let Some(into) = settles_into(&ws.root) else { return Ok(Vec::new()) };
   let from = made_from(ws);
   Ok(
     pending(store, ws)?
       .into_iter()
-      .filter(|(id, c)| c.changes.is_empty() && from.contains_key(id))
+      .filter(|(id, c)| c.changes.is_empty() && (from.contains_key(id) || *id == into))
       .map(|(_, c)| {
         let said = String::from_utf8_lossy(&c.rest).into_owned();
         said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
@@ -3052,6 +3050,29 @@ fn made_from(ws: &Workspace) -> std::collections::HashMap<Id, Id> {
 pub fn settles_into(root: &Path) -> Option<Id> {
   let text = std::fs::read_to_string(root.join(META).join("incomplete")).ok()?;
   text.lines().next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())
+}
+
+/// Give the last commit made here another message, keeping who wrote it and its trailers: for a
+/// settling committed under a message of Git's commit, as Git's rebase that stopped does.
+pub fn reword_last(store: &mut Store, ws: &mut Workspace, message: &str, committer: &str) -> Result<Id> {
+  let Some(last) = ws.base.filter(|_| ws.head == ws.base) else {
+    return Err("the commit to give the message to is not the last one here".into());
+  };
+  let was = Commit::load(store, &last)?;
+  let said = String::from_utf8_lossy(&was.rest).into_owned();
+  let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
+  let author = head.lines().find(|l| l.starts_with("author ")).unwrap_or_default();
+  let rest = format!("{author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes();
+  let rest = with_trailers(rest, &settled_lines(&was.rest));
+  let id = Commit { parents: was.parents.clone(), rest, changes: was.changes.clone() }.store(store)?;
+  root_of(store, &id)?;
+  store.flush()?;
+  ws.log("commit", &id)?;
+  let based = ws.base;
+  (ws.base, ws.head) = (Some(id), Some(id));
+  ws.save()?;
+  take_branch_along(store, ws, based)?;
+  Ok(id)
 }
 
 /// For `nv commit` given no message: where a sync left files out of a commit of this workspace's

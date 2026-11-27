@@ -1692,6 +1692,44 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if merging.is_some() && amend {
     return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
   }
+  // A pull with --rebase that stopped at commits of this workspace's own, waiting with nothing in
+  // them for the files the sync held out of them: as in Git's rebase stopped there, a commit is
+  // the settling of those, under the message given where the one it completes is the last.
+  let waiting = workspace::waiting_on_settling(&mut repo.store, &repo.ws)?;
+  if !waiting.is_empty() {
+    if amend {
+      return fatal(
+        128,
+        "fatal: You are in the middle of a pull --rebase that stopped -- cannot amend.\nSettle the files, `git add` them, and `git rebase --continue`, or `git commit -m <message>`.",
+      );
+    }
+    let last_waits = workspace::pending(&mut repo.store, &repo.ws)?.last().is_some_and(|(_, c)| c.changes.is_empty());
+    if messages.first().is_some() && !last_waits {
+      return fatal(
+        128,
+        format!(
+          "fatal: the pull --rebase stopped at commits before the last one made here ({}): `git rebase --continue` completes them under their own messages.",
+          waiting.join("; ")
+        ),
+      );
+    }
+    let Some(mut id) = workspace::complete_settling(&mut repo.store, &mut repo.ws, "nv <nv@localhost>", workspace::Look::Everywhere)?
+    else {
+      return fatal(1, "nothing to commit: the settling is not on disk");
+    };
+    if let Some(message) = messages.first() {
+      let committer = identity(&repo, "COMMITTER")?;
+      id = workspace::reword_last(&mut repo.store, &mut repo.ws, &cleaned(message), &committer)?;
+    }
+    repo.set_staged(&Staged::new())?;
+    if !silent {
+      let made = Commit::load(&mut repo.store, &id)?;
+      let branch = repo.branch().unwrap_or_else(|| "detached HEAD".into());
+      let oid = repo.git_oid(&id)?;
+      println!("[{branch} {}] {}", &oid[..abbrev()], told(&made.rest).message.lines().next().unwrap_or_default());
+    }
+    return Ok(0);
+  }
   // A ref only goes forward: a commit it has is not made again. After a sync that could not
   // merge, that is someone else's commit, with this workspace's work on top as changes to commit;
   // after a push, this workspace's own, which the next push could not put anywhere.

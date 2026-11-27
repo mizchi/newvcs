@@ -2263,6 +2263,27 @@ fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
   // A ref it does not push to is not this one.
   let (code, said) = run("bob", "$NV git push origin other");
   assert_eq!(code, 125, "{said}");
+  // A commit of nothing but a file that clashes, settled as Git's rebase is: `git add`, then
+  // `git rebase --continue`, which completes it under its own message.
+  run("bob", "$NV git pull --rebase -q >/dev/null");
+  run("ann", "printf 'ANN\\nb\\nann\\n' > list && $NV git commit -q -am 'Ann shouts' && $NV git push -q");
+  run("bob", "printf 'BOB\\nb\\nann\\n' > list && $NV git commit -q -am 'Bob shouts'");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 1, "{said}");
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("both sides changed the same lines of: list"), "{said}");
+  // Undone as Git's rebase is, to what was there before.
+  let (code, said) = run("bob", "$NV git rebase --abort");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "BOB\nb\nann\n");
+  run("bob", "$NV git pull --rebase -q >/dev/null");
+  let (code, said) = run("bob", "printf 'ANN BOB\\nb\\nann\\n' > list && $NV git add list && $NV git rebase --continue");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Bob shouts\nAnn shouts\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "list\n");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 0, "{said}");
 }
 
 /// Where a sync made the commits one, it says so, and not that each will get its version of the

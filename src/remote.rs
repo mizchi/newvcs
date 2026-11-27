@@ -1375,8 +1375,11 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // settling goes into that commit. Where any of this is not so, they are one commit.
   let mut settles_into: Option<Id> = None;
   let mut origins: Vec<(Id, Id)> = Vec::new();
-  let base = match (published.is_empty(), ws.base) {
-    (false, Some(was)) => {
+  // Commits of this workspace's own whose changes are all held out until the settling are put on
+  // the tip with nothing in them, not dropped with their messages: the settling completes them.
+  let holds = !published.is_empty() || (had_some && !unsettled.is_empty());
+  let base = match (holds, ws.base) {
+    (true, Some(was)) => {
       let replayed: Option<Replayed> = if still_mine > 1 {
         (|| -> Result<Option<Replayed>> {
           let mut own = Vec::new();

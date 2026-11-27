@@ -9,6 +9,8 @@ Patterns:
               only write, test and note (prompts/worker-supervised.md); a watcher in each
               workspace, the tests behind every write, a commit at each state that passes
   nv          each developer commits, pushes and syncs with nv itself (prompts/worker-nv.md)
+  nv-git      the same workspaces, and the Git prompt: `git` on the path is nv's (tools/git-shim),
+              and the developers use Git's verbs (prompts/worker-nv-git.md)
   parallel    the supervisor's work in two: a planner that only tells the developers how to keep
               apart and writes the rules of settling (prompts/supervisor-plan.md), then an
               integrator for each developer (prompts/integrator.md), all at once
@@ -131,7 +133,7 @@ class Round:
         project = self.task.get("project", "a small Python package")
         base = {"BIN": str(self.bin), "WORK": str(self.work), "COMMON": common, "TEST": test, "N": str(self.n),
                 "A_PROJECT": f"{project} with its tests", "ONE_PROJECT": "one " + project.split(" ", 1)[1]}
-        worker = {"supervisor": "worker-supervised.md", "parallel": "worker-supervised.md", "nv": "worker-nv.md", "git": "worker-git.md"}[self.a.pattern]
+        worker = {"supervisor": "worker-supervised.md", "parallel": "worker-supervised.md", "nv": "worker-nv.md", "nv-git": "worker-nv-git.md", "git": "worker-git.md"}[self.a.pattern]
         template = (HERE / "prompts" / worker).read_text()
         out = {}
         for i, (d, task) in enumerate(zip(self.dirs(), self.task["tasks"]), 1):
@@ -159,6 +161,10 @@ class Round:
         env = dict(self.env, GIT_AUTHOR_NAME=name, GIT_COMMITTER_NAME=name, PWD=str(cwd))
         # Nothing of where the harness was run from: an agent's `$OLDPWD/..` wrote into the repository.
         env.pop("OLDPWD", None)
+        if self.a.pattern == "nv-git":
+            # `git` is nv's, for the agents only; what Git itself is asked (its version) is Git's.
+            real = shutil.which("git", path=self.env["PATH"].split(":", 1)[1])
+            env.update(PATH=f"{HERE.parent.parent / 'tools' / 'git-shim' / 'bin'}:{env['PATH']}", NV_BIN=self.nv, NV_REAL_GIT=real or "/usr/bin/git")
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
         return {"proc": proc, "started": time.time(), "ended": None}
 
@@ -290,7 +296,7 @@ print(result.testsRun - len(result.failures) - len(result.errors), result.testsR
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--task", required=True)
-    p.add_argument("--pattern", required=True, choices=["supervisor", "parallel", "nv", "git"])
+    p.add_argument("--pattern", required=True, choices=["supervisor", "parallel", "nv", "nv-git", "git"])
     p.add_argument("--nv", required=True, help="the nv binary (copied: a build made meanwhile does not change the round)")
     p.add_argument("--server", default="http://localhost:8799")
     p.add_argument("--work", required=True)
