@@ -1431,12 +1431,10 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
                 changes.push((path.clone(), new));
               }
             }
-            if changes.is_empty() {
-              // Its change is on the tip already; but a commit a clash belongs to has to be there,
-              // and one that changed nothing but such files would be gone, with its message.
-              if owner == Some(i) || left_out {
-                return Ok(None);
-              }
+            // Its change is on the tip already: it is not made again. But one that changed files
+            // left with both versions, and nothing else, is on the tip with nothing in it, until the
+            // settling gives it its version of them (`commit_state`).
+            if changes.is_empty() && !left_out {
               continue;
             }
             let id = Commit { parents: vec![prev], rest: c.rest.clone(), changes }.store(store)?;

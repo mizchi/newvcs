@@ -2145,10 +2145,14 @@ stops.
   the settling brought in (three-way: from the last commit's version, to
   its own and to the settled one), and the same trailer, as a rebase
   stopped at each would have them; where that does not merge clean, the
-  commit keeps the tip's version and nothing says so. Where that cannot
-  be (a commit clashes with the ref on the way though the commits together
-  do not; a commit changed nothing but files left with both versions; a
-  directory set whole), they are one commit,
+  commit keeps the tip's version and nothing says so. A commit that
+  changed nothing but such files is on the tip with nothing in it until
+  then; where its version does not merge clean, it is one commit with the
+  one after it, under the lines of both. While such a commit waits, the
+  settling cannot be made a commit of its own (`nv commit <dir>
+  <message>` is refused and says to give no message). Where none of this
+  can be (a commit clashes with the ref on the way though the commits
+  together do not; a directory set whole), they are one commit,
   under the lines of all of them (their summary lines joined by `; `, their
   bodies one after another), and the sync says so. The model in
   `formal/sync` folds them always: it does not cover the commits put on the

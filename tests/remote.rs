@@ -2197,6 +2197,58 @@ fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
   assert!(said.contains("a commit needs a message"), "{said}");
 }
 
+/// Where a sync made the commits one, it says so, and not that each will get its version of the
+/// files it left with both versions.
+#[test]
+fn a_sync_that_folds_says_what_the_settling_completes() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-fold-and-clash");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/fold-and-clash-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '1\n2\n3\n' > f && printf 'one\n' > g
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf '1\\n2\\nann\\n' > f && echo 'one by ann' > g && $NV commit . 'Ann' >/dev/null && $NV push . >/dev/null");
+  run(
+    "bob",
+    "printf '1\\n2\\nbob\\n' > f && $NV commit . 'Bob tries' >/dev/null && printf '1\\n2\\n3\\n' > f && echo 'one by bob' > g && echo h > h && $NV commit . 'Bob instead' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("now one commit") && said.contains("both sides changed the same lines of: g"), "{said}");
+  assert!(!said.contains("each commit of yours"), "{said}");
+  assert!(said.contains("they complete the commit of yours"), "{said}");
+}
+
 #[test]
 fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   let Ok(server) = std::env::var("NV_SERVER") else {
@@ -2265,8 +2317,10 @@ fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"));
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
-  // A commit that changed nothing but such a file would be left with nothing: they are one
-  // commit, under the lines of both, rather than lose its message.
+  // A commit that changed nothing but such a file is not folded into the others either: it is
+  // on the tip with nothing in it until the settling, which gives it its version, as a rebase
+  // stopped at it would have it settled (`eval/agent-bench`, `bst-cst`: a writer's commit of a
+  // shared lemma alone folded all its commits, in every round).
   run(
     "ann",
     "$NV sync . >/dev/null; printf '# list\\n- ann2\\n' > README.md && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Ann again' >/dev/null && $NV push . >/dev/null",
@@ -2278,6 +2332,20 @@ fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   );
   let (code, said) = run("bob", "$NV push . ; $NV sync .");
   assert_eq!(code, 1, "{said}");
-  assert!(said.contains("now one commit"), "{said}");
-  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Note z; Add w\nAnn again\n", "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  // Settled as a commit of its own, the first would be pushed with nothing in it: refused.
+  let (code, said) = run("bob", "printf '# list\\n- ann2\\n- z\\n- w\\n' > README.md && $NV commit . 'Settle the list'");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("Note z") && said.contains("with no message"), "{said}");
+  let (code, said) = run("bob", "$NV commit .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add w\nNote z\nAnn again\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\n");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann2\n- z\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\nw.py\n");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
 }

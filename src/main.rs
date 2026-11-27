@@ -467,6 +467,17 @@ fn run(args: &[String]) -> Result<()> {
       // The message given, or else the one drafted for the state this commit is of.
       let given = args.get(2).filter(|a| !["--recorded", "--tracked", "--no-checks"].contains(&a.as_str()));
       let config = newvcs::checks::load(&ws.root)?;
+      // Given one while commits of this workspace's own wait on the settling with nothing in them,
+      // the settling made a commit of its own would leave them so: refused, before anything.
+      if given.is_some() && !newvcs::colocated::shared(&ws.root) {
+        let waiting = workspace::waiting_on_settling(&mut store, &ws)?;
+        if !waiting.is_empty() {
+          return Err(format!(
+            "these commits made here hold nothing until the files the last sync held out of them are settled: {}. Given a message, the settling would be a commit of its own and they would stay empty; run `nv commit <dir>` with no message, which gives each of them its version",
+            waiting.join("; ")
+          ));
+        }
+      }
       // Given none, the settling of what a sync held out of a commit of this workspace's own
       // completes that commit, under its message.
       if given.is_none() && !newvcs::colocated::shared(&ws.root) && workspace::settles_into(&ws.root).is_some() {
@@ -1164,10 +1175,14 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     text.push_str(&format!(
       "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers, and is left out of the commit put on the ref's tip. {}",
       s.conflicts.join(", "),
-      if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
+      if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) && s.folded > 1 {
+        "Edit them: once the conditions pass on them, they complete the commit of yours put on the tip, under its message. Then `nv push`."
+      } else if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
         "Edit them: once the conditions pass on them, each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one (where you have none, they are a commit of their own; `nv pending` lists what each is held out of). Then `nv push`."
       } else {
-        if newvcs::workspace::settles_into(root).is_some() {
+        if newvcs::workspace::settles_into(root).is_some() && s.folded > 1 {
+          "Edit them, then `nv commit <dir>` with no message: they complete the commit of yours put on the tip, under its message. Then `nv push`."
+        } else if newvcs::workspace::settles_into(root).is_some() {
           "Edit them, then `nv commit <dir>` with no message: each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one, each under its message (`nv pending` lists what each is held out of). Then `nv push`."
         } else {
           "Edit them, then `nv commit` and `nv push`."

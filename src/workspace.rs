@@ -2058,11 +2058,27 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
       // with what the settling brought in that the last version did not have, where that merges
       // clean. As a rebase that stopped at each of them would have them settled.
       let earlier = earlier_settled(store, ws, &chain[..at_short], short, &changes)?;
-      let first = earlier.iter().position(|e| !e.is_empty()).unwrap_or(at_short);
+      // A commit the sync left with nothing in it until now, whose version of the files does not
+      // merge clean, is not left empty: it is one with the commit after it, under the lines of both.
+      let empty: Vec<bool> = (0..at_short).map(|k| chain[k].1.changes.is_empty() && earlier[k].is_empty()).collect();
+      let first = (0..at_short).find(|&k| !earlier[k].is_empty() || empty[k]).unwrap_or(at_short);
       let lines = settling_lines(ws, &changes);
       let mut parents = chain[first].1.parents.clone();
       let mut made = None;
+      let mut carried: Option<Vec<u8>> = None;
       for (j, (_, c)) in chain.iter().enumerate().skip(first) {
+        if j < at_short && empty[j] {
+          carried = Some(match carried.take() {
+            Some(before) => joined_rest(&before, &c.rest),
+            None => c.rest.clone(),
+          });
+          continue;
+        }
+        let rest = match carried.take() {
+          Some(before) => joined_rest(&before, &c.rest),
+          None => c.rest.clone(),
+        };
+        let c = &Commit { parents: c.parents.clone(), rest, changes: c.changes.clone() };
         let add: &[Change] = if j < at_short {
           &earlier[j]
         } else if j == at_short {
@@ -2829,6 +2845,41 @@ fn with_settled(_store: &mut Store, ws: &Workspace, rest: Vec<u8>, changes: &[Ch
     .collect();
   set_settling(ws, &kept)?;
   Ok(with_trailers(rest, &lines))
+}
+
+/// The message of two commits as one: their summary lines joined by `; `, their bodies one after
+/// the other, under the author and committer of the second.
+fn joined_rest(first: &[u8], second: &[u8]) -> Vec<u8> {
+  let split = |rest: &[u8]| -> (String, String, String) {
+    let said = String::from_utf8_lossy(rest).into_owned();
+    let (head, message) = said.split_once("\n\n").map_or((said.clone(), String::new()), |(h, m)| (h.to_string(), m.trim_end().to_string()));
+    let (subject, body) = message.split_once("\n\n").map_or((message.clone(), String::new()), |(s, b)| (s.to_string(), b.to_string()));
+    (head, subject.lines().next().unwrap_or_default().trim().to_string(), body.trim().to_string())
+  };
+  let ((_, s1, b1), (head, s2, b2)) = (split(first), split(second));
+  let subject = if s1.is_empty() || s1 == s2 { s2 } else { format!("{s1}; {s2}") };
+  let bodies: Vec<String> = [b1, b2].into_iter().filter(|b| !b.is_empty()).collect();
+  let message = if bodies.is_empty() { subject } else { format!("{subject}\n\n{}", bodies.join("\n\n")) };
+  format!("{head}\n\n{message}\n").into_bytes()
+}
+
+/// The commits a sync put on the tip with nothing in them until the files it held out of them
+/// are settled: what a settling made a commit of its own would leave empty.
+pub fn waiting_on_settling(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
+  if settles_into(&ws.root).is_none() {
+    return Ok(Vec::new());
+  }
+  let from = made_from(ws);
+  Ok(
+    pending(store, ws)?
+      .into_iter()
+      .filter(|(id, c)| c.changes.is_empty() && from.contains_key(id))
+      .map(|(_, c)| {
+        let said = String::from_utf8_lossy(&c.rest).into_owned();
+        said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+      })
+      .collect(),
+  )
 }
 
 /// The trailer of each file settled among these changes, by path: what `with_settled` would add.
