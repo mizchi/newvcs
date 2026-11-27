@@ -144,7 +144,7 @@ around them. `stackc-cst` merges the shared files by `tools/merge-cst` (Lean by 
 | `stackc`, git | 3 | 92.1, 113.1, 114.2 | 1.29 to 1.34 | 45 to 49 | 4 to 6 | 6 to 8 | |
 | `stackc`, nv | 3 | 94.1, 105.5, 112.2 | 1.35 to 1.43 | 40 to 44 | 4 to 5 | 4 to 5 | |
 | `stackc-cst`, git | 3 | 71.1, 75.1, 98.1 | 1.01 to 1.19 | 31 to 37 | 3 to 5 | 0 | 0 |
-| `stackc-cst`, nv, driver as first written | 6 | 94.3 to 205.2 | 1.15 to 1.50 | 35 to 44 | 3 to 6 | 0 | 1 a round |
+| `stackc-cst`, nv, driver as first written | 6 | 94.3 to 205.2 | 1.15 to 1.50 | 35 to 44 | 3 to 6 | 0 | 0 to 1 a round |
 | `stackc-cst`, nv, driver in the base's order | 3 | 79.1, 83.1, 85.1 | 1.23 to 1.32 | 38 to 40 | 3 to 5 | 0 | 0 |
 | `stackc-cst`, nv, and `nv help` short | 3 | **67.0, 70.1, 73.0** | 1.12, 1.12, 1.13 | 33 to 36 | 3 to 5 | 0 | 0 |
 
