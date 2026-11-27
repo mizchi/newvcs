@@ -2111,9 +2111,18 @@ stops.
   timed locally, and a worker's limits on time and memory have not been
   met by a real file of a gigabyte. Nothing yet fetches a large file only
   when it is opened.
-- A workspace with several unpushed commits that has to catch up first gets
-  them back as one commit, under the lines of all of them (their summary
-  lines joined by `; `, their bodies one after another); the sync says so.
+- A workspace with several unpushed commits that has to catch up gets them
+  put on the ref's tip one by one, each with its message, where each file of
+  each merges as a sync merges and the last comes to the same files as one
+  commit would; a file left with both versions belongs to the one commit
+  that changed it, and its settling goes into that commit, those after it
+  made again on top. Where that cannot be (a commit clashes with the ref on
+  the way though the commits together do not; two of them changed the file
+  left with both versions; a directory set whole), they are one commit,
+  under the lines of all of them (their summary lines joined by `; `, their
+  bodies one after another), and the sync says so. The model in
+  `formal/sync` folds them always: it does not cover the commits put on the
+  tip one by one.
 - The server compares paths. Two changes to different functions of one file
   need a sync and a second push from one of the writers; the merge is the
   client's. A push that was refused stays on the server as a row nobody

@@ -2063,10 +2063,21 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
       whole.sort_by(|a, b| a.0.cmp(&b.0));
       let _ = std::fs::remove_file(incomplete_file(ws));
       let rest = with_settled(store, ws, was.rest.clone(), &whole)?;
-      let made = Commit { parents: was.parents.clone(), rest, changes: whole }.store(store)?;
+      let mut made = Commit { parents: was.parents.clone(), rest, changes: whole }.store(store)?;
+      root_of(store, &made)?;
+      // Those after it, made again on top as they were: none of them changed what was settled.
+      let after: Vec<Commit> = {
+        let chain = pending(store, ws)?;
+        let at = chain.iter().position(|(id, _)| *id == short).map_or(chain.len(), |i| i + 1);
+        chain[at..].iter().map(|(_, c)| c.clone()).collect()
+      };
+      let last_was = ws.base;
+      for later in after {
+        made = Commit { parents: vec![made], rest: later.rest, changes: later.changes }.store(store)?;
+        root_of(store, &made)?;
+      }
       // The settling does not answer for the message: what was said of its base still stands.
-      if let Some((moved, under)) = moved_under(ws).filter(|(id, _)| *id == short) {
-        let _ = moved;
+      if let Some((_, under)) = moved_under(ws).filter(|(id, _)| Some(*id) == last_was || *id == short) {
         set_moved(ws, Some(made), &under)?;
       }
       made
@@ -2872,7 +2883,9 @@ fn incomplete(store: &mut Store, ws: &Workspace) -> Result<Option<(Id, Vec<Vec<u
   let Ok(text) = std::fs::read_to_string(incomplete_file(ws)) else { return Ok(None) };
   let mut lines = text.lines();
   let Some(id) = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok()) else { return Ok(None) };
-  if ws.base != Some(id) || unheard(ws).exists() || pending(store, ws)?.last().map(|(c, _)| *c) != Some(id) {
+  // One of the commits not pushed (a sync puts them on the tip one by one, and a clash is the
+  // one's that changed the file); those after it are made again on top when it is completed.
+  if unheard(ws).exists() || !pending(store, ws)?.iter().any(|(c, _)| *c == id) {
     return Ok(None);
   }
   Ok(Some((id, lines.map(|l| l.as_bytes().to_vec()).collect())))

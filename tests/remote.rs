@@ -1940,8 +1940,23 @@ fn commits_a_sync_makes_one_keep_all_their_lines() {
   );
   let (code, said) = run("bob", "$NV push . ; $NV sync .");
   assert_eq!(code, 0, "{said}");
-  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step A; Step B\nAnn edits five\n", "{said}");
-  assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why A.\n\nWhy B.");
+  // Put on the tip one by one, each with its message: a supervisor's commits stay as it made
+  // them (round 17: two noted steps came out of a sync as one).
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Step B\nStep A\nAnn edits five\n", "{said}");
+  assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why B.");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1.trim(), "f");
+  assert_eq!(run("bob", "cat f").1, "bob\n2\n3\n4\nann\n");
+  assert!(!said.contains("now one commit"), "{said}");
+  // Where they cannot be put on it one by one (the first clashes with theirs, the second takes
+  // it back), they are one commit as before, under the lines of all of them.
+  run("bob", "$NV push . >/dev/null");
+  run("ann", "$NV sync . >/dev/null; sed -i 's/^3$/ann3/' f && $NV commit . 'Ann edits three' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run(
+    "bob",
+    "sed -i 's/^3$/bob3/' f && $NV commit . 'Step C' >/dev/null && sed -i 's/^bob3$/3/' f && echo k > k && $NV commit . 'Step D' >/dev/null && $NV push . ; $NV sync .",
+  );
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step C; Step D\nAnn edits three\n", "{said}");
   assert!(said.contains("under the lines of all of them"), "{said}");
   // Commits that came are counted though the store, which Ann's fork shares, had them already
   // (twelfth round: "caught up 0 commits", from two reviewers).
@@ -1956,4 +1971,72 @@ fn commits_a_sync_makes_one_keep_all_their_lines() {
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 0, "{said}");
   assert!(said.contains("caught up 1 commit"), "{said}");
+}
+
+/// A clash in a file only one of the commits put on the tip changed: the commits stay commits of
+/// their own, and the settling goes into the one that changed the file, with those after it made
+/// again on top (round 17: the supervisor's two commits were made one by the sync that clashed).
+#[test]
+fn a_settling_goes_into_the_commit_that_changed_the_file() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-in-place");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-in-place-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      printf '[checks.unit]\nrun = "! grep -q none README.md && ! grep -q markers README.md"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run(
+    "ann",
+    "printf '# list\\n- ann\\n' > README.md && echo a > a.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add a' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- bob\\n' > README.md && echo x > x.py && $NV checkpoint . >/dev/null && echo y > y.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Add x' 2 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "still two commits: {said}");
+  // Settled, and committed as the conditions pass: into "Add x", which changed README.md.
+  run("bob", "printf '# list\\n- ann\\n- bob\\n' > README.md && $NV checkpoint . >/dev/null");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "y.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"), "the trailer is on the commit it settled");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
 }

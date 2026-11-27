@@ -1360,15 +1360,111 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // This workspace's own work, now on top of the tip: what it had published
   // but not pushed stays one published commit, with the message it had, and
   // what it had only recorded stays recorded on top of that.
+  // They are put on the tip one by one, each with its message, where that can be done: each
+  // file of each merged with what is there as a sync merges, and the last coming to the same
+  // files as the one commit would. A clash is the commit's that changed the file, where one did;
+  // its settling goes into that commit. Where any of this is not so, they are one commit.
+  let mut settles_into: Option<Id> = None;
   let base = match (published.is_empty(), ws.base) {
     (false, Some(was)) => {
-      let rest = folded_rest(store, was, still_mine, common)?;
-      let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
-      root_of(store, &id)?;
-      // A commit of this workspace's own, like the one it stands for: logged once it is stored.
-      store.flush()?;
-      ws.log("commit", &id)?;
-      id
+      let replayed: Option<(Vec<Id>, Option<Id>)> = if still_mine > 1 {
+        (|| -> Result<Option<(Vec<Id>, Option<Id>)>> {
+          let mut own = Vec::new();
+          let mut at_id = Some(was);
+          for _ in 0..still_mine {
+            let Some(id) = at_id else { return Ok(None) };
+            own.push(id);
+            at_id = Commit::load(store, &id)?.parents.first().copied();
+          }
+          own.reverse();
+          let commits: Vec<Commit> = own.iter().map(|id| Commit::load(store, id)).collect::<Result<_>>()?;
+          if commits.iter().any(|c| c.changes.iter().any(|(_, e)| e.is_some_and(|e| e.is_dir()))) {
+            return Ok(None);
+          }
+          let clashed: Vec<Vec<u8>> = done.conflicts.iter().map(|p| p.as_bytes().to_vec()).collect();
+          let mut owner: Option<usize> = None;
+          for path in &clashed {
+            let touching: Vec<usize> =
+              commits.iter().enumerate().filter(|(_, c)| c.changes.iter().any(|(p, _)| p == path)).map(|(i, _)| i).collect();
+            match (touching.as_slice(), owner) {
+              ([one], None) => owner = Some(*one),
+              ([one], Some(known)) if *one == known => {}
+              _ => return Ok(None),
+            }
+          }
+          let mut prev = tip;
+          let mut made = Vec::new();
+          let mut owned = None;
+          for (i, c) in commits.iter().enumerate() {
+            let (parent_root, running_root) = (root(store, c.parents.first().copied())?, root(store, Some(prev))?);
+            let mut changes = Vec::new();
+            for (path, entry) in &c.changes {
+              if clashed.contains(path) {
+                continue;
+              }
+              let (was_there, now) = (at(store, parent_root, path)?, at(store, running_root, path)?);
+              let new = if now == was_there {
+                *entry
+              } else if now == *entry {
+                continue;
+              } else {
+                match (now, *entry) {
+                  (Some(theirs), Some(ours)) => match three_way(store, path, was_there, ours, theirs)? {
+                    Some((text, true, mode)) => Some(Entry { mode, id: store.put(Kind::Blob, &text, Some(ours.id))? }),
+                    _ => return Ok(None),
+                  },
+                  _ => return Ok(None),
+                }
+              };
+              if new != now {
+                changes.push((path.clone(), new));
+              }
+            }
+            if changes.is_empty() {
+              // Its change is on the tip already; but a commit a clash belongs to has to be there.
+              if owner == Some(i) {
+                return Ok(None);
+              }
+              continue;
+            }
+            let id = Commit { parents: vec![prev], rest: c.rest.clone(), changes }.store(store)?;
+            root_of(store, &id)?;
+            if owner == Some(i) {
+              owned = Some(id);
+            }
+            made.push(id);
+            prev = id;
+          }
+          // The same files as the one commit, or not at all.
+          let one = Commit { parents: vec![tip], rest: Vec::new(), changes: published.clone() }.store(store)?;
+          if root(store, Some(prev))? != root(store, Some(one))? || made.is_empty() {
+            return Ok(None);
+          }
+          Ok(Some((made, owned)))
+        })()?
+      } else {
+        None
+      };
+      match replayed {
+        Some((made, owned)) => {
+          store.flush()?;
+          for id in &made {
+            ws.log("commit", id)?;
+          }
+          done.folded = 0;
+          settles_into = owned;
+          *made.last().expect("not empty")
+        }
+        None => {
+          let rest = folded_rest(store, was, still_mine, common)?;
+          let id = Commit { parents: vec![tip], rest, changes: published.clone() }.store(store)?;
+          root_of(store, &id)?;
+          // A commit of this workspace's own, like the one it stands for: logged once it is stored.
+          store.flush()?;
+          ws.log("commit", &id)?;
+          id
+        }
+      }
     }
     _ => tip,
   };
@@ -1391,16 +1487,24 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // The commit of this workspace's own that the sync put on the tip without those files, if it
   // has one: their settling goes into it (`commit_state`).
   let own = Some(base) != Some(tip) && !done.conflicts.is_empty();
-  workspace::set_incomplete(ws, own.then_some(base), &done.conflicts)?;
+  workspace::set_incomplete(ws, own.then_some(settles_into.unwrap_or(base)), &done.conflicts)?;
   // A commit of this workspace's own put on commits of others that change files it changes: its
   // message was written on another base, and what it says of what was there may not hold.
   if Some(base) != standing.base {
     let mut over: Vec<String> = Vec::new();
     if Some(base) != Some(tip) {
       let mine = Commit::load(store, &base)?;
-      // Its paths, and those the sync left out of it, which are its as well.
+      // Its paths, and those of the commits of its own put on the tip below it, and those the sync
+      // left out of them, which are theirs as well.
+      let mut own_changes: Vec<Vec<u8>> = Vec::new();
+      let mut at_own = Some(base);
+      while let Some(id) = at_own.filter(|id| *id != tip) {
+        let c = Commit::load(store, &id)?;
+        own_changes.extend(c.changes.iter().map(|(p, _)| p.clone()));
+        at_own = c.parents.first().copied();
+      }
       let paths: std::collections::HashSet<&[u8]> =
-        mine.changes.iter().map(|(p, _)| p.as_slice()).chain(done.conflicts.iter().map(|p| p.as_bytes())).collect();
+        own_changes.iter().map(|p| p.as_slice()).chain(done.conflicts.iter().map(|p| p.as_bytes())).collect();
       let mut at = Some(tip);
       let mut walked = 0;
       while let Some(id) = at.filter(|id| Some(*id) != common) {
