@@ -426,6 +426,34 @@ round 17's history answered five of six, question 5 by the trailers, as round 16
   not be split again. Its report said the rebuild had dropped the `Settled:` trailer; the trailer
   is on the commit (`nv rebuild` keeps it), and the report was wrong.
 
+## Round 18 (2026-11-27): round 17 again, after commits are put on the tip one by one
+
+Round 17's prompts and seed, run again after a sync started putting a workspace's unpushed
+commits on the ref's tip one by one rather than as one (README, "Not done"). `CONFLICT=1`.
+
+| | 17 (supervisor) | 18 (supervisor) |
+| --- | ---: | ---: |
+| launch to the last push, s | 267.3 | 264.7 |
+| developer done to the ref, median, s | 57.5 | 50.7 |
+| version control's tokens above starts | 32,655 | 30,337 |
+| total tokens | 331,843 | 324,429 |
+| version control's tool calls | 23 | 21 |
+
+All gates passed: four commits, each passing its tests, no markers, no provisional message.
+Both pushes after the first were refused over `README.md` and settled by the supervisor in one
+try each, as in round 17; each settling commit carries its `Settled:` trailer.
+
+- **What the round was for did not come up.** Developer 3 noted one step for both functions
+  (round 17's noted two), and the supervisor rebuilt every task as one commit, so no sync had
+  more than one commit to put on the tip.
+- **Round 17's case, run by a script** (two workspaces, the second with two noted commits that
+  each add a line to the Functions list): the sync still made them one, "Add word_count; Add
+  reading_time". Both commits changed `README.md`, the file left with both versions, and that is
+  one of the cases where the commits are folded (README, "Not done"). What round 17's supervisor
+  could not do, this one could not either.
+- **The supervisor's report was wrong again about a trailer**: it said the task 3 commit had no
+  `Settled:` line; 7182d1b has one, naming both commits it was settled with.
+
 ## Readers (2026-11-23): the history as memory for the next writer
 
 A fresh agent given only a bare Git repository of a round's history and `reader.md` (six questions:
