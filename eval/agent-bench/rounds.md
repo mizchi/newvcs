@@ -99,11 +99,45 @@ settling: the server merges such paths itself, Git's pull merges them. One round
   landed. That is what `merge=union` is, in nv as in Git (both sides' lines, where both changed
   the same ones), and it is safe for lines added, not for lines moved or removed.
 
+## Merged by the syntax tree (`strkit-cst`)
+
+`strkit` with `errors.py`, the README and the changelog given `merge=cst`, the driver of
+`tools/merge-cst` (tree-sitter, unit by unit, text with markers where it cannot decide), defined
+in every workspace and clone; `__init__.py` a union as before. nv at aaada63 (merge drivers),
+Git 2.43 running the same driver on its pulls.
+
+| | git | nv | supervisor | parallel |
+| --- | ---: | ---: | ---: | ---: |
+| rounds | 3 | 3 | 1 | 2 |
+| last agent done, s | 97.0, 98.0, 119.1 | **74.1, 78.0, 84.1** | 170.1 | 161.1, 168.1 |
+| tokens | 2.12 to 2.28 M | **1.60 M** | 2.76 M | 3.00, 3.11 M |
+| cost, USD | 1.54 to 1.65 | **1.36 to 1.38** | 1.93 | 2.61, 2.68 |
+| tool calls | 44 to 48 | **32** | 65 | 68, 63 |
+| pushes refused | 4 to 6 | 3 | 3 | 5, 4 |
+| files left with both versions | 0 | 0 | 0 | 0 |
+| commits, all passing their tests | 8 to 10 | 8 | 12 | 5, 7 |
+
+- **No clash in any round needed settling**: every file both sides changed was merged by the
+  driver, and every round reached all 28 acceptance tests. Against `strkit` (text merges), the
+  nv pattern is 25% quicker (100 to 78 s, medians) and 11% cheaper, with 16% fewer tool calls.
+- **nv against Git, with the same driver, no longer overlaps**: the slowest nv round (84 s) is
+  quicker than the quickest Git round (97 s), at fewer tokens and calls in every round. A push
+  refused costs either a sync or a pull and a second push; Git's writers made more of them, and
+  read more around them.
+- **The supervisor patterns gained nothing**: their time is the planner's and each agent's own
+  turns, not settling. The parallel one still has its integrators refused over each other
+  (the server runs no driver, and a refusal is a sync and a push of an agent's), and the planner
+  still holds everyone for 35 to 40 s.
+
 ## Not yet known
 
 - Four rounds of Git and three of v4 are few, and their ranges overlap: makespan 100 to 131 s
   against 98 to 123 s, tokens 1.96 to 2.58 M against 1.81 to 2.11 M, tool calls 40 to 54
   against 36 to 41. What does not overlap is the work redone by hand: 2 to 4 in every round of
   nv before v4, none in v4.
-- The supervisor has had three rounds, the parallel pattern six, `strkit-union` one of each.
+- The supervisor has had three rounds, the parallel pattern six, `strkit-union` one of each,
+  `strkit-cst` one or two of the supervisor patterns.
+- Whether the syntax-tree merge is right where nothing tests it: here the acceptance tests and
+  each writer's own checked what it made. Two units put in at one place, or a change to a unit
+  the other side moved, can each be right and wrong together.
 - One task. A task whose parts depend on each other, or that is larger, may tell otherwise.
