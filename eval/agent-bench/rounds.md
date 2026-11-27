@@ -176,6 +176,7 @@ by `tools/merge-cst`. 11 acceptance tests. nv at 3c58494 (short `nv help`).
 | git | 3 | 111.1, 113.1, 113.3 | 1.29 to 1.42 | 37 to 42 | 3 to 4 | 1 each | 0 |
 | nv | 3 | 121.1, 127.2, 134.1 | 1.50 to 1.56 | 43 to 45 | 4 each | 1 each | 1 each |
 | nv, a commit of clashed files alone kept (0a48480) | 3 | **105.1, 110.1, 117.1** | 1.45 to 1.70 | 40 to 50 | 3 to 7 | 0 to 1 | **0** |
+| nv, Git's verbs toward the ref (99416be) | 3 | **91.0, 91.1, 103.1** | 1.38 to 1.54 | 37 to 45 | 3 to 6 | 0 | 0 |
 | supervisor | 1 | 200.2 | 1.89 | 53 | 3 | 0 | 0 |
 | parallel | 1 | 190.3 | 2.55 | 60 | 4 | 3 | 1 |
 
@@ -196,6 +197,18 @@ reference: the longest a developer took was 134 s.
   against 10 or 11: the writers made fewer. One writer, finding its shared lemma already on the
   ref under the same name, set its work aside and made its commits again without it: what a
   Git writer amends.
+- **What the extra cost was**: against Git's rounds, nv's made 4.7 more model calls a round (47.7
+  against 43), each reading the whole context again: 260 thousand more tokens read from the
+  cache, most of the difference. 3.7 of those calls a round did nothing but look nv up (`nv help`,
+  `nv help all`, `nv help commit`); Git's writers know Git. The rest was a round with more pushes
+  refused (7, the order pushes arrive in) and one writer's own remaking of its commits.
+- **Git's verbs toward the ref** (99416be: `nv git push` is `nv push`, `nv git pull --rebase` is
+  `nv sync`, where they had gone to the repository the workspace was cloned from; the writer's
+  prompt says so in a clause): no writer used them. Every one still pushed and synced with nv's
+  own commands, as the prompt shows them, and looked nv up 3 to 5 times a round. The rounds were
+  quicker (91 to 103 s, median 91, against Git's 111 to 113) and a little cheaper (mean 1.47
+  against 1.54 before, Git 1.37), with 10 or 11 commits as Git's; none of it is from the verbs,
+  and three rounds do not separate it from the order pushes arrived in.
 
 ## Counting Git's refusals
 
