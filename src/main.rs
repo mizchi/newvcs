@@ -760,6 +760,7 @@ fn run(args: &[String]) -> Result<()> {
       if ws.pushed.or(ws.start).is_none() && !chain.is_empty() {
         println!("(this workspace has no ref it pushes to, nor a commit it was made at: all of its history is listed)");
       }
+      let held = workspace::held_out(&mut store, &ws)?;
       for (n, (id, commit)) in chain.iter().enumerate() {
         let said = String::from_utf8_lossy(&commit.rest).into_owned();
         let message = said.split_once("\n\n").map_or("", |(_, m)| m).trim();
@@ -783,6 +784,9 @@ fn run(args: &[String]) -> Result<()> {
           };
           println!("       {what} {}", String::from_utf8_lossy(path));
         }
+        for path in held.get(id).into_iter().flatten() {
+          println!("       {path} (held out until it is settled)");
+        }
         if let Some((_, under)) = workspace::moved_under(&ws).filter(|(moved, _)| moved == id) {
           println!(
             "       its message was written before it was put on top of: {} (they change files it changes); what it says of them may not hold. Read it: `nv rebuild` writes it again, or, given the same message, keeps it and says no more of it; a push does not wait on it",
@@ -799,6 +803,11 @@ fn run(args: &[String]) -> Result<()> {
           said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
         });
         let into = match into {
+          Some(first) if !held.is_empty() => {
+            format!(
+              "each commit above that changed them gets its own version of them, with what the settling brought in, and {first} the settled one"
+            )
+          }
           Some(first) => format!("they go into {first}, which they complete"),
           None => "they go into the last commit above, which they complete".to_string(),
         };
@@ -1156,10 +1165,10 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
       "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers, and is left out of the commit put on the ref's tip. {}",
       s.conflicts.join(", "),
       if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
-        "Edit them: once the conditions pass on them, they go into the commit of yours put on the tip, which they complete (where you have none, they are a commit of their own). Then `nv push`."
+        "Edit them: once the conditions pass on them, each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one (where you have none, they are a commit of their own; `nv pending` lists what each is held out of). Then `nv push`."
       } else {
         if newvcs::workspace::settles_into(root).is_some() {
-          "Edit them, then `nv commit <dir>` with no message: they complete the commit of yours put on the tip that changed them, under its message, and those after it stay on top. Then `nv push`."
+          "Edit them, then `nv commit <dir>` with no message: each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one, each under its message (`nv pending` lists what each is held out of). Then `nv push`."
         } else {
           "Edit them, then `nv commit` and `nv push`."
         }

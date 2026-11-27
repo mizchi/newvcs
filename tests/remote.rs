@@ -1367,7 +1367,7 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   // passing state is committed by itself.
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 1, "{said}");
-  assert!(said.contains("once the conditions pass on them, they go into the commit of yours put on the tip"), "{said}");
+  assert!(said.contains("once the conditions pass on them, each commit of yours that changed them gets its own version"), "{said}");
   assert!(said.contains("caught up 1 commit:"), "{said}");
   // Until it is settled, `nv pending` says the file is in none of the commits it lists.
   let (_, said) = run("bob", "$NV pending .");
@@ -2092,6 +2092,14 @@ fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
   let (code, said) = run("bob", "$NV push . ; $NV sync .");
   assert_eq!(code, 1, "{said}");
   assert!(said.contains("`nv commit <dir>` with no message"), "the sync says how: {said}");
+  assert!(said.contains("each commit of yours that changed them"), "and what becomes of the commits: {said}");
+  // What each commit is held out of until the settling, and where the settling goes.
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  assert!(
+    said.contains("each commit above that changed them gets its own version of them") && said.contains("Add y the settled one"),
+    "{said}"
+  );
   // Given no message with nothing to complete, or with more than the settling, it still asks for one.
   let (code, said) = run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && echo z > z.py && $NV commit .");
   assert_ne!(code, 0, "{said}");
@@ -2170,8 +2178,9 @@ fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
   assert!(!said.contains("now one commit"), "{said}");
   let (_, said) = run("bob", "$NV pending .");
   assert_eq!(said.matches("  git ").count(), 2, "still two commits: {said}");
-  // The earlier of the two is made without its line of README.md; the later is the one completed.
-  assert!(said.contains("they go into Add y"), "{said}");
+  // Both are held out of README.md until it is settled; the later is the one completed.
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  assert!(said.contains("and Add y the settled one"), "{said}");
   run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && $NV checkpoint . >/dev/null");
   let (_, said) = run("bob", "$NV pending .");
   assert_eq!(said.matches("  git ").count(), 2, "{said}");

@@ -2967,6 +2967,28 @@ pub(crate) fn set_made_from(ws: &Workspace, pairs: &[(Id, Id)]) -> Result<()> {
   crate::write_whole(&made_from_file(ws), pairs.iter().map(|(made, from)| format!("{} {}\n", hex(made), hex(from))).collect::<String>())
 }
 
+/// For each commit not pushed that a sync put on the tip, the files it changed that the sync
+/// holds out of it until they are settled.
+pub fn held_out(store: &mut Store, ws: &Workspace) -> Result<std::collections::HashMap<Id, Vec<String>>> {
+  let left = unsettled(ws);
+  let mut out = std::collections::HashMap::new();
+  if left.is_empty() {
+    return Ok(out);
+  }
+  for (made, from) in made_from(ws) {
+    let paths: Vec<String> = Commit::load(store, &from)?
+      .changes
+      .iter()
+      .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+      .filter(|path| left.contains(path))
+      .collect();
+    if !paths.is_empty() {
+      out.insert(made, paths);
+    }
+  }
+  Ok(out)
+}
+
 fn made_from(ws: &Workspace) -> std::collections::HashMap<Id, Id> {
   let id = |text: &str| unhex(text).and_then(|b| <Id>::try_from(b.as_slice()).ok());
   std::fs::read_to_string(made_from_file(ws))
