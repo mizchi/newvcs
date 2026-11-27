@@ -39,6 +39,11 @@ pub fn git_commit() -> Option<Duration> {
   seconds("NV_GIT_TIMEOUT", 300)
 }
 
+/// How long a merge driver may take on one file (`NV_MERGE_DRIVER_TIMEOUT`, 120 s).
+pub fn merge_driver() -> Option<Duration> {
+  seconds("NV_MERGE_DRIVER_TIMEOUT", 120)
+}
+
 /// How long one command may run in all (`NV_TIMEOUT`, 1800 s). A watcher is not one command.
 pub fn command() -> Option<Duration> {
   seconds("NV_TIMEOUT", 1800)

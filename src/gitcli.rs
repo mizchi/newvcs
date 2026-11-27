@@ -3175,17 +3175,6 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
   Ok(0)
 }
 
-/// Git's three-way merge of one file's text, by gitoxide: the merged bytes, and whether every change found its place.
-/// When not, the bytes hold both sides' lines between markers.
-fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8], their_name: &str, union: bool) -> (Vec<u8>, bool) {
-  merge_text_named(base, ours, theirs, "HEAD", their_name, union)
-}
-
-/// Git's three-way merge of a text file: `crate::union::merge_text`, which the server runs too.
-pub(crate) fn merge_text_named(base: &[u8], ours: &[u8], theirs: &[u8], our_name: &str, their_name: &str, union: bool) -> (Vec<u8>, bool) {
-  crate::union::merge_text(base, ours, theirs, our_name, their_name, union)
-}
-
 fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if has(args, "--abort") {
     if repo.merging().is_none() {
@@ -3323,13 +3312,15 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
         let binary = textdiff::binary(&b) || textdiff::binary(&o) || textdiff::binary(&t);
         // The mode goes with whichever side changed it.
         let mode = if ours.mode != base.mode { ours.mode } else { theirs.mode };
+        // A driver the configuration defines is given the file whatever it holds, as Git gives it.
+        let driven = matches!(crate::drivers::merge_of(&repo.ws.root, path), crate::union::Merge::Driver(ref d) if crate::drivers::command(&repo.ws.root, d).is_some());
         let content = if ours.id == theirs.id {
           Some(o.to_vec())
-        } else if binary {
+        } else if binary && !driven {
           None
         } else {
           merged_within.push(path.clone());
-          let (bytes, settled) = merge_text(&b, &o, &t, name, crate::eol::merges_by_union(&repo.ws.root, path));
+          let (bytes, settled) = crate::drivers::merge_file(&repo.ws.root, path, &b, &o, &t, ["merged common ancestors", "HEAD", name])?;
           if !settled {
             marked.push((path.clone(), bytes));
             continue;
@@ -3496,17 +3487,29 @@ fn brought(repo: &mut Repo, was: Id, now: Id) -> Res<()> {
   Ok(())
 }
 
+/// The keys `nv git config` sets: who commits, and Git's merge drivers (`merge.<name>.name`,
+/// `merge.<name>.driver`), which a merge of a path whose attributes name one runs.
+fn settable(key: &str) -> bool {
+  matches!(key, "user.name" | "user.email")
+    || key
+      .strip_prefix("merge.")
+      .and_then(|rest| rest.rsplit_once('.'))
+      .is_some_and(|(name, field)| !name.is_empty() && !name.contains(['\n', '=']) && matches!(field, "name" | "driver"))
+}
+
 fn config(repo: Repo, args: &[&str]) -> Res<i32> {
   match positional("config", args)[..] {
     [key] => match repo.config(key) {
       Some(value) => println!("{value}"),
       None => return Ok(1),
     },
-    [key @ ("user.name" | "user.email"), value] if !has(args, "--get") => {
+    [key, value] if !has(args, "--get") && settable(key) => {
       let mut file = std::fs::File::options().append(true).create(true).open(repo.meta("git-config")).map_err(|e| e.to_string())?;
       writeln!(file, "{key}={value}").map_err(|e| e.to_string())?;
     }
-    [key, _] => return unsupported(format_args!("config {key}` (only user.name and user.email can be set)")),
+    [key, _] => {
+      return unsupported(format_args!("config {key}` (only user.name, user.email and a merge driver's name and driver can be set)"));
+    }
     _ => return unsupported(format_args!("config {}", args.join(" "))),
   }
   Ok(0)

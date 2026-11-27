@@ -2041,6 +2041,79 @@ fn a_settling_goes_into_the_commit_that_changed_the_file() {
   assert_eq!(code, 0, "{said}");
 }
 
+/// A path whose `.gitattributes` names a merge driver is merged by a sync as Git merges it: by the
+/// command the workspace's configuration gives that driver, and only where it is defined there.
+/// A driver that says it could not merge leaves what it wrote, held out as a file with both
+/// versions is, for whoever settles it.
+#[test]
+fn a_sync_merges_by_the_driver_the_attributes_name() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-merge-driver");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/merge-driver-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      printf 'cat "$2" "$3" | awk %s > "$2.new" && mv "$2.new" "$2"\n' "'!seen[\$0]++'" > both.sh
+      printf 'echo "could not" > "$1"; exit 1\n' > refuse.sh
+      git init -q -b main src && cd src && printf 'a\nb\n' > list.txt && echo one > hard.txt
+      printf 'list.txt merge=both\nhard.txt merge=refuse\n' > .gitattributes
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list.txt && $NV commit . 'Ann lists' >/dev/null && $NV push . >/dev/null");
+  run("bob", "printf 'a\\nb\\nbob\\n' > list.txt && $NV commit . 'Bob lists' >/dev/null");
+  // Undefined here, the driver is no driver: the text merge, which leaves both versions.
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("both sides changed the same lines of: list.txt"), "{said}");
+  run("bob", "$NV restore . before-sync >/dev/null");
+  // Defined, it merges, and the sync is clean.
+  let (code, said) = run("bob", "$NV git config merge.both.driver 'sh ../both.sh %O %A %B' && $NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("bob/list.txt")).unwrap(), "a\nb\nbob\nann\n");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // A driver that says it could not merge and leaves no markers is not taken at its word: the
+  // file is merged as text, both versions between markers, held out until it is settled.
+  run("ann", "$NV sync . >/dev/null; echo 'one by ann' > hard.txt && $NV commit . 'Ann hard' >/dev/null && $NV push . >/dev/null");
+  run("bob", "echo 'one by bob' > hard.txt && $NV commit . 'Bob hard' >/dev/null");
+  let (code, said) = run("bob", "$NV git config merge.refuse.driver 'sh ../refuse.sh %A' && $NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("hard.txt"), "{said}");
+  assert!(std::fs::read_to_string(root.join("bob/hard.txt")).unwrap().starts_with("<<<<<<< yours\none by bob\n"));
+  let (code, said) = run("bob", "$NV commit . 'Bob hard, settled'");
+  assert_ne!(code, 0, "held out until it is settled: {said}");
+  assert!(said.contains("hard.txt"), "{said}");
+  // No file of the driver's is left behind in the workspace.
+  assert_eq!(run("bob", "ls .nv | grep -c '^merge-' || true").1.trim(), "0");
+}
+
 /// Without a runner behind writes, `nv commit` given no message is how a settling completes the
 /// commit it belongs to, as `git rebase --continue` keeps the message of the commit that stopped:
 /// no commit is left on the ref without the files the sync held out of it (`eval/agent-bench`,

@@ -1054,21 +1054,26 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   };
   // `merge=union` paths, as `.gitattributes` on disk says: both sides' lines, and merged.
   let ws_root = ws.root.clone();
-  let three_way =
-    |store: &mut Store, path: &[u8], was: Option<Entry>, ours: Entry, theirs: Entry| -> Result<Option<(Vec<u8>, bool, u32)>> {
-      // The mode is merged as the text is: whoever changed it from what both had, has it.
-      let mode = match was {
-        Some(was) if was.mode == ours.mode => theirs.mode,
-        _ => ours.mode,
-      };
-      let (was, ours, theirs) = (content(store, was.filter(|e| !e.is_dir()))?, content(store, Some(ours))?, content(store, Some(theirs))?);
-      if ours.contains(&0) || theirs.contains(&0) {
-        return Ok(None);
-      }
-      let (text, clean) =
-        crate::gitcli::merge_text_named(&was, &ours, &theirs, "yours", "theirs", crate::eol::merges_by_union(&ws_root, path));
-      Ok(Some((text, clean, mode)))
+  let three_way = |store: &mut Store,
+                   path: &[u8],
+                   was: Option<Entry>,
+                   ours: Entry,
+                   theirs: Entry|
+   -> Result<Option<(Vec<u8>, bool, u32)>> {
+    // The mode is merged as the text is: whoever changed it from what both had, has it.
+    let mode = match was {
+      Some(was) if was.mode == ours.mode => theirs.mode,
+      _ => ours.mode,
     };
+    let (was, ours, theirs) = (content(store, was.filter(|e| !e.is_dir()))?, content(store, Some(ours))?, content(store, Some(theirs))?);
+    // A driver the configuration defines is given the file whatever it holds, as Git gives it.
+    let driven = matches!(crate::drivers::merge_of(&ws_root, path), crate::union::Merge::Driver(ref d) if crate::drivers::command(&ws_root, d).is_some());
+    if (ours.contains(&0) || theirs.contains(&0)) && !driven {
+      return Ok(None);
+    }
+    let (text, clean) = crate::drivers::merge_file_marked(&ws_root, path, &was, &ours, &theirs)?;
+    Ok(Some((text, clean, mode)))
+  };
   let mut clash: Vec<String> = Vec::new();
   let name = |path: &[u8]| String::from_utf8_lossy(path).into_owned();
 

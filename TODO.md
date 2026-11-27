@@ -149,3 +149,9 @@ Nothing known: case 33 covers what was found, and everything listed before is fi
   look waits for the next write. Conditions run in the workspace, not a copy.
 - [ ] Share checkpoints with other workspaces, and run one's own conditions on another writer's
   checkpoint merged in, to take it in early.
+
+## Found by the agent bench
+
+- A sync whose own commit changed nothing but files left with both versions drops that commit,
+  message and all: settled, the files are a commit of their own, under a message the writer has
+  to give again (`a_sync_merges_by_the_driver_the_attributes_name`, Bob's "Bob hard").

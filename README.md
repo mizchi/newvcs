@@ -298,6 +298,17 @@ all of Git has it by keeping Git in the directory.
   `eol`, `-text`, `binary`), and for `merge=union`, which `git merge` and
   `nv sync` both honour: where both sides changed the same lines of such a
   path, both sides' lines are kept, ours first, and the path is merged.
+  `merge=<name>` is merged by the command `merge.<name>.driver` gives, as
+  in Git (`%O %A %B %L %P %S %X %Y`, the result left in `%A`, exit 0 where
+  it is clean), wherever the workspace's configuration (`nv git config
+  merge.<name>.driver <command>`) or Git's defines it, never the
+  repository's files; a name nobody defined is the text merge. `nv sync`
+  runs a driver as `git merge` does, but there is no index to hold a path
+  unmerged, and a file is unsettled for as long as it holds markers: a
+  driver that says it could not merge and leaves no `<<<<<<< yours` line
+  is not believed to have left something to settle by, and the file is
+  merged as text instead. The server runs no driver: a push that the ref
+  clashes with on such a path is refused, and the sync runs it.
   Line endings are read as Git does with `core.autocrlf` unset on a
   system whose line ending is LF. Filters, `ident` and
   `working-tree-encoding` are not applied. A file under `text=auto` that
@@ -2157,10 +2168,8 @@ stops.
 - A fork keeps build output, but whether a build tool still trusts it under
   a new absolute path has not been tried.
 - In a workspace with no Git beside it, `.gitattributes` is read for line
-  endings and `merge=union` only: no filters, no LFS, no `-merge` (it is
-  merged as text), no merge drivers of one's own (`merge=<name>` with
-  `merge.<name>.driver`, which would let a syntax-aware tool or an agent
-  settle a conflict before a person sees it). Beside Git, commits are Git's and
+  endings, `merge=union` and merge drivers only: no filters, no LFS, no
+  `-merge` (it is merged as text). Beside Git, commits are Git's and
   filters apply to them; nv's own snapshots hold the files as they are on
   disk.
 - `.gitignore` is honoured, and `.nv/exclude` is a workspace's own list in

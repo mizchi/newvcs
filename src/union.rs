@@ -30,11 +30,29 @@ pub fn merge_union(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
   merge_text(base, ours, theirs, "yours", "theirs", true).0
 }
 
+/// What `.gitattributes` says of how a path is merged: Git's `merge` attribute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Merge {
+  /// Unspecified, `merge` set or `merge=text`: the three-way text merge.
+  Text,
+  /// `merge=union`: both sides' lines, without markers.
+  Union,
+  /// `-merge`, `merge=binary` or `binary`: not merged.
+  Binary,
+  /// `merge=<name>`: the driver the configuration names `merge.<name>.driver`.
+  Driver(String),
+}
+
 /// Whether `.gitattributes` gives a path Git's `union` merge. `attributes(dir)` is the content of
 /// the `.gitattributes` in that directory (`b""` for the top), if there is one. The file's own
 /// directory first, the top last; in a file, the last line first; the first rule that matches
 /// and says anything of `merge` decides, and `binary` says `-merge`.
-pub fn is_union(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -> bool {
+pub fn is_union(attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -> bool {
+  merge_of(attributes, path) == Merge::Union
+}
+
+/// The `merge` attribute of a path, as `is_union` reads it.
+pub fn merge_of(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -> Merge {
   let mut ends: Vec<usize> = path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(at, _)| at).collect();
   loop {
     let (dir, relative) = match ends.pop() {
@@ -45,25 +63,34 @@ pub fn is_union(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8
     let mut said = None;
     for (kind, assignments, _) in gix_attributes::parse(&bytes).flatten() {
       let gix_attributes::parse::Kind::Pattern(pattern) = kind else { continue };
-      let mut union = None;
+      let mut merge = None;
       for assignment in assignments.flatten() {
         match (assignment.name.as_str(), assignment.state) {
-          ("merge", StateRef::Value(value)) => union = Some(value.as_bstr() == "union"),
-          ("merge", _) | ("binary", StateRef::Set) => union = Some(false),
+          ("merge", StateRef::Value(value)) => {
+            merge = Some(match value.as_bstr().to_str_lossy().as_ref() {
+              "union" => Merge::Union,
+              "text" => Merge::Text,
+              "binary" => Merge::Binary,
+              name => Merge::Driver(name.to_string()),
+            })
+          }
+          ("merge", StateRef::Set) => merge = Some(Merge::Text),
+          ("merge", StateRef::Unset) | ("binary", StateRef::Set) => merge = Some(Merge::Binary),
+          ("merge", _) => merge = Some(Merge::Text),
           _ => {}
         }
       }
-      let Some(union) = union else { continue };
+      let Some(merge) = merge else { continue };
       let base = relative.rfind_byte(b'/').map(|at| at + 1);
       if pattern.matches_repo_relative_path(relative.as_bstr(), base, Some(false), Case::Sensitive, Mode::NO_MATCH_SLASH_LITERAL) {
-        said = Some(union);
+        said = Some(merge);
       }
     }
-    if let Some(union) = said {
-      return union;
+    if let Some(merge) = said {
+      return merge;
     }
     if dir.is_empty() {
-      return false;
+      return Merge::Text;
     }
   }
 }

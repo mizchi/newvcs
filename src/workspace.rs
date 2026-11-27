@@ -2875,8 +2875,7 @@ fn earlier_settled(store: &mut Store, ws: &Workspace, earlier: &[(Id, Commit)], 
       if base.contains(&0) || ours.contains(&0) || theirs.contains(&0) {
         continue;
       }
-      let union = crate::eol::merges_by_union(&ws.root, path);
-      let (text, clean) = crate::gitcli::merge_text_named(&base, &ours, &theirs, "yours", "theirs", union);
+      let (text, clean) = crate::drivers::merge_file_marked(&ws.root, path, &base, &ours, &theirs)?;
       if clean {
         let id = store.put(Kind::Blob, &text, Some(own.id))?;
         out[k].push((path.clone(), Some(Entry { mode: own.mode, id })));

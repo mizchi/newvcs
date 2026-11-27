@@ -14,6 +14,7 @@
 pub mod checks;
 pub mod colocated;
 pub mod commit;
+pub mod drivers;
 pub mod eol;
 pub mod git;
 pub mod gitcli;
