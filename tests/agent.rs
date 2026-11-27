@@ -1287,6 +1287,10 @@ fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
   let waited = ok(&dir, "$NV pending . --wait");
   assert!(waited.contains("did not pass (unit did not)"), "{waited}");
   assert_eq!(waited.matches("checkpoint: unit passed").count(), 1, "{waited}");
+  // The runners it started are gone once they are done, not left for it to reap when it stops:
+  // a watcher left running for days would fill the process table with them.
+  std::thread::sleep(std::time::Duration::from_millis(500));
+  assert_eq!(ok(&dir, "ps -axo ppid=,stat= | awk -v w=$(cat .nv/watch.pid) '$1 == w && $2 ~ /Z/' | wc -l | tr -d ' '"), "0");
   ok(&dir, "$NV watch . --stop >/dev/null");
 }
 

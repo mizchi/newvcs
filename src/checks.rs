@@ -800,7 +800,12 @@ pub fn start_behind(root: &Path) {
   // A session of its own: whoever started it may be gone long before the conditions are.
   // SAFETY: `setsid` is safe to call between fork and exec.
   unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
-  let _ = command.spawn();
+  // Waited for by a thread of this process, so that a runner done is gone: a watcher, which
+  // starts runners for as long as it runs, would otherwise keep every one of them as a zombie.
+  // A command that ends first leaves the runner to be reaped as any orphan is.
+  if let Ok(mut child) = command.spawn() {
+    std::thread::spawn(move || child.wait());
+  }
 }
 
 #[cfg(test)]

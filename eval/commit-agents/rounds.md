@@ -450,7 +450,10 @@ try each, as in round 17; each settling commit carries its `Settled:` trailer.
   each add a line to the Functions list): the sync still made them one, "Add word_count; Add
   reading_time". Both commits changed `README.md`, the file left with both versions, and that is
   one of the cases where the commits are folded (README, "Not done"). What round 17's supervisor
-  could not do, this one could not either.
+  could not do, this one could not either. Since then (af48788) the settling goes into the last
+  commit that changed the file, and the same script ends with two commits on the ref: "Add
+  word_count" with `stats.py` and `__init__.py`, and "Add reading_time" with both README lines
+  and the `Settled:` trailer.
 - **The supervisor's report was wrong again about a trailer**: it said the task 3 commit had no
   `Settled:` line; 7182d1b has one, naming both commits it was settled with.
 

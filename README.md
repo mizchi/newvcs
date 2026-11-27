@@ -2186,9 +2186,10 @@ stop root: run them as another user.
 
 On Linux (ext4, Git 2.43, the tests run as an unprivileged user and against
 a local server) everything passes but case 27 of the Git cases (Git 2.43
-takes `log -n abc`, newer Git refuses it), and, now and then, the check that
-a hook's process is gone after it was stopped, which can still be seen there
-for a moment until it is reaped.
+takes `log -n abc`, newer Git refuses it), and the check that a hook's
+process is gone after it was stopped: it can still be seen there for a
+moment until it is reaped, and for ever in a container whose first process
+reaps nothing (the hook's `sleep` is killed, and stays a zombie of it).
 
 The server:
 
