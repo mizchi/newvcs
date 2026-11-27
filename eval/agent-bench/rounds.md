@@ -129,6 +129,41 @@ Git 2.43 running the same driver on its pulls.
   (the server runs no driver, and a refusal is a sync and a push of an agent's), and the planner
   still holds everyone for 35 to 40 s.
 
+## Proofs in Lean (`stackc`, `stackc-cst`)
+
+Ten theorems of a stack-machine compiler and two rewritings of expressions, in Lean 4.36's core
+library, stated with `sorry` in four files, one to a developer, meeting in a file of shared
+lemmas, the README's checklist of what is proved and the changelog. The acceptance tests (13)
+check each theorem against its statement and that it depends on the standard axioms only, the
+definitions' behaviour, and the checklist and changelog. Every round of every pattern reached
+13 of 13; the proofs took a developer 40 to 90 s, so what is measured here is mostly the work
+around them. `stackc-cst` merges the shared files by `tools/merge-cst` (Lean by its commands).
+
+| | rounds | last agent done, s | cost, USD | tool calls | refused | clashes | redone by hand |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `stackc`, git | 3 | 92.1, 113.1, 114.2 | 1.29 to 1.34 | 45 to 49 | 4 to 6 | 6 to 8 | |
+| `stackc`, nv | 3 | 94.1, 105.5, 112.2 | 1.35 to 1.43 | 40 to 44 | 4 to 5 | 4 to 5 | |
+| `stackc-cst`, git | 3 | 71.1, 75.1, 98.1 | 1.01 to 1.19 | 31 to 37 | 3 to 5 | 0 | 0 |
+| `stackc-cst`, nv, driver as first written | 6 | 94.3 to 205.2 | 1.15 to 1.50 | 35 to 44 | 3 to 6 | 0 | 1 a round |
+| `stackc-cst`, nv, driver in the base's order | 3 | 79.1, 83.1, 85.1 | 1.23 to 1.32 | 38 to 40 | 3 to 5 | 0 | 0 |
+| `stackc-cst`, nv, and `nv help` short | 3 | **67.0, 70.1, 73.0** | 1.12, 1.12, 1.13 | 33 to 36 | 3 to 5 | 0 | 0 |
+
+(The Git rows of `stackc-cst` are of the driver in the base's order. One parallel and one
+supervisor round of `stackc-cst`, before either change: 120.3 s and 165.1 s, $2.08 and $1.74.)
+
+- **With text merges nv and Git came out even**: the same clashes on the checklist and the
+  changelog, settled by the same kind of turn.
+- **The driver as first written put a side's ticks out of place** in the checklist, when the
+  other had ticked the lines before them: a writer put the order back by hand and pushed again,
+  and since a sync putting the commits on the tip one by one did not come to what merging them
+  at once did, it folded them, and the writer set its work aside and made the commits again.
+  Placing every unit by the base's order fixed both (a4a2e16, a test of each).
+- **`nv help` was 8 KB**, read by every writer and carried through each of its turns after: of
+  what nv's writers read of version control, 39 to 48 thousand characters a round against Git's
+  26 to 28, most was that. Cut to the everyday commands (897 bytes, `nv help all` for the rest),
+  a round read 20 to 29 thousand, and nv's rounds became the quickest of any pattern here, at
+  Git's cost.
+
 ## Counting Git's refusals
 
 Until 952150c, a refusal and a clash were counted by the first lines Git prints of them
