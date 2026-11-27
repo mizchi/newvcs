@@ -2877,6 +2877,12 @@ pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String
   }
 }
 
+/// The commit a settling is noted to complete, as noted: whether it still can is `incomplete`'s.
+pub fn settles_into(ws: &Workspace) -> Option<Id> {
+  let text = std::fs::read_to_string(incomplete_file(ws)).ok()?;
+  text.lines().next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())
+}
+
 /// The commit a settling completes, and the paths it was left without, while that commit is
 /// still the last made here, not pushed, and no push of it may have landed unheard.
 fn incomplete(store: &mut Store, ws: &Workspace) -> Result<Option<(Id, Vec<Vec<u8>>)>> {

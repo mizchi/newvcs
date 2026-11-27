@@ -2114,11 +2114,14 @@ stops.
 - A workspace with several unpushed commits that has to catch up gets them
   put on the ref's tip one by one, each with its message, where each file of
   each merges as a sync merges and the last comes to the same files as one
-  commit would; a file left with both versions belongs to the one commit
+  commit would; a file left with both versions belongs to the last commit
   that changed it, and its settling goes into that commit, those after it
-  made again on top. Where that cannot be (a commit clashes with the ref on
-  the way though the commits together do not; two of them changed the file
-  left with both versions; a directory set whole), they are one commit,
+  made again on top. Those before it are made without their changes to
+  that file (the tip's version stays), and nothing says of their messages
+  that what they describe of it moved to a later commit. Where that cannot
+  be (a commit clashes with the ref on the way though the commits together
+  do not; a commit changed nothing but files left with both versions; a
+  directory set whole), they are one commit,
   under the lines of all of them (their summary lines joined by `; `, their
   bodies one after another), and the sync says so. The model in
   `formal/sync` folds them always: it does not cover the commits put on the

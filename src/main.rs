@@ -773,8 +773,18 @@ fn run(args: &[String]) -> Result<()> {
       }
       let unsettled = workspace::unsettled(&ws);
       if !unsettled.is_empty() {
+        // The commit they complete: the last of this workspace's that changed them, which need
+        // not be the last made here.
+        let into = workspace::settles_into(&ws).and_then(|id| chain.iter().find(|(c, _)| *c == id)).map(|(_, commit)| {
+          let said = String::from_utf8_lossy(&commit.rest).into_owned();
+          said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+        });
+        let into = match into {
+          Some(first) => format!("they go into {first}, which they complete"),
+          None => "they go into the last commit above, which they complete".to_string(),
+        };
         println!(
-          "still holding both versions, and so in none of the commits above: {}. Once they are settled and the conditions pass, they go into the last commit above, which they complete",
+          "still holding both versions, and so in none of the commits above: {}. Once they are settled and the conditions pass, {into}",
           unsettled.join(", ")
         );
       }

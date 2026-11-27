@@ -1362,8 +1362,8 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   // what it had only recorded stays recorded on top of that.
   // They are put on the tip one by one, each with its message, where that can be done: each
   // file of each merged with what is there as a sync merges, and the last coming to the same
-  // files as the one commit would. A clash is the commit's that changed the file, where one did;
-  // its settling goes into that commit. Where any of this is not so, they are one commit.
+  // files as the one commit would. A clash is the last commit's that changed the file; its
+  // settling goes into that commit. Where any of this is not so, they are one commit.
   let mut settles_into: Option<Id> = None;
   let base = match (published.is_empty(), ws.base) {
     (false, Some(was)) => {
@@ -1382,15 +1382,12 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
             return Ok(None);
           }
           let clashed: Vec<Vec<u8>> = done.conflicts.iter().map(|p| p.as_bytes().to_vec()).collect();
-          let mut owner: Option<usize> = None;
-          for path in &clashed {
-            let touching: Vec<usize> =
-              commits.iter().enumerate().filter(|(_, c)| c.changes.iter().any(|(p, _)| p == path)).map(|(i, _)| i).collect();
-            match (touching.as_slice(), owner) {
-              ([one], None) => owner = Some(*one),
-              ([one], Some(known)) if *one == known => {}
-              _ => return Ok(None),
-            }
+          // The last of them that changed a file left with both versions: every commit is made
+          // without its changes to those files, and their settling goes into that one, which
+          // comes to them as they were meant; one before it leaves them as the tip has them.
+          let owner = commits.iter().rposition(|c| c.changes.iter().any(|(p, _)| clashed.contains(p)));
+          if owner.is_none() && !clashed.is_empty() {
+            return Ok(None);
           }
           let mut prev = tip;
           let mut made = Vec::new();
@@ -1398,8 +1395,10 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
           for (i, c) in commits.iter().enumerate() {
             let (parent_root, running_root) = (root(store, c.parents.first().copied())?, root(store, Some(prev))?);
             let mut changes = Vec::new();
+            let mut left_out = false;
             for (path, entry) in &c.changes {
               if clashed.contains(path) {
+                left_out = true;
                 continue;
               }
               let (was_there, now) = (at(store, parent_root, path)?, at(store, running_root, path)?);
@@ -1421,8 +1420,9 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
               }
             }
             if changes.is_empty() {
-              // Its change is on the tip already; but a commit a clash belongs to has to be there.
-              if owner == Some(i) {
+              // Its change is on the tip already; but a commit a clash belongs to has to be there,
+              // and one that changed nothing but such files would be gone, with its message.
+              if owner == Some(i) || left_out {
                 return Ok(None);
               }
               continue;

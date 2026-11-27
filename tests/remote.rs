@@ -2040,3 +2040,86 @@ fn a_settling_goes_into_the_commit_that_changed_the_file() {
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
 }
+
+#[test]
+fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-in-last");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-in-last-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      printf '[checks.unit]\nrun = "! grep -q none README.md && ! grep -q markers README.md"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run(
+    "ann",
+    "printf '# list\\n- ann\\n' > README.md && echo a > a.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add a' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- x\\n' > README.md && echo x > x.py && $NV checkpoint . >/dev/null \
+     && printf '# list\\n- x\\n- y\\n' > README.md && echo y > y.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Add x' 2 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "still two commits: {said}");
+  // The earlier of the two is made without its line of README.md; the later is the one completed.
+  assert!(said.contains("they go into Add y"), "{said}");
+  run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && $NV checkpoint . >/dev/null");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "x.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD").1.contains("Settled: README.md with"), "the trailer is on the commit it settled");
+  assert!(!run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled:"));
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // A commit that changed nothing but such a file would be left with nothing: they are one
+  // commit, under the lines of both, rather than lose its message.
+  run(
+    "ann",
+    "$NV sync . >/dev/null; printf '# list\\n- ann2\\n' > README.md && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Ann again' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- z\\n' > README.md && $NV checkpoint . >/dev/null && printf '# list\\n- z\\n- w\\n' > README.md && echo w > w.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Note z' 2 'Add w' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("now one commit"), "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Note z; Add w\nAnn again\n", "{said}");
+}
