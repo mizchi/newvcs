@@ -65,7 +65,7 @@ nv unlink <dir> <path>                     stop following one
 
 nv check <dir>                             how the workspace stands with Git and with its watcher
 nv git <command>                           Git's command line (see below)
-nv help [command], nv --version
+nv help [command | all], nv --version     the everyday commands; one command; all of them
 ```
 
 A state is a name given with `nv mark`, `base` (the last commit), `pushed`

@@ -1255,6 +1255,23 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("stats", 1, 1, &[]),
 ];
 
+/// What `nv help` says: the commands a writer uses every day, each in a line, and where the rest
+/// is. A writer reads it first, and carries it through every turn after.
+const SHORT: &str = "\
+nv: version control for many writers committing often, exchangeable with Git
+
+Every day, in a workspace <dir>:
+  nv status <dir>                 what changed since the last commit
+  nv commit <dir> [<message>]     commit what is on disk; given no message after a sync
+                                  that clashed, complete the commits it held files out of
+  nv push <dir>                   send the commits to the ref; refused where it changed them too
+  nv sync <dir>                   bring in what the ref took, and your commits on top of it
+  nv pending <dir> [--wait]       the commits made here and not pushed, and what each holds
+  nv restore <dir> <state>        go back to a recorded state (`before-sync` undoes a sync)
+  nv git <command> [<args>]       Git's everyday commands: log, show, diff, status, add, ...
+
+`nv help <command>` says all of one command, `nv help all` all of them.";
+
 /// The lines of the usage text that are about one command.
 fn usage_of(command: &str) -> String {
   let mut lines = USAGE.lines().skip_while(|line| {
@@ -1267,15 +1284,16 @@ fn usage_of(command: &str) -> String {
 /// The arguments as the commands expect them (options last), or what is wrong with them.
 /// `Ok(None)`: the question was answered here, by printing help.
 fn shaped(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
-  let Some(command) = args.first().map(String::as_str) else { return Err(USAGE.to_string()) };
+  let Some(command) = args.first().map(String::as_str) else { return Err(SHORT.to_string()) };
   match command {
     "help" | "--help" | "-h" => {
       match args.get(1).map(String::as_str) {
         Some(about) if about == "hook" || about == "git" || COMMANDS.iter().any(|(name, ..)| *name == about) => {
           println!("{}", usage_of(about))
         }
+        Some("all") => println!("{USAGE}"),
         Some(about) => return Err(format!("nv: `{about}` is not a command. `nv help` lists them.")),
-        None => println!("{USAGE}"),
+        None => println!("{SHORT}"),
       }
       return Ok(None);
     }

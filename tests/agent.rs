@@ -441,7 +441,16 @@ fn a_command_given_wrongly_says_what_was_wrong_and_does_nothing() {
   assert_eq!(ok(&dir, "$NV log . | grep -c snapshot || true"), "0", "none of those recorded anything");
   // Help and version are answers, not errors.
   assert!(ok(&dir, "$NV --version").starts_with("nv "));
-  assert!(ok(&dir, "$NV help").contains("nv snapshot <dir>") && ok(&dir, "$NV --help").contains("nv commit <dir>"));
+  // `nv help` is what a writer reads first, and every turn after carries it: the everyday
+  // commands, in a few lines, and where the rest is (`eval/agent-bench`: 8 KB, read by every
+  // writer, was most of what nv's writers read beyond Git's).
+  let short = ok(&dir, "$NV help");
+  assert!(short.len() < 2000, "{} bytes", short.len());
+  for command in ["nv commit <dir>", "nv push <dir>", "nv sync <dir>", "nv pending <dir>", "nv restore <dir>", "nv help all"] {
+    assert!(short.contains(command), "{command}: {short}");
+  }
+  assert_eq!(ok(&dir, "$NV --help"), short);
+  assert!(ok(&dir, "$NV help all").contains("nv snapshot <dir> [--recorded | --tracked]"));
   assert_eq!(ok(&dir, "$NV snapshot --help | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
   assert_eq!(ok(&dir, "$NV help snapshot | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
   // States counted back reach behind the first one recorded here, to the commit the work began on.
