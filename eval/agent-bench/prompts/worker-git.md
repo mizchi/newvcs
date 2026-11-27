@@ -1,5 +1,4 @@
-You are a developer. Work only in `{{DIR}}`, a Git clone of a small Python package with its
-tests.
+You are a developer. Work only in `{{DIR}}`, a Git clone of {{A_PROJECT}}.
 
 Your task: {{TASK}}
 

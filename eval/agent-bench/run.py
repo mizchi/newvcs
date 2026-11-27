@@ -66,7 +66,9 @@ class Round:
                         GIT_COMMITTER_NAME="bench", GIT_COMMITTER_EMAIL="bench@example.com")
         self.bin = self.work / "bin"
         self.nv = str(self.bin / "nv")
-        self.env["PATH"] = f"{self.bin}:{self.env['PATH']}"
+        # What the task's own tools need on the path (a Lean toolchain, say).
+        extra = [os.path.expanduser(d) for d in self.task.get("path", [])]
+        self.env["PATH"] = ":".join([str(self.bin), *extra, self.env["PATH"]])
 
     def dirs(self):
         return [self.work / f"task-{i}" for i in range(1, self.n + 1)]
@@ -124,7 +126,9 @@ class Round:
 
     def prompts(self):
         common, test = self.task["common"], self.task["test"]
-        base = {"BIN": str(self.bin), "WORK": str(self.work), "COMMON": common, "TEST": test, "N": str(self.n)}
+        project = self.task.get("project", "a small Python package")
+        base = {"BIN": str(self.bin), "WORK": str(self.work), "COMMON": common, "TEST": test, "N": str(self.n),
+                "A_PROJECT": f"{project} with its tests", "ONE_PROJECT": "one " + project.split(" ", 1)[1]}
         worker = {"supervisor": "worker-supervised.md", "parallel": "worker-supervised.md", "nv": "worker-nv.md", "git": "worker-git.md"}[self.a.pattern]
         template = (HERE / "prompts" / worker).read_text()
         out = {}

@@ -1,0 +1,5 @@
+name = "stackc"
+defaultTargets = ["Stackc"]
+
+[[lean_lib]]
+name = "Stackc"

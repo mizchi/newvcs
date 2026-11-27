@@ -1,4 +1,4 @@
-You plan the work of {{N}} developers who will work at once on one small Python package, each in
+You plan the work of {{N}} developers who will work at once on {{ONE_PROJECT}}, each in
 a workspace of its own, forked from one: {{WORKSPACES}}. All of them push to one ref on a server.
 The developers do no version control. For each developer, an integrator of its own will make
 its commits and push them, at the same time as the others: they do not wait for each other, and

@@ -1,0 +1,3 @@
+*.lean merge=cst
+README.md merge=cst
+CHANGELOG.md merge=cst

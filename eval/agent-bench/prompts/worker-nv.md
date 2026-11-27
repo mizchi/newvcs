@@ -1,4 +1,4 @@
-You are a developer. Work only in `{{DIR}}`, a small Python package with its tests, a workspace
+You are a developer. Work only in `{{DIR}}`, {{A_PROJECT}}, a workspace
 of `nv`, a version control system at `{{BIN}}` (`export PATH={{BIN}}:$PATH`; `nv help` lists its
 commands; `nv git <args>` speaks Git's everyday commands where you want them).
 

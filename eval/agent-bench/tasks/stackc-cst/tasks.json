@@ -1,0 +1,19 @@
+{
+  "name": "stackc-cst",
+  "about": "stackc, with the Lean files, the README and the changelog merged by tools/merge-cst (Lean by its commands)",
+  "test": "lake build",
+  "path": [
+    "~/.elan/bin"
+  ],
+  "common": "Each theorem of your task is stated in your file with `sorry` for its proof: prove it in place, replacing the `sorry`, and change no statement, no definition and no other theorem's proof. A lemma more than one proof could use goes in `Stackc/Lemmas.lean`, and only there; a lemma for your own theorems alone goes in your own file, above them. Use Lean 4's core library only: no Mathlib, no new dependency, and no `sorry`, `axiom`, `admit` or `native_decide` in what you leave. `lake build` builds everything and says which declarations still use `sorry`. In `README.md`, tick each theorem you proved (`- [ ]` to `- [x]` on its line), and in `CHANGELOG.md` add one line under \"Unreleased\" for each: `- Prove `NAME`.`",
+  "tasks": [
+    "Prove `run_append`, `compile_run` and `compile_correct`, in `Stackc/Correct.lean`.",
+    "Prove `eval_fold` and `fold_size`, in `Stackc/Fold.lean`.",
+    "Prove `eval_simplify` and `simplify_size`, in `Stackc/Simplify.lean`.",
+    "Prove `compile_length`, `compile_fold_correct` and `compile_simplify_length`, in `Stackc/Length.lean`. The last two may use the theorems of the other files, which other developers are proving meanwhile: their statements will not change, and a proof that uses them is complete once theirs are."
+  ],
+  "project": "a small Lean 4 project",
+  "drivers": {
+    "cst": "{{PYTHON}} {{TOOLS}}/merge-cst/merge_cst.py %O %A %B %P %X %Y %L"
+  }
+}

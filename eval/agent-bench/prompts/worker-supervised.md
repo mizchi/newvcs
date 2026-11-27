@@ -1,4 +1,4 @@
-You are a developer. Work only in `{{DIR}}`, a small Python package with its tests.
+You are a developer. Work only in `{{DIR}}`, {{A_PROJECT}}.
 
 Your task: {{TASK}}
 
