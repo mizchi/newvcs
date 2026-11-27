@@ -591,6 +591,14 @@ again before anyone else sees them:
   a file with both versions, it stops with exit 1 and says so, and the
   note of a commit the files held is kept for when they are settled.
 
+A file a sync left with both versions is settled by whoever settles it,
+and the commit that holds the settling says so, as a Git trailer: which
+file, and the commits of others' it was settled against, as
+`Settled: README.md with 1a2b3c4 (Add a)`. Remade by `nv rebuild` or
+`nv publish`, a commit keeps the trailers of those it is made of. Nothing
+else in a history says that two writers' work met there, and a reader of
+it could not tell (`eval/commit-agents`, "Readers").
+
 A commit's message is written of what was there when it was made. When a
 sync or a push puts it on top of other writers' commits that change the
 same files, `nv sync`, `nv push` and `nv pending` name those commits and

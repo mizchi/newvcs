@@ -1562,7 +1562,13 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   run("echo 'mine and theirs' > a && $NV checkpoint . >/dev/null");
   let (code, said) = run("$NV publish .");
   assert_eq!(code, 0, "{said}");
-  assert_eq!(run("$NV git log -1 --format=%B").1, "Change a\n\nwhy Change a\n1\n\n", "{said}");
+  // The body written once, and below it what was settled, against whose commit.
+  let theirs = run("cd ../other && $NV git log -1 --format=%h").1.trim().to_string();
+  assert_eq!(
+    run("$NV git log -1 --format=%B").1,
+    format!("Change a\n\nwhy Change a\n1\n\nSettled: a with {theirs} (Theirs)\n\n"),
+    "{said}"
+  );
   // A publish whose push the ref refused and whose sync merged by itself writes the body again,
   // of the change as it lands on the new tip: a body of the old base would say what may no
   // longer hold.
@@ -1659,6 +1665,11 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("bob", "$NV git show --name-only --format=%s HEAD").1, "Add b\n\nREADME.md\nb.py\n");
+  // The history says what was settled, and against whose commit, through the rebuild: what a
+  // reader of it could not find out in the twelfth round's reader experiment.
+  let ann_add = run("ann", "$NV git log --format='%h %s' | grep 'Add a$' | cut -d' ' -f1").1.trim().to_string();
+  let said = run("bob", "$NV git log -1 --format=%B").1;
+  assert!(said.contains(&format!("Settled: README.md with {ann_add} (Add a)")), "{said}");
   // Cat clashes with nothing of his own committed: what he settles is a commit of his, on the
   // ref's tip, never a change to Bob's.
   let (code, said) = run("cat", "printf '# list\\n- cat\\n' > README.md && $NV sync .");
@@ -1666,6 +1677,10 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   run("cat", "printf '# list\\n- ann\\n- bob\\n- cat\\n' > README.md && $NV checkpoint . >/dev/null");
   assert_eq!(run("cat", "$NV git log --format=%s -2").1, "checkpoint: unit passed\nAdd b\n");
   assert_eq!(run("cat", "$NV git show --name-only --format= HEAD~1").1, "README.md\nb.py\n", "Bob's commit is as he pushed it");
+  // A settling that is a commit of its own says what it settled too: against both of theirs.
+  let bob_add = run("cat", "$NV git log -1 --format=%h HEAD~1").1.trim().to_string();
+  let said = run("cat", "$NV git log -1 --format=%B").1;
+  assert!(said.contains(&format!("Settled: README.md with {ann_add} (Add a), {bob_add} (Add b)")), "{said}");
 }
 
 /// What a twelfth-round reviewer lost by killing a sync: an arrival cut short is finished by the

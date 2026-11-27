@@ -1969,6 +1969,7 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
     ws.save()?;
     return Ok(None);
   }
+  let rest = with_settled(store, ws, rest, &changes)?;
   let id = Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?;
   root_of(store, &id)?;
   store.flush()?;
@@ -2061,7 +2062,8 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
       }
       whole.sort_by(|a, b| a.0.cmp(&b.0));
       let _ = std::fs::remove_file(incomplete_file(ws));
-      let made = Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?;
+      let rest = with_settled(store, ws, was.rest.clone(), &whole)?;
+      let made = Commit { parents: was.parents.clone(), rest, changes: whole }.store(store)?;
       // The settling does not answer for the message: what was said of its base still stands.
       if let Some((moved, under)) = moved_under(ws).filter(|(id, _)| *id == short) {
         let _ = moved;
@@ -2069,7 +2071,10 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
       }
       made
     }
-    _ => Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?,
+    _ => {
+      let rest = with_settled(store, ws, rest, &changes)?;
+      Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?
+    }
   };
   root_of(store, &id)?;
   // What came after the state, recorded again on the new commit.
@@ -2163,8 +2168,13 @@ pub fn rebuild(store: &mut Store, ws: &mut Workspace, plan: &[(Id, Vec<u8>)], au
     root_of(store, &id)?;
     Ok(Some(id))
   };
+  let mut start = 0;
   for ((_, rest), end) in plan.iter().zip(&ends) {
-    if let Some(id) = next(store, on, chain[*end].0, rest.clone())? {
+    // What the commits it is made of said they settled, it says too.
+    let settled: Vec<String> = chain[start..=*end].iter().flat_map(|(_, c)| settled_lines(&c.rest)).collect();
+    start = end + 1;
+    let rest = with_trailers(rest.clone(), &settled);
+    if let Some(id) = next(store, on, chain[*end].0, rest)? {
       made.push(id);
       on = Some(id);
     }
@@ -2657,6 +2667,7 @@ pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, 
   ws.save()?;
   take_branch_along(store, ws, based)?;
   set_unsettled(ws, &[])?;
+  set_settling(ws, &[])?;
   Ok(done)
 }
 
@@ -2691,11 +2702,123 @@ pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look
   ws.save()?;
   take_branch_along(store, ws, based)?;
   set_unsettled(ws, &[])?;
+  set_settling(ws, &[])?;
   if let Some(was) = was {
     ws.log("set-aside", &was)?;
   }
   done.kept = was;
   Ok(done)
+}
+
+/// What a sync left with both versions, and the commits of others' it met there: for the commit
+/// that settles each file to say so (`Settled:`), as a history read later can find out no other way.
+fn settling_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("settling")
+}
+
+fn settling(ws: &Workspace) -> Vec<(String, Vec<String>)> {
+  std::fs::read_to_string(settling_file(ws))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| {
+      let (path, against) = line.split_once('\t')?;
+      Some((path.to_string(), against.split('\t').filter(|a| !a.is_empty()).map(str::to_string).collect()))
+    })
+    .collect()
+}
+
+fn set_settling(ws: &Workspace, entries: &[(String, Vec<String>)]) -> Result<()> {
+  if entries.is_empty() {
+    let _ = std::fs::remove_file(settling_file(ws));
+    return Ok(());
+  }
+  let text: String = entries.iter().map(|(path, against)| format!("{path}\t{}\n", against.join("\t"))).collect();
+  crate::write_whole(&settling_file(ws), text)
+}
+
+/// Note, of each of `paths` a sync left with both versions, the commits on the way back from
+/// `tip` to `common` that changed it: what it was settled against, by Git's id and summary line.
+/// Where a Git id cannot be had, nv's is given, and said to be nv's.
+pub(crate) fn note_settling(store: &mut Store, ws: &Workspace, tip: Id, common: Option<Id>, paths: &[String]) -> Result<()> {
+  if paths.is_empty() {
+    return Ok(());
+  }
+  let mut met: Vec<(String, Vec<Id>)> = paths.iter().map(|p| (p.clone(), Vec::new())).collect();
+  let (mut at, mut walked) = (Some(tip), 0);
+  while let Some(id) = at.filter(|id| Some(*id) != common && walked < 100_000) {
+    let commit = Commit::load(store, &id)?;
+    for (path, ids) in met.iter_mut() {
+      if commit.changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()) {
+        ids.insert(0, id);
+      }
+    }
+    at = commit.parents.first().copied();
+    walked += 1;
+  }
+  let mut all = settling(ws);
+  for (path, ids) in met {
+    let mut against = Vec::new();
+    for id in ids {
+      let named = match crate::git::git_id_of(store, &id) {
+        Ok(oid) => hex(&oid)[..7].to_string(),
+        Err(_) => format!("nv {}", &hex(&id)[..12]),
+      };
+      let said = String::from_utf8_lossy(&Commit::load(store, &id)?.rest).into_owned();
+      let subject = said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or_default().to_string();
+      against.push(format!("{named} ({subject})"));
+    }
+    match all.iter_mut().find(|(p, _)| *p == path) {
+      Some((_, known)) => known.extend(against.into_iter().filter(|a| !known.contains(a)).collect::<Vec<_>>()),
+      None => all.push((path, against)),
+    }
+  }
+  set_settling(ws, &all)
+}
+
+/// A commit's message, with a `Settled:` line for each file it holds that a sync left with both
+/// versions, now settled: which, and against whose commits. Those are then no longer noted.
+fn with_settled(_store: &mut Store, ws: &Workspace, rest: Vec<u8>, changes: &[Change]) -> Result<Vec<u8>> {
+  let all = settling(ws);
+  if all.is_empty() {
+    return Ok(rest);
+  }
+  let left = unsettled(ws);
+  let (taken, kept): (Vec<_>, Vec<_>) =
+    all.into_iter().partition(|(path, _)| !left.contains(path) && changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()));
+  if taken.is_empty() {
+    return Ok(rest);
+  }
+  let lines: Vec<String> = taken
+    .iter()
+    .map(
+      |(path, against)| {
+        if against.is_empty() { format!("Settled: {path}") } else { format!("Settled: {path} with {}", against.join(", ")) }
+      },
+    )
+    .collect();
+  set_settling(ws, &kept)?;
+  Ok(with_trailers(rest, &lines))
+}
+
+/// `rest` with these lines at the end of its message, as Git's trailers are, those it has already
+/// left out.
+pub(crate) fn with_trailers(rest: Vec<u8>, lines: &[String]) -> Vec<u8> {
+  let said = String::from_utf8_lossy(&rest).into_owned();
+  let new: Vec<&String> = lines.iter().filter(|line| !said.lines().any(|l| l == line.as_str())).collect();
+  if new.is_empty() {
+    return rest;
+  }
+  let body = said.trim_end();
+  // After a paragraph of trailers, more of them; after anything else, a paragraph of their own.
+  let last = body.rsplit("\n\n").next().unwrap_or_default();
+  let trailing = !last.is_empty() && last.lines().all(|l| l.starts_with("Settled: "));
+  let joined = new.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+  format!("{body}{}{joined}\n", if trailing { "\n" } else { "\n\n" }).into_bytes()
+}
+
+/// The `Settled:` lines of a commit's message.
+pub(crate) fn settled_lines(rest: &[u8]) -> Vec<String> {
+  String::from_utf8_lossy(rest).lines().filter(|l| l.starts_with("Settled: ")).map(str::to_string).collect()
 }
 
 fn unsettled_file(ws: &Workspace) -> PathBuf {

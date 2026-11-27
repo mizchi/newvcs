@@ -718,9 +718,14 @@ fn fetch_contents(store: &mut Store, url: &str, wanted: &[(Id, Option<Id>)]) -> 
 /// gave a Git id: the versions between the ones a sync brought, and files
 /// outside the workspace's view. They are fetched here, if there are any.
 pub fn fetch_for_export(store: &mut Store, ws: &Workspace) -> Result<usize> {
+  fetch_history(store, ws, ws.base)
+}
+
+/// The file contents the history from `from` needs for its Git ids and this store does not have.
+fn fetch_history(store: &mut Store, ws: &Workspace, from: Option<Id>) -> Result<usize> {
   let mut wanted: Vec<(Id, Option<Id>)> = Vec::new();
   let mut seen = std::collections::HashSet::new();
-  let mut todo: Vec<Id> = ws.base.into_iter().collect();
+  let mut todo: Vec<Id> = from.into_iter().collect();
   while let Some(at) = todo.pop() {
     // A commit with a Git id had every file below it given one.
     if !seen.insert(at) || store.git_of(&at).is_some() {
@@ -1377,6 +1382,12 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   }
   done.conflicts.sort();
   workspace::set_unsettled(ws, &done.conflicts)?;
+  if !done.conflicts.is_empty() {
+    // What the files were settled against is named by Git's ids: what Git does not have of
+    // those commits' files is brought in first (a store that synced has only what it wrote).
+    let _ = fetch_history(store, ws, Some(tip));
+    workspace::note_settling(store, ws, tip, common, &done.conflicts)?;
+  }
   // The commit of this workspace's own that the sync put on the tip without those files, if it
   // has one: their settling goes into it (`commit_state`).
   let own = Some(base) != Some(tip) && !done.conflicts.is_empty();
