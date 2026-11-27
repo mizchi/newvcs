@@ -2197,6 +2197,74 @@ fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
   assert!(said.contains("a commit needs a message"), "{said}");
 }
 
+/// Where a workspace pushes to a ref of nv's, Git's verbs for the ref are nv's: `nv git push` is
+/// `nv push` and `nv git pull --rebase` is `nv sync`, with what they say and Git's exit codes,
+/// and not a push to, or a pull from, the repository the workspace was cloned from, which is not
+/// where its work goes (`eval/agent-bench`: a writer that knows Git reached for `nv help` first).
+/// What nv cannot be (a pull that merges, a fetch) is refused, and says what to use.
+#[test]
+fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-verbs");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-verbs-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list && $NV commit . 'Ann lists' >/dev/null && $NV git push");
+  run("bob", "printf 'A\\nb\\n' > list && $NV commit . 'Bob capitalises a' >/dev/null");
+  // Refused as `nv push` is (both changed `list`), with Git's exit code for a push refused.
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("the push was refused"), "{said}");
+  // A pull that would merge, and a fetch, are not what nv does with a ref: refused, saying what is.
+  for verb in ["pull", "fetch"] {
+    let (code, said) = run("bob", &format!("$NV git {verb}"));
+    assert_eq!(code, 125, "{verb}: {said}");
+    assert!(said.contains("not supported") && said.contains("git pull --rebase"), "{verb}: {said}");
+  }
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 1 commit"), "{said}");
+  let (code, said) = run("bob", "$NV git push origin main");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("pushed 1 commit"), "{said}");
+  run("ann", "$NV git pull --rebase -q >/dev/null");
+  assert_eq!(run("ann", "$NV git log --format=%s").1, "Bob capitalises a\nAnn lists\nseed\n");
+  assert_eq!(std::fs::read_to_string(root.join("ann/list")).unwrap(), "A\nb\nann\n");
+  // A ref it does not push to is not this one.
+  let (code, said) = run("bob", "$NV git push origin other");
+  assert_eq!(code, 125, "{said}");
+}
+
 /// Where a sync made the commits one, it says so, and not that each will get its version of the
 /// files it left with both versions.
 #[test]

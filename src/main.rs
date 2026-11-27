@@ -1283,7 +1283,8 @@ Every day, in a workspace <dir>:
   nv sync <dir>                   bring in what the ref took, and your commits on top of it
   nv pending <dir> [--wait]       the commits made here and not pushed, and what each holds
   nv restore <dir> <state>        go back to a recorded state (`before-sync` undoes a sync)
-  nv git <command> [<args>]       Git's everyday commands: log, show, diff, status, add, ...
+  nv git <command> [<args>]       Git's everyday commands: log, show, diff, status, add, ...;
+                                  toward the ref, `nv git push` is nv push, `pull --rebase` nv sync
 
 `nv help <command>` says all of one command, `nv help all` all of them.";
 
@@ -1361,6 +1362,15 @@ fn main() -> ExitCode {
   if !stays && args.first().is_none_or(|a| a != "publish-step") {
     newvcs::limits::watch_the_clock(&args.iter().take(2).cloned().collect::<Vec<_>>().join(" "));
   }
+  // Git's verbs for the ref a workspace pushes to are nv's own push and sync (`toward_the_ref`).
+  let (args, exit_as_git) = match toward_the_ref(&args) {
+    Ok(Some(nv)) => (nv, true),
+    Ok(None) => (args, false),
+    Err(why) => {
+      eprintln!("nv: {why}");
+      return ExitCode::from(125);
+    }
+  };
   // `nv git …` answers as Git would, exit code and all.
   if args.first().is_some_and(|a| a == "git") {
     return ExitCode::from(newvcs::gitcli::run(&args[1..]) as u8);
@@ -1492,9 +1502,62 @@ fn main() -> ExitCode {
   };
   match run(&args) {
     Ok(()) => ExitCode::SUCCESS,
+    // Git's push says it was refused with 1, as its other failures to do what was asked.
     Err(e) => {
       eprintln!("{e}");
-      ExitCode::from(2)
+      ExitCode::from(if exit_as_git { 1 } else { 2 })
     }
+  }
+}
+
+/// `nv git push` and `nv git pull --rebase` in a workspace that pushes to a ref of nv's (`nv
+/// remote`), with no Git beside it: the ref is where its work goes, not the repository it was
+/// cloned from, and so they are `nv push` and `nv sync`, saying what those say. A pull that would
+/// merge, or a fetch, is not something nv does with a ref: refused, saying what is. `None` for
+/// everything else, which `nv git` answers as ever.
+fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
+  let Some(rest) = args.strip_prefix(&["git".to_string()]) else { return Ok(None) };
+  let mut rest = rest;
+  let mut at = PathBuf::from(".");
+  while let [flag, dir, more @ ..] = rest {
+    if flag != "-C" {
+      break;
+    }
+    at = at.join(dir);
+    rest = more;
+  }
+  let Some((verb, options)) = rest.split_first() else { return Ok(None) };
+  if !matches!(verb.as_str(), "push" | "pull" | "fetch") {
+    return Ok(None);
+  }
+  let Some(root) = workspace::top_of(&at) else { return Ok(None) };
+  if newvcs::colocated::shared(&root) {
+    return Ok(None);
+  }
+  let Ok(ws) = workspace::Workspace::open(&root) else { return Ok(None) };
+  let (Some(_), Some(ref_name)) = (ws.remote.as_ref(), ws.remote_ref.as_ref()) else { return Ok(None) };
+  let quiet = |o: &str| o == "-q" || o == "--quiet";
+  let plain: Vec<&str> = options.iter().map(String::as_str).filter(|o| !quiet(o)).collect();
+  let rebase = |o: &str| o == "--rebase" || o == "-r";
+  let named: Vec<&str> = plain.iter().copied().filter(|o| !rebase(o) && !o.starts_with('-')).collect();
+  let flags: Vec<&str> = plain.iter().copied().filter(|o| o.starts_with('-') && !rebase(o)).collect();
+  // Where the work goes: `origin`, and the ref's own name or `HEAD`, or nothing.
+  let toward = match named[..] {
+    [] | ["origin"] => true,
+    ["origin", name] => name == ref_name || name == "HEAD" || name == format!("HEAD:{ref_name}"),
+    _ => false,
+  };
+  let instead = format!(
+    "where the workspace pushes to `{ref_name}` on a server of nv's, `nv git push` is `nv push` and `nv git pull --rebase` is `nv sync`, which puts the commits made here on the ref's tip"
+  );
+  if !toward || !flags.is_empty() {
+    return Err(format!("`git {} {}` is not supported: {instead}", verb, options.join(" ")));
+  }
+  let dir = root.to_string_lossy().into_owned();
+  match verb.as_str() {
+    "push" if !plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["push".into(), dir])),
+    "pull" if plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["sync".into(), dir])),
+    "pull" => Err(format!("`git pull` without --rebase is not supported: it would make a merge commit, which nv does not; {instead}")),
+    _ => Err(format!("`git {verb}` is not supported: {instead}")),
   }
 }

@@ -64,7 +64,9 @@ nv links <dir> [--update]                  how each link stands; follow the ones
 nv unlink <dir> <path>                     stop following one
 
 nv check <dir>                             how the workspace stands with Git and with its watcher
-nv git <command>                           Git's command line (see below)
+nv git <command>                           Git's command line (see below); toward the ref a
+                                           workspace pushes to, `push` is nv push and
+                                           `pull --rebase` nv sync
 nv help [command | all], nv --version     the everyday commands; one command; all of them
 ```
 
