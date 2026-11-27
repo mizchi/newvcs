@@ -21,6 +21,7 @@ pattern needs none.
 | Pattern | Who does the version control | Prompts |
 | --- | --- | --- |
 | `supervisor` | one agent, for everyone: it tells the developers how to keep apart before they start, then makes each one's commits again, pushes, syncs and settles; the developers write, test and note (`nv note`), with a watcher in each workspace, the tests behind every write and a commit at each state that passes | `prompts/supervisor.md`, `prompts/worker-supervised.md` |
+| `parallel` | a planner tells the developers how to keep apart, writes `ready`, then the rules of settling (`plan.md`); an integrator for each developer does what the supervisor did for all of them, at once | `prompts/supervisor-plan.md`, `prompts/integrator.md`, `prompts/worker-supervised.md` |
 | `nv` | each developer, with `nv commit`, `nv push` and `nv sync` | `prompts/worker-nv.md` |
 | `git` | each developer, with Git, in a clone of one bare repository: what the others are measured against | `prompts/worker-git.md` |
 
@@ -30,6 +31,9 @@ A task is a directory under `tasks/`: `seed/` (the project as it starts), `tasks
 name, the command that runs its tests, what every developer is told, and one text for each part),
 `accept/` (the acceptance tests, run at the tip from the project's root) and `reference/` (an
 implementation the acceptance tests pass on, which checks the tests, not the agents).
+
+`strkit-union` is `strkit` with `merge=union` for every file the parts meet in: what is left of
+the work when no clash needs settling.
 
 `strkit` has four parts, independent in code (durations, Roman numerals, versions, templates)
 and meeting in five files: the package's `__init__.py` (a union), `errors.py`, the README's list

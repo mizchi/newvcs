@@ -9,6 +9,9 @@ Patterns:
               only write, test and note (prompts/worker-supervised.md); a watcher in each
               workspace, the tests behind every write, a commit at each state that passes
   nv          each developer commits, pushes and syncs with nv itself (prompts/worker-nv.md)
+  parallel    the supervisor's work in two: a planner that only tells the developers how to keep
+              apart and writes the rules of settling (prompts/supervisor-plan.md), then an
+              integrator for each developer (prompts/integrator.md), all at once
   git         each developer commits, pushes and pulls with Git, in a clone of a bare
               repository (prompts/worker-git.md): what the others are measured against
 
@@ -75,7 +78,7 @@ class Round:
         shutil.copy2(self.a.nv, self.nv)
         seed = self.work / "seed"
         shutil.copytree(HERE / "tasks" / self.a.task / "seed", seed)
-        if self.a.pattern == "supervisor":
+        if self.a.pattern in ("supervisor", "parallel"):
             (seed / "nv.toml").write_text(
                 "auto = true                              # run the conditions behind every write the watcher records\n\n"
                 f'[checks.unit]\nrun = "{self.task["test"]}"\ntimeout = 60\n\n'
@@ -98,23 +101,28 @@ class Round:
         sh([self.nv, "push", "base"], w, e)
         for d in self.dirs():
             sh([self.nv, "fork", "base", d.name], w, e)
-            if self.a.pattern == "supervisor":
+            if self.a.pattern in ("supervisor", "parallel"):
                 sh([self.nv, "watch", d.name, "--start"], w, e)
         sh([self.nv, "fork", "base", "observer"], w, e)
 
     def prompts(self):
         common, test = self.task["common"], self.task["test"]
         base = {"BIN": str(self.bin), "WORK": str(self.work), "COMMON": common, "TEST": test, "N": str(self.n)}
-        worker = {"supervisor": "worker-supervised.md", "nv": "worker-nv.md", "git": "worker-git.md"}[self.a.pattern]
+        worker = {"supervisor": "worker-supervised.md", "parallel": "worker-supervised.md", "nv": "worker-nv.md", "git": "worker-git.md"}[self.a.pattern]
         template = (HERE / "prompts" / worker).read_text()
         out = {}
         for i, (d, task) in enumerate(zip(self.dirs(), self.task["tasks"]), 1):
             out[f"worker-{i}"] = (d, fill(template, {**base, "DIR": str(d), "TASK": task, "DONE": str(self.work / f"task-{i}.done")}))
-        if self.a.pattern == "supervisor":
+        if self.a.pattern in ("supervisor", "parallel"):
             tasks = "\n".join(f"{i}. {t}" for i, t in enumerate(self.task["tasks"], 1))
             spaces = ", ".join(f"`{d}`" for d in self.dirs())
-            text = fill((HERE / "prompts" / "supervisor.md").read_text(), {**base, "TASKS": tasks, "WORKSPACES": spaces, "FIRST": str(self.dirs()[0])})
+            which = "supervisor.md" if self.a.pattern == "supervisor" else "supervisor-plan.md"
+            text = fill((HERE / "prompts" / which).read_text(), {**base, "TASKS": tasks, "WORKSPACES": spaces, "FIRST": str(self.dirs()[0])})
             out["supervisor"] = (self.work, text)
+        if self.a.pattern == "parallel":
+            template = (HERE / "prompts" / "integrator.md").read_text()
+            for i, (d, task) in enumerate(zip(self.dirs(), self.task["tasks"]), 1):
+                out[f"integrator-{i}"] = (self.work, fill(template, {**base, "DIR": str(d), "TASK": task, "DONE": str(self.work / f"task-{i}.done")}))
         for name, (_, text) in out.items():
             (self.work / f"{name}.prompt").write_text(text)
         return out
@@ -135,7 +143,7 @@ class Round:
         self.launched = time.time()
         deadline = self.launched + self.a.timeout
         agents = {}
-        if self.a.pattern == "supervisor" and not self.a.dry:
+        if self.a.pattern in ("supervisor", "parallel") and not self.a.dry:
             agents["supervisor"] = self.launch("supervisor", *prompts.pop("supervisor"))
             while not (self.work / "ready").exists():
                 if time.time() > deadline or agents["supervisor"]["proc"].poll() is not None:
@@ -158,7 +166,7 @@ class Round:
                         a["ended"] = time.time()
             time.sleep(1)
         self.agents = agents
-        if self.a.pattern == "supervisor":
+        if self.a.pattern in ("supervisor", "parallel"):
             for d in self.dirs():
                 sh([self.nv, "watch", d.name, "--stop"], self.work, self.env, ok=(0, 1, 2))
 
@@ -257,7 +265,7 @@ print(result.testsRun - len(result.failures) - len(result.errors), result.testsR
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--task", required=True)
-    p.add_argument("--pattern", required=True, choices=["supervisor", "nv", "git"])
+    p.add_argument("--pattern", required=True, choices=["supervisor", "parallel", "nv", "git"])
     p.add_argument("--nv", required=True, help="the nv binary (copied: a build made meanwhile does not change the round)")
     p.add_argument("--server", default="http://localhost:8799")
     p.add_argument("--work", required=True)

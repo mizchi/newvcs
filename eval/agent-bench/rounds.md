@@ -46,11 +46,64 @@ The binaries, each the build of the commit named:
   and it took them one by one for four minutes more, five to eight seconds of thinking a step
   (and 120 s lost to a heredoc of its own that waited on stdin).
 
+## The supervisor in parallel (pattern `parallel`)
+
+The supervisor's work split in two: a planner that tells the developers how to keep apart and
+writes how to settle each shared file (`plan.md`), then an integrator for each developer, all at
+once, each doing for its developer what the supervisor did for all of them. `strkit`, nv v4;
+each a round, the supervisor's own rounds beside them.
+
+| | supervisor | parallel, plan first | parallel, `ready` first | parallel, one push at a time |
+| --- | ---: | ---: | ---: | ---: |
+| last agent done, s | 171.1, 139.1 | 184.1, 195.1 | 153.1, 156.1 | 170.2, 170.1 |
+| developers started at, s | 20, 23 | 59, 68 | 38, 35 | 27, 26 |
+| cost, USD | 1.90, 1.66 | 2.90, 3.06 | 2.71, 2.68 | 2.75, 2.70 |
+| tool calls | 63, 43 | 80, 82 | 66, 62 | 76, 70 |
+| pushes refused | 2, 3 | 6, 6 | 5, 5 | 0, 0 |
+
+- **The supervisor, rerun on v4, took half its first round's time** (331 s before v2): fewer
+  refusals, no work redone, no heredoc left waiting.
+- **Planning held everyone back**: writing the rules of settling before `ready` cost 40 s of
+  every agent's time. Written after `ready`, while the developers work, the developers start
+  as early as the supervisor's do.
+- **Integrators at once collide**: every push touches the same four shared files, so each is
+  refused over the last one that landed, and each sync, settle and push is 20 to 30 s of an
+  agent's thinking. Taking turns at the ref (a lock directory) ends the refusals and not the
+  wait: four settlings one after another, each by an agent that has to read the rules first,
+  take longer than one supervisor settling four times with all of it in mind (17 s each).
+- What settling costs is an agent's turn, and the parallel pattern pays it once for every
+  integrator, a planner on top. While every part meets every other in files a clash needs
+  judgment in, one supervisor is the cheaper and quicker of the two.
+
+## With nothing to settle (`strkit-union`)
+
+The same task with `merge=union` for every file the parts meet in, so that a clash never needs
+settling: the server merges such paths itself, Git's pull merges them. One round each, nv v4.
+
+| | git | nv | supervisor | parallel |
+| --- | ---: | ---: | ---: | ---: |
+| last agent done, s | 103.1 | 99.1 | 220.1 | 289.2, 179.1 |
+| cost, USD | 1.75 | 1.76 | 2.24 | 3.74, 2.87 |
+| pushes refused | 5 | 0 | 0 | 0, 0 |
+| commits on the ref | 8 | 14 | 11 | 14, 10 |
+
+- **nv's pushes were never refused**: the server merged what the writers had in common. Git's
+  were refused five times, each a pull that merged without a word, and the time came out the
+  same.
+- **The supervisor patterns were slower with nothing to settle than with clashes.** The
+  planner's rules said what order the shared lines go in; a union keeps both sides' lines in
+  the order they landed, so the integrators rewrote the shared files to the rules' order and
+  pushed that. Two such rewrites pushed at once are merged by union too, and a union of two
+  rewrites of the same lines has each line twice: in the slower round the ref took six commits
+  of "settle", "put back in order" and "remove the repeated lines" after the four parts had
+  landed. That is what `merge=union` is, in nv as in Git (both sides' lines, where both changed
+  the same ones), and it is safe for lines added, not for lines moved or removed.
+
 ## Not yet known
 
 - Four rounds of Git and three of v4 are few, and their ranges overlap: makespan 100 to 131 s
   against 98 to 123 s, tokens 1.96 to 2.58 M against 1.81 to 2.11 M, tool calls 40 to 54
   against 36 to 41. What does not overlap is the work redone by hand: 2 to 4 in every round of
   nv before v4, none in v4.
-- The supervisor has had one round, before any of these changes.
+- The supervisor has had three rounds, the parallel pattern six, `strkit-union` one of each.
 - One task. A task whose parts depend on each other, or that is larger, may tell otherwise.
