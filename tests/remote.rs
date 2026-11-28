@@ -1367,7 +1367,7 @@ fn what_a_committer_reads_names_the_ref_and_what_to_do_next() {
   // passing state is committed by itself.
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 1, "{said}");
-  assert!(said.contains("once the conditions pass on them, they go into the commit of yours put on the tip"), "{said}");
+  assert!(said.contains("once the conditions pass on them, each commit of yours that changed them gets its own version"), "{said}");
   assert!(said.contains("caught up 1 commit:"), "{said}");
   // Until it is settled, `nv pending` says the file is in none of the commits it lists.
   let (_, said) = run("bob", "$NV pending .");
@@ -1562,7 +1562,13 @@ fn publish_makes_a_commit_at_each_note_and_pushes_them() {
   run("echo 'mine and theirs' > a && $NV checkpoint . >/dev/null");
   let (code, said) = run("$NV publish .");
   assert_eq!(code, 0, "{said}");
-  assert_eq!(run("$NV git log -1 --format=%B").1, "Change a\n\nwhy Change a\n1\n\n", "{said}");
+  // The body written once, and below it what was settled, against whose commit.
+  let theirs = run("cd ../other && $NV git log -1 --format=%h").1.trim().to_string();
+  assert_eq!(
+    run("$NV git log -1 --format=%B").1,
+    format!("Change a\n\nwhy Change a\n1\n\nSettled: a with {theirs} (Theirs)\n\n"),
+    "{said}"
+  );
   // A publish whose push the ref refused and whose sync merged by itself writes the body again,
   // of the change as it lands on the new tip: a body of the old base would say what may no
   // longer hold.
@@ -1659,6 +1665,11 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   let (code, said) = run("bob", "$NV push .");
   assert_eq!(code, 0, "{said}");
   assert_eq!(run("bob", "$NV git show --name-only --format=%s HEAD").1, "Add b\n\nREADME.md\nb.py\n");
+  // The history says what was settled, and against whose commit, through the rebuild: what a
+  // reader of it could not find out in the twelfth round's reader experiment.
+  let ann_add = run("ann", "$NV git log --format='%h %s' | grep 'Add a$' | cut -d' ' -f1").1.trim().to_string();
+  let said = run("bob", "$NV git log -1 --format=%B").1;
+  assert!(said.contains(&format!("Settled: README.md with {ann_add} (Add a)")), "{said}");
   // Cat clashes with nothing of his own committed: what he settles is a commit of his, on the
   // ref's tip, never a change to Bob's.
   let (code, said) = run("cat", "printf '# list\\n- cat\\n' > README.md && $NV sync .");
@@ -1666,6 +1677,10 @@ fn settling_a_clash_completes_the_commit_the_sync_left_it_out_of() {
   run("cat", "printf '# list\\n- ann\\n- bob\\n- cat\\n' > README.md && $NV checkpoint . >/dev/null");
   assert_eq!(run("cat", "$NV git log --format=%s -2").1, "checkpoint: unit passed\nAdd b\n");
   assert_eq!(run("cat", "$NV git show --name-only --format= HEAD~1").1, "README.md\nb.py\n", "Bob's commit is as he pushed it");
+  // A settling that is a commit of its own says what it settled too: against both of theirs.
+  let bob_add = run("cat", "$NV git log -1 --format=%h HEAD~1").1.trim().to_string();
+  let said = run("cat", "$NV git log -1 --format=%B").1;
+  assert!(said.contains(&format!("Settled: README.md with {ann_add} (Add a), {bob_add} (Add b)")), "{said}");
 }
 
 /// What a twelfth-round reviewer lost by killing a sync: an arrival cut short is finished by the
@@ -1925,8 +1940,23 @@ fn commits_a_sync_makes_one_keep_all_their_lines() {
   );
   let (code, said) = run("bob", "$NV push . ; $NV sync .");
   assert_eq!(code, 0, "{said}");
-  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step A; Step B\nAnn edits five\n", "{said}");
-  assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why A.\n\nWhy B.");
+  // Put on the tip one by one, each with its message: a supervisor's commits stay as it made
+  // them (round 17: two noted steps came out of a sync as one).
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Step B\nStep A\nAnn edits five\n", "{said}");
+  assert_eq!(run("bob", "$NV git log -1 --format=%b").1.trim(), "Why B.");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1.trim(), "f");
+  assert_eq!(run("bob", "cat f").1, "bob\n2\n3\n4\nann\n");
+  assert!(!said.contains("now one commit"), "{said}");
+  // Where they cannot be put on it one by one (the first clashes with theirs, the second takes
+  // it back), they are one commit as before, under the lines of all of them.
+  run("bob", "$NV push . >/dev/null");
+  run("ann", "$NV sync . >/dev/null; sed -i 's/^3$/ann3/' f && $NV commit . 'Ann edits three' >/dev/null && $NV push . >/dev/null");
+  let (code, said) = run(
+    "bob",
+    "sed -i 's/^3$/bob3/' f && $NV commit . 'Step C' >/dev/null && sed -i 's/^bob3$/3/' f && echo k > k && $NV commit . 'Step D' >/dev/null && $NV push . ; $NV sync .",
+  );
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Step C; Step D\nAnn edits three\n", "{said}");
   assert!(said.contains("under the lines of all of them"), "{said}");
   // Commits that came are counted though the store, which Ann's fork shares, had them already
   // (twelfth round: "caught up 0 commits", from two reviewers).
@@ -1941,4 +1971,1088 @@ fn commits_a_sync_makes_one_keep_all_their_lines() {
   let (code, said) = run("bob", "$NV sync .");
   assert_eq!(code, 0, "{said}");
   assert!(said.contains("caught up 1 commit"), "{said}");
+}
+
+/// A clash in a file only one of the commits put on the tip changed: the commits stay commits of
+/// their own, and the settling goes into the one that changed the file, with those after it made
+/// again on top (round 17: the supervisor's two commits were made one by the sync that clashed).
+#[test]
+fn a_settling_goes_into_the_commit_that_changed_the_file() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-in-place");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-in-place-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      printf '[checks.unit]\nrun = "! grep -q none README.md && ! grep -q markers README.md"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run(
+    "ann",
+    "printf '# list\\n- ann\\n' > README.md && echo a > a.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add a' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- bob\\n' > README.md && echo x > x.py && $NV checkpoint . >/dev/null && echo y > y.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Add x' 2 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "still two commits: {said}");
+  // Settled, and committed as the conditions pass: into "Add x", which changed README.md.
+  run("bob", "printf '# list\\n- ann\\n- bob\\n' > README.md && $NV checkpoint . >/dev/null");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "y.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"), "the trailer is on the commit it settled");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+}
+
+/// A path whose `.gitattributes` names a merge driver is merged by a sync as Git merges it: by the
+/// command the workspace's configuration gives that driver, and only where it is defined there.
+/// A driver that says it could not merge leaves what it wrote, held out as a file with both
+/// versions is, for whoever settles it.
+#[test]
+fn a_sync_merges_by_the_driver_the_attributes_name() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-merge-driver");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/merge-driver-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      printf 'cat "$2" "$3" | awk %s > "$2.new" && mv "$2.new" "$2"\n' "'!seen[\$0]++'" > both.sh
+      printf 'echo "could not" > "$1"; exit 1\n' > refuse.sh
+      git init -q -b main src && cd src && printf 'a\nb\n' > list.txt && echo one > hard.txt
+      printf 'list.txt merge=both\nhard.txt merge=refuse\n' > .gitattributes
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list.txt && $NV commit . 'Ann lists' >/dev/null && $NV push . >/dev/null");
+  run("bob", "printf 'a\\nb\\nbob\\n' > list.txt && $NV commit . 'Bob lists' >/dev/null");
+  // Undefined here, the driver is no driver: the text merge, which leaves both versions.
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("both sides changed the same lines of: list.txt"), "{said}");
+  run("bob", "$NV restore . before-sync >/dev/null");
+  // Defined, it merges, and the sync is clean.
+  let (code, said) = run("bob", "$NV git config merge.both.driver 'sh ../both.sh %O %A %B' && $NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("bob/list.txt")).unwrap(), "a\nb\nbob\nann\n");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // A driver that says it could not merge and leaves no markers is not taken at its word: the
+  // file is merged as text, both versions between markers, held out until it is settled.
+  run("ann", "$NV sync . >/dev/null; echo 'one by ann' > hard.txt && $NV commit . 'Ann hard' >/dev/null && $NV push . >/dev/null");
+  run("bob", "echo 'one by bob' > hard.txt && $NV commit . 'Bob hard' >/dev/null");
+  let (code, said) = run("bob", "$NV git config merge.refuse.driver 'sh ../refuse.sh %A' && $NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("hard.txt"), "{said}");
+  assert!(std::fs::read_to_string(root.join("bob/hard.txt")).unwrap().starts_with("<<<<<<< yours\none by bob\n"));
+  let (code, said) = run("bob", "$NV commit . 'Bob hard, settled'");
+  assert_ne!(code, 0, "held out until it is settled: {said}");
+  assert!(said.contains("hard.txt"), "{said}");
+  // No file of the driver's is left behind in the workspace.
+  assert_eq!(run("bob", "ls .nv | grep -c '^merge-' || true").1.trim(), "0");
+}
+
+/// Without a runner behind writes, `nv commit` given no message is how a settling completes the
+/// commit it belongs to, as `git rebase --continue` keeps the message of the commit that stopped:
+/// no commit is left on the ref without the files the sync held out of it (`eval/agent-bench`,
+/// where a writer that gave a message made a commit of the settling after two that fail).
+#[test]
+fn a_commit_given_no_message_completes_the_commit_a_settling_belongs_to() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-by-commit");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-by-commit-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf '# list\\n- ann\\n' > README.md && $NV commit . 'Add a' >/dev/null && $NV push . >/dev/null");
+  run(
+    "bob",
+    "printf '# list\\n- x\\n' > README.md && echo x > x.py && $NV commit . 'Add x' >/dev/null \
+     && printf '# list\\n- x\\n- y\\n' > README.md && echo y > y.py && $NV commit . 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("`nv commit <dir>` with no message"), "the sync says how: {said}");
+  assert!(said.contains("each commit of yours that changed them"), "and what becomes of the commits: {said}");
+  // What each commit is held out of until the settling, and where the settling goes.
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  assert!(
+    said.contains("each commit above that changed them gets its own version of them") && said.contains("Add y the settled one"),
+    "{said}"
+  );
+  // Given no message with nothing to complete, or with more than the settling, it still asks for one.
+  let (code, said) = run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && echo z > z.py && $NV commit .");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("a commit needs a message") && said.contains("z.py"), "{said}");
+  let (code, said) = run("bob", "rm z.py && $NV commit .");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("completes Add y"), "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B").1.contains("Settled: README.md with"));
+  // The earlier commit is not left without its line: it has the file as the settling has it, less
+  // what the later commit added, and says it was settled as well.
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann\n- x\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"));
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // With nothing left to complete, a commit needs a message as ever.
+  let (code, said) = run("bob", "echo w > w.py && $NV commit .");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("a commit needs a message"), "{said}");
+}
+
+/// Where a workspace pushes to a ref of nv's, Git's verbs for the ref are nv's: `nv git push` is
+/// `nv push` and `nv git pull --rebase` is `nv sync`, with what they say and Git's exit codes,
+/// and not a push to, or a pull from, the repository the workspace was cloned from, which is not
+/// where its work goes (`eval/agent-bench`: a writer that knows Git reached for `nv help` first).
+/// What nv cannot be (a pull that merges, a fetch) is refused, and says what to use.
+#[test]
+fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-verbs");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-verbs-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list && $NV commit . 'Ann lists' >/dev/null && $NV git push");
+  run("bob", "printf 'A\\nb\\n' > list && $NV commit . 'Bob capitalises a' >/dev/null");
+  // Refused as `nv push` is (both changed `list`), with Git's exit code for a push refused.
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("the push was refused"), "{said}");
+  // A pull that would merge is not what nv does with a ref: refused, saying what is.
+  let (code, said) = run("bob", "$NV git pull");
+  assert_eq!(code, 125, "{said}");
+  assert!(said.contains("not supported") && said.contains("git pull --rebase"), "{said}");
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("caught up 1 commit"), "{said}");
+  let (code, said) = run("bob", "$NV git push origin main");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("pushed 1 commit"), "{said}");
+  run("ann", "$NV git pull --rebase -q >/dev/null");
+  assert_eq!(run("ann", "$NV git log --format=%s").1, "Bob capitalises a\nAnn lists\nseed\n");
+  assert_eq!(std::fs::read_to_string(root.join("ann/list")).unwrap(), "A\nb\nann\n");
+  // A ref it does not push to is not this one.
+  let (code, said) = run("bob", "$NV git push origin other");
+  assert_eq!(code, 125, "{said}");
+  // A commit of nothing but a file that clashes, settled as Git's rebase is: `git add`, then
+  // `git rebase --continue`, which completes it under its own message.
+  run("bob", "$NV git pull --rebase -q >/dev/null");
+  run("ann", "printf 'ANN\\nb\\nann\\n' > list && $NV git commit -q -am 'Ann shouts' && $NV git push -q");
+  run("bob", "printf 'BOB\\nb\\nann\\n' > list && $NV git commit -q -am 'Bob shouts'");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 1, "{said}");
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("both sides changed the same lines of: list"), "{said}");
+  // The files it left with both versions are what Git's rebase would list as unmerged.
+  assert_eq!(run("bob", "$NV git diff --name-only --diff-filter=U").1, "list\n");
+  // Undone as Git's rebase is, to what was there before.
+  let (code, said) = run("bob", "$NV git rebase --abort");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "BOB\nb\nann\n");
+  run("bob", "$NV git pull --rebase -q >/dev/null");
+  let (code, said) = run("bob", "printf 'ANN BOB\\nb\\nann\\n' > list && $NV git add list && $NV git rebase --continue");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -2 --format=%s").1, "Bob shouts\nAnn shouts\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "list\n");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 0, "{said}");
+}
+
+/// `git fetch` toward the ref brings the ref's commits into the store and changes no file and
+/// nothing the workspace stands on; `origin/<ref>` names the tip it fetched, for log, show, diff
+/// and status, until a sync or a push sees a newer one.
+#[test]
+fn git_fetch_names_the_refs_tip_without_touching_the_files() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-fetch");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-fetch-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list && $NV git commit -q -am 'Ann lists' && $NV git push -q");
+  // Before any fetch, `origin/main` is the ref as the workspace last saw it.
+  assert_eq!(run("ann", "$NV git log -1 --format=%s origin/main").1, "Ann lists\n");
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "seed\n");
+  let (code, said) = run("bob", "$NV git fetch");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("main") && said.contains("origin/main"), "{said}");
+  // Nothing on disk, and nothing the workspace stands on, moved.
+  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "a\nb\n");
+  assert_eq!(run("bob", "$NV git log --format=%s").1, "seed\n");
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  // What it fetched is there to look at.
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "Ann lists\nseed\n");
+  assert_eq!(run("bob", "$NV git show origin/main:list").1, "a\nb\nann\n");
+  assert_eq!(run("bob", "$NV git diff --name-only HEAD origin/main").1, "list\n");
+  let (_, said) = run("bob", "$NV git status");
+  assert!(said.contains("behind") && said.contains("by 1 commit"), "{said}");
+  run("bob", "printf 'A\\nb\\n' > list && $NV git commit -q -am 'Bob capitalises a'");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main [ahead 1, behind 1]\n");
+  // A second fetch with nothing new says nothing and changes nothing.
+  let (code, said) = run("bob", "$NV git fetch -q origin");
+  assert_eq!((code, said.as_str()), (0, ""));
+  // Options it does not speak, and a ref it does not push to, are refused.
+  for line in ["$NV git fetch --all", "$NV git fetch origin other"] {
+    let (code, said) = run("bob", line);
+    assert_eq!(code, 125, "{line}: {said}");
+  }
+  // A sync takes the newer tip, and a push names it too.
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main [ahead 1]\n");
+  run("bob", "$NV git push -q");
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "Bob capitalises a\nAnn lists\nseed\n");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main\n");
+}
+
+/// A `git pull --rebase` that stopped speaks Git's verbs for what comes next, and `git commit -m`
+/// there gives the commit the settling completes a message of its own, as at a rebase stopped at
+/// that commit, though commits of this workspace's came after it.
+#[test]
+fn git_commit_at_a_stopped_pull_gives_the_commit_it_completes_a_message() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-commit-stopped");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-commit-stopped-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'ANN\\nb\\n' > list && $NV git commit -q -am 'Ann shouts' && $NV git push -q");
+  run("bob", "printf 'BOB\\nb\\n' > list && echo y > y && $NV git add -A && $NV git commit -q -m 'Bob shouts and adds y'");
+  run("bob", "echo z > z && $NV git add z && $NV git commit -q -m 'Bob adds z'");
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 1, "{said}");
+  // Told in the verbs it was asked in.
+  assert!(said.contains("git add") && said.contains("git rebase --continue") && said.contains("git commit -m"), "{said}");
+  let (code, said) =
+    run("bob", "printf 'ANN BOB\\nb\\n' > list && $NV git add list && $NV git commit -q -m 'Bob shouts with Ann and adds y'");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log --format=%s").1, "Bob adds z\nBob shouts with Ann and adds y\nAnn shouts\nseed\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "list\ny\n");
+  assert_eq!(run("bob", "$NV git log -1 --format=%an HEAD~1").1, "bob\n");
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 0, "{said}");
+}
+
+/// Where a sync made the commits one, it says so, and not that each will get its version of the
+/// files it left with both versions.
+#[test]
+fn a_sync_that_folds_says_what_the_settling_completes() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-fold-and-clash");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/fold-and-clash-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '1\n2\n3\n' > f && printf 'one\n' > g
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf '1\\n2\\nann\\n' > f && echo 'one by ann' > g && $NV commit . 'Ann' >/dev/null && $NV push . >/dev/null");
+  run(
+    "bob",
+    "printf '1\\n2\\nbob\\n' > f && $NV commit . 'Bob tries' >/dev/null && printf '1\\n2\\n3\\n' > f && echo 'one by bob' > g && echo h > h && $NV commit . 'Bob instead' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(said.contains("now one commit") && said.contains("both sides changed the same lines of: g"), "{said}");
+  assert!(!said.contains("each commit of yours"), "{said}");
+  assert!(said.contains("they complete the commit of yours"), "{said}");
+}
+
+#[test]
+fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-settle-in-last");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/settle-in-last-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf '# list\n- (none yet)\n' > README.md
+      printf '[checks.unit]\nrun = "! grep -q none README.md && ! grep -q markers README.md"\n\n[commit]\neach = true\n' > nv.toml
+      git add -A && git commit -q -m seed && cd ..
+      {nv} import src store >/dev/null && {nv} checkout store HEAD ann >/dev/null && {nv} remote ann {url} main
+      (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run(
+    "ann",
+    "printf '# list\\n- ann\\n' > README.md && echo a > a.py && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Add a' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- x\\n' > README.md && echo x > x.py && $NV checkpoint . >/dev/null \
+     && printf '# list\\n- x\\n- y\\n' > README.md && echo y > y.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Add x' 2 'Add y' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "still two commits: {said}");
+  // Both are held out of README.md until it is settled; the later is the one completed.
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  assert!(said.contains("and Add y the settled one"), "{said}");
+  run("bob", "printf '# list\\n- ann\\n- x\\n- y\\n' > README.md && $NV checkpoint . >/dev/null");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add y\nAdd x\nAdd a\n", "{said}");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\nx.py\n", "{said}");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann\n- x\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\ny.py\n");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD").1.contains("Settled: README.md with"), "the trailer is on the commit it settled");
+  assert!(run("bob", "$NV git log -1 --format=%B HEAD~1").1.contains("Settled: README.md with"));
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  // A commit that changed nothing but such a file is not folded into the others either: it is
+  // on the tip with nothing in it until the settling, which gives it its version, as a rebase
+  // stopped at it would have it settled (`eval/agent-bench`, `bst-cst`: a writer's commit of a
+  // shared lemma alone folded all its commits, in every round).
+  run(
+    "ann",
+    "$NV sync . >/dev/null; printf '# list\\n- ann2\\n' > README.md && $NV checkpoint . >/dev/null && $NV rebuild . 1 'Ann again' >/dev/null && $NV push . >/dev/null",
+  );
+  run(
+    "bob",
+    "printf '# list\\n- z\\n' > README.md && $NV checkpoint . >/dev/null && printf '# list\\n- z\\n- w\\n' > README.md && echo w > w.py && $NV checkpoint . >/dev/null \
+     && $NV rebuild . 1 'Note z' 2 'Add w' >/dev/null",
+  );
+  let (code, said) = run("bob", "$NV push . ; $NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert!(!said.contains("now one commit"), "{said}");
+  let (_, said) = run("bob", "$NV pending .");
+  assert_eq!(said.matches("  git ").count(), 2, "{said}");
+  assert_eq!(said.matches("README.md (held out until it is settled)").count(), 2, "{said}");
+  // Settled as a commit of its own, the first would be pushed with nothing in it: refused.
+  let (code, said) = run("bob", "printf '# list\\n- ann2\\n- z\\n- w\\n' > README.md && $NV commit . 'Settle the list'");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("Note z") && said.contains("with no message"), "{said}");
+  let (code, said) = run("bob", "$NV commit .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log -3 --format=%s").1, "Add w\nNote z\nAnn again\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "README.md\n");
+  assert_eq!(run("bob", "$NV git show HEAD~1:README.md").1, "# list\n- ann2\n- z\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "README.md\nw.py\n");
+  let (code, said) = run("bob", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+}
+
+/// Two writers on a fresh ref, both made from one Git repository of a six-line `a.txt` and a
+/// `b.txt`, and a way to run a script in either, with what it printed, stderr and all.
+fn two_writers(name: &str) -> (PathBuf, impl Fn(&str, &str) -> (i32, String) + use<>) {
+  let server = std::env::var("NV_SERVER").expect("NV_SERVER");
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("remote-{name}"));
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/{name}-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main seed && cd seed && printf '1\n2\n3\n4\n5\n6\n' > a.txt && echo x > b.txt
+      git add -A && git commit -q -m init && cd ..
+      {nv} git clone -q seed w1 && {nv} remote w1 {url} main && (cd w1 && {nv} push . >/dev/null)
+      {nv} git clone -q seed w2 && {nv} remote w2 {url} main && (cd w2 && {nv} sync . >/dev/null)
+      "##
+    ),
+  );
+  let at = root.clone();
+  let run = move |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(at.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  (root, run)
+}
+
+/// What a thirteenth reviewer found with several writers on one ref, through Git's verbs: what
+/// `git add` staged is not carried across a pull to be committed over what the pull brought; a
+/// pull that stopped is finished or undone before anything moves; undoing it undoes its staging;
+/// and finishing it commits what was staged, whatever else is in the directory.
+#[test]
+fn what_a_thirteenth_reviewer_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  // Staged, then pulled: Git refuses the pull, and so does nv, where the ref changed the file.
+  let (_, run) = two_writers("thirteenth-staged");
+  assert_eq!(run("w1", "sed -i 's/^1$/1 by w1/' a.txt && $NV git commit -qam w1 && $NV git push -q").0, 0);
+  assert_eq!(run("w2", "sed -i 's/^6$/6 by w2/' a.txt && $NV git add a.txt").0, 0);
+  let (code, said) = run("w2", "$NV git pull --rebase");
+  assert_eq!(code, 128, "{said}");
+  assert!(said.contains("cannot pull with rebase: Your index contains uncommitted changes."), "{said}");
+  let (code, said) = run("w2", "$NV sync .");
+  assert_ne!(code, 0, "{said}");
+  assert!(said.contains("staged") && said.contains("a.txt"), "{said}");
+  assert_eq!(run("w2", "cat a.txt").1, "1\n2\n3\n4\n5\n6 by w2\n");
+  assert_eq!(run("w2", "$NV git status --porcelain").1, "M  a.txt\n");
+  let (code, said) = run("w2", "$NV git commit -qm w2 && $NV git pull --rebase -q && $NV git push -q");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("w1", "$NV git pull --rebase -q && cat a.txt").1, "1 by w1\n2\n3\n4\n5\n6 by w2\n");
+  // A file staged that the ref did not change is no reason to refuse nv's own sync: it stays staged.
+  assert_eq!(run("w2", "echo y > b.txt && $NV git add b.txt").0, 0);
+  assert_eq!(run("w1", "echo 7 >> a.txt && $NV git commit -qam seven && $NV git push -q").0, 0);
+  let (code, said) = run("w2", "$NV sync .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("w2", "$NV git status --porcelain").1, "M  b.txt\n");
+
+  // A pull that stopped, settled and added: nothing moves until it is finished, and finishing it
+  // commits what was added, untracked files or not.
+  let (_, run) = two_writers("thirteenth-stopped");
+  assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+  assert_eq!(run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a").0, 0);
+  assert_eq!(run("w2", "$NV git pull --rebase").0, 1);
+  assert_eq!(run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt").0, 0);
+  assert_eq!(run("w1", "echo W1b >> b.txt && $NV git commit -qam w1b && $NV git push -q").0, 0);
+  // Settled on disk and not added: as unfinished as added and not committed.
+  for (what, step) in [("settled", ":"), ("added", "$NV git add a.txt")] {
+    assert_eq!(run("w2", step).0, 0);
+    for verb in ["$NV git pull --rebase", "$NV git push", "$NV push .", "$NV sync ."] {
+      let (code, said) = run("w2", verb);
+      assert_ne!(code, 0, "{what}: {verb}\n{said}");
+      assert!(said.contains("a.txt"), "{what}: {verb}\n{said}");
+    }
+  }
+  assert_eq!(run("w2", "$NV git log --format=%s").1, "w2a\nw1a\ninit\n");
+  assert_eq!(run("w2", "echo notes > u.txt && $NV git rebase --continue").0, 0);
+  assert_eq!(run("w2", "$NV git status --porcelain").1, "?? u.txt\n");
+  assert_eq!(run("w2", "$NV git log --format=%s").1, "w2a\nw1a\ninit\n");
+  let (code, said) = run("w2", "$NV git pull --rebase -q && $NV git push -q");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("w1", "$NV git pull --rebase -q && cat a.txt b.txt").1, "1\n2\n3\n4\n5\n6\nW2a\nW1a\nx\nW1b\n");
+
+  // And given a message there: that message, with only what was added.
+  let (_, run) = two_writers("thirteenth-reworded");
+  assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+  assert_eq!(run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a").0, 0);
+  assert_eq!(run("w2", "$NV git pull --rebase").0, 1);
+  let (code, said) =
+    run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt && $NV git add a.txt && echo notes > u.txt && $NV git commit -q -m 'w2a, settled'");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("w2", "$NV git status --porcelain").1, "?? u.txt\n");
+  assert_eq!(run("w2", "$NV git log --format=%s").1, "w2a, settled\nw1a\ninit\n");
+
+  // Undone instead: the files, HEAD and the index as they were before the pull.
+  for undo in ["$NV git rebase --abort", "$NV restore . before-sync"] {
+    let (_, run) = two_writers("thirteenth-undone");
+    assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+    assert_eq!(run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a").0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase").0, 1);
+    assert_eq!(run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt && $NV git add a.txt && echo n > n.txt && $NV git add n.txt").0, 0);
+    let (code, said) = run("w2", undo);
+    assert_eq!(code, 0, "{undo}: {said}");
+    let (_, status) = run("w2", "$NV git status --porcelain");
+    assert!(status.lines().all(|l| l.starts_with("??")), "{undo}: {status}");
+    assert_eq!(run("w2", "cat a.txt").1, "1\n2\n3\n4\n5\n6\nW2a\n", "{undo}");
+    assert_eq!(run("w2", "$NV git commit -qm next").0, 1, "{undo}");
+  }
+}
+
+/// A name with a newline in it is a name like any other to what a sync notes of the files it left
+/// with both versions: a push is refused while it holds them.
+#[test]
+fn a_file_left_unsettled_under_a_name_with_a_newline_is_still_unsettled() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let (_, run) = two_writers("thirteenth-newline");
+  assert_eq!(run("w1", "printf 'a\\n' > 'new\nline.txt' && $NV commit . 'adds it' >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+  assert_eq!(run("w1", "printf 'w1\\n' > 'new\nline.txt' && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(run("w2", "printf 'w2\\n' > 'new\nline.txt' && $NV commit . w2 >/dev/null").0, 0);
+  let (code, said) = run("w2", "$NV sync .");
+  assert_ne!(code, 0, "{said}");
+  let (code, said) = run("w2", "$NV push .");
+  assert_ne!(code, 0, "{said}");
+  // Settled, it completes the commit the sync held it out of.
+  let (code, said) = run("w2", "printf 'w1 w2\\n' > 'new\nline.txt' && $NV commit .");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("w2", "$NV push . >/dev/null").0, 0);
+  assert_eq!(run("w1", "$NV sync . >/dev/null && cat 'new\nline.txt'").1, "w1 w2\n");
+}
+
+/// `git fetch` brings what `log origin/<ref>` needs to name each commit that came, and names the
+/// ref's tip even where the workspace learnt only then where it stands on it.
+#[test]
+fn git_fetch_gives_origin_every_commit_and_the_tip() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let (_, run) = two_writers("thirteenth-fetch");
+  assert_eq!(
+    run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && echo W1b >> a.txt && $NV git commit -qam w1b && $NV git push -q").0,
+    0
+  );
+  let (code, said) = run("w2", "$NV git fetch -q && $NV git log --format=%s origin/main");
+  assert_eq!((code, said.as_str()), (0, "w1b\nw1a\ninit\n"));
+  assert_eq!(run("w2", "$NV git status -sb").1.lines().next().unwrap(), "## main...origin/main [behind 2]");
+  // A ref this workspace's own push started, whose answer it never heard: it does not yet know
+  // it stands on the ref, and the fetch is where it learns that.
+  let (_, run) = two_writers("thirteenth-fetch-unheard");
+  assert_eq!(run("w2", "echo W2 >> b.txt && $NV git commit -qam w2 && $NV git push -q").0, 0);
+  assert_eq!(run("w2", "sed -i '/^pushed /d; s/^seq .*/seq 0/' .nv/workspace").0, 0);
+  let (code, said) = run("w2", "$NV git fetch -q && $NV git rev-parse origin/main && $NV git rev-parse HEAD");
+  assert_eq!(code, 0, "{said}");
+  let ids: Vec<&str> = said.lines().collect();
+  assert_eq!(ids[0], ids[1], "{said}");
+}
+
+/// `restore` names the state that keeps what it wrote over, whether that state was recorded by
+/// the restore or before it, by a push.
+#[test]
+fn restore_after_a_push_names_where_the_edit_is_kept() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let (_, run) = two_writers("thirteenth-restore");
+  assert_eq!(
+    run("w2", "echo c >> a.txt && $NV git commit -qam c1 && $NV mark . m1 >/dev/null && echo EDIT >> b.txt && $NV git push -q").0,
+    0
+  );
+  let (code, said) = run("w2", "$NV restore . m1");
+  assert_eq!(code, 0, "{said}");
+  let id = said.split("kept as ").nth(1).map(str::trim).unwrap_or_else(|| panic!("{said}")).to_string();
+  assert_eq!(run("w2", &format!("$NV restore . {id} >/dev/null && cat b.txt")).1, "x\nEDIT\n");
+}
+
+/// What a thirteenth reviewer found of merge drivers under a sync: one that never returns is
+/// stopped with the command and writes nothing after it; one killed by a signal is no result; and
+/// markers a driver leaves are a file to settle, whatever it says.
+#[test]
+fn what_a_thirteenth_reviewer_found_in_drivers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let clash = |name: &str, driver: &str| {
+    let (root, run) = two_writers(name);
+    assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(
+      run("w2", &format!("sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver {driver:?}")).0,
+      0
+    );
+    (root, run)
+  };
+  // Never returns, then writes: stopped with the sync, and with it, its writing.
+  let (root, run) = clash("thirteenth-driver-hangs", "sleep 3; echo LATE > b.txt; cat %B > %A");
+  let (code, said) = run("w2", "NV_TIMEOUT=1 $NV sync .");
+  assert_eq!(code, 124, "{said}");
+  std::thread::sleep(std::time::Duration::from_secs(4));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n");
+  // What it left of its own goes when a driver next runs.
+  assert_eq!(run("w2", "$NV git config merge.x.driver 'cat %B > %A' && $NV sync . >/dev/null && ls .nv | grep -c merge-").1, "0\n");
+
+  // Killed by a signal half way: the sync merges as text.
+  let (root, run) = clash("thirteenth-driver-killed", "echo half > %A; kill -9 $$");
+  let (code, said) = run("w2", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  let text = std::fs::read_to_string(root.join("w2/a.txt")).unwrap();
+  assert!(text.contains("<<<<<<< yours") && text.contains("w1") && !text.contains("half"), "{text}");
+
+  // Out of its process group in a session of its own, and still stopped with it (second pass).
+  let (root, run) = clash("thirteenth-driver-setsid", "setsid sh -c 'sleep 2; echo LATE > b.txt' & sleep 100");
+  let (code, said) = run("w2", "NV_MERGE_DRIVER_TIMEOUT=1 $NV sync .");
+  assert_eq!(code, 2, "{said}");
+  std::thread::sleep(std::time::Duration::from_secs(3));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n");
+
+  // Killed inside a shell, which says so by an exit above 128: no result, as Git has it.
+  let (root, run) = clash("thirteenth-driver-wrapped", "echo half > %A; exit 137");
+  let (code, said) = run(
+    "w2",
+    "$NV git checkout -q -b other HEAD~1 && sed -i 's/^1$/other/' a.txt && $NV git commit -qam other && $NV git checkout -q main && $NV git merge -q other",
+  );
+  assert_ne!(code, 0, "{said}");
+  let text = std::fs::read_to_string(root.join("w2/a.txt")).unwrap();
+  assert!(!text.contains("half") && text.starts_with("w2\n"), "{text}");
+
+  // Exit 0 with markers: a file to settle, and no push until it is.
+  let (_, run) = clash("thirteenth-driver-marks", "printf '<<<<<<< yours\\nA\\n=======\\nB\\n>>>>>>> theirs\\n' > %A");
+  let (code, said) = run("w2", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert_ne!(run("w2", "$NV push .").0, 0);
+}
+
+/// What the thirteenth round's second pass found with several writers: what was added at a pull
+/// that stopped stays committed whatever commit comes after; a completion by `nv commit` spends
+/// the staging; and what a push's catching-up unstages is kept.
+#[test]
+fn what_a_second_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let stopped = |name: &str| {
+    let (root, run) = two_writers(name);
+    assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+    assert_eq!(run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a && echo W2b >> b.txt && $NV git commit -qam w2b").0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase").0, 1);
+    assert_eq!(run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt").0, 0);
+    (root, run)
+  };
+  // Added to a file a later commit changed: committed, not taken back out by that commit.
+  for finish in ["$NV git rebase --continue", "$NV git commit -qm 'w2a again'"] {
+    let (_, run) = stopped("second-pass-added");
+    let (code, said) = run("w2", &format!("echo ADDED >> b.txt && $NV git add a.txt b.txt && {finish}"));
+    assert_eq!(code, 0, "{finish}: {said}");
+    assert_eq!(run("w2", "$NV git show HEAD:b.txt").1, "x\nW2b\nADDED\n", "{finish}");
+    assert_eq!(run("w2", "$NV git status --porcelain").1, "", "{finish}");
+  }
+  // Completed by `nv commit`, with files added on the way: nothing is left staged.
+  let (_, run) = stopped("second-pass-nv-commit");
+  assert_eq!(run("w2", "$NV git add a.txt && $NV commit . >/dev/null").0, 0);
+  assert_eq!(run("w1", "echo c > c.txt && $NV git add c.txt && $NV git commit -qm w1c && $NV git push -q").0, 0);
+  let (code, said) = run("w2", "$NV git pull --rebase -q");
+  assert_eq!(code, 0, "{said}");
+
+  // Staged, then taken off disk, then a push that catches up on that file: the staged copy is kept.
+  let (_, run) = two_writers("second-pass-unstaged");
+  assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV git commit -qam w1 && $NV git push -q").0, 0);
+  assert_eq!(
+    run("w2", "echo y > b.txt && $NV git commit -qam w2 && echo STAGED >> a.txt && $NV git add a.txt && sed -i '/STAGED/d' a.txt").0,
+    0
+  );
+  let (code, said) = run("w2", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  let kept = said.split("is kept as ").nth(1).map(|t| t.split_whitespace().next().unwrap().to_string()).unwrap_or_else(|| panic!("{said}"));
+  assert!(!said.contains("before-sync"), "{said}");
+  let (_, shown) = run("w2", &format!("$NV since . {kept}"));
+  assert!(shown.contains("a.txt"), "{shown}");
+}
+
+#[test]
+fn what_a_third_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let killed = |undo: &str, pause: u32| {
+    format!(
+      "$NV {undo} >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true"
+    )
+  };
+  let undos = ["git rebase --abort", "restore . before-sync"];
+  // An undo at a stopped pull, killed while it writes files, then gone on from with Git's verbs:
+  // the other writer's committed lines stay on the ref, and the undo run again finishes it.
+  let files = "a.txt b.txt c.txt d.txt e.txt g.txt";
+  for round in 0..12u32 {
+    let undo = undos[round as usize % 2];
+    let (_, run) = two_writers(&format!("third-pass-killed-undo-{round}"));
+    assert_eq!(
+      run(
+        "w1",
+        &format!("for f in c d e g; do echo base > $f.txt; done && $NV git add {files} && $NV git commit -qm files && $NV git push -q")
+      )
+      .0,
+      0
+    );
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", &format!("for f in {files}; do echo W1-$f >> $f; done && $NV git commit -qam w1 && $NV git push -q")).0, 0);
+    assert_eq!(run("w2", &format!("for f in {files}; do echo W2-$f >> $f; done && $NV git commit -qam w2")).0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase >/dev/null").0, 1);
+    assert_eq!(run("w2", &format!("sed -i '/^[<=>]\\{{7\\}}/d' {files} && $NV git add {files}")).0, 0);
+    run("w2", &killed(undo, 1 + round % 9));
+    // Going on as the refusals say, settling and committing whatever is left, and pushing.
+    run(
+      "w2",
+      &format!(
+        "sed -i '/^[<=>]\\{{7\\}}/d' {files}; $NV git add {files}; $NV git commit -qm again || $NV git rebase --continue; $NV git push -q"
+      ),
+    );
+    assert_eq!(run("w1", "$NV sync . >/dev/null").0, 0);
+    let (_, missing) = run("w1", &format!("for f in {files}; do grep -qx W1-$f $f || echo W1-$f; done"));
+    assert_eq!(missing, "", "{undo} killed at {} ms: w1's committed lines gone from the ref", 1 + round % 9);
+    // Run again, the undo finishes: the files, HEAD and the index are as before the pull.
+    let (code, said) = run("w2", &format!("$NV {undo}"));
+    let (_, status) = run("w2", "$NV git status --porcelain");
+    let (_, head) = run("w2", "$NV git show HEAD:a.txt");
+    if code == 0 {
+      assert_eq!(status, "", "{undo} killed at {} ms, then run again: {said}", 1 + round % 9);
+      assert!(head.contains("W2-a.txt") && !head.contains("W1-a.txt"), "{head}");
+    } else {
+      // Or the kill came before it began, or after it was done, and what followed went on from there.
+      assert!(
+        said.contains("no catching-up to undo")
+          || said.contains("`git rebase` is not supported")
+          || said.contains("since it last caught up"),
+        "{said}"
+      );
+    }
+  }
+  // A staged path the ref did not touch, and more staged at the stop: the undo, killed and run
+  // again, gives back the index of before the pull.
+  for round in 0..12u32 {
+    let undo = undos[round as usize % 2];
+    let (_, run) = two_writers(&format!("third-pass-killed-undo-index-{round}"));
+    assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+    assert_eq!(
+      run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a && echo STAGED >> b.txt && $NV git add b.txt && echo UNSTAGED >> b.txt").0,
+      0
+    );
+    let before = run("w2", "$NV git status --porcelain && $NV git diff --cached").1;
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 1);
+    assert_eq!(
+      run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt && $NV git add a.txt && echo MORE >> b.txt && $NV git add b.txt && echo n > n.txt && $NV git add n.txt").0,
+      0
+    );
+    run("w2", &killed(undo, 1 + round % 9));
+    let (code, said) = run("w2", &format!("$NV {undo}"));
+    let after = run("w2", "$NV git status --porcelain && $NV git diff --cached").1;
+    // Refused only as an undo already done is refused (a second one would go back past it).
+    assert!(
+      code == 0
+        || said.contains("no catching-up to undo")
+        || said.contains("`git rebase` is not supported")
+        || said.contains("since it last caught up"),
+      "{undo} killed at {} ms, run again: {said}",
+      1 + round % 9
+    );
+    assert_eq!(after, before, "{undo} killed at {} ms, run again: {said}", 1 + round % 9);
+  }
+}
+
+/// What the thirteenth round's third pass found of drivers: one is stopped with nv, however nv is
+/// stopped.
+#[test]
+fn a_driver_is_stopped_when_nv_is() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  for signal in ["TERM", "INT", "HUP"] {
+    let (root, run) = two_writers(&format!("third-pass-driver-{signal}"));
+    assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(
+      run(
+        "w2",
+        "sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver 'sleep 2; echo LATE > b.txt; cat %B > %A'"
+      )
+      .0,
+      0
+    );
+    let (code, said) = run("w2", &format!("timeout -s {signal} 1 $NV sync ."));
+    assert_ne!(code, 0, "{said}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n", "stopped by SIG{signal}");
+  }
+  // A Ctrl-C goes to nv's process group, and not to the driver's: the driver is stopped all the same.
+  let (root, run) = two_writers("third-pass-driver-ctrl-c");
+  assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+  assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(
+    run(
+      "w2",
+      "sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver 'sleep 2; echo LATE > b.txt; cat %B > %A'"
+    )
+    .0,
+    0
+  );
+  run("w2", "setsid sh -c 'echo $$ > ../pg; exec $NV sync . >/dev/null 2>&1' & sleep 1; kill -INT -$(cat ../pg); true");
+  std::thread::sleep(std::time::Duration::from_secs(3));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n", "Ctrl-C");
+}
+
+/// What the thirteenth round's fourth pass found with several writers: an edit made between a
+/// killed undo and the undo run again is kept, and the state named as kept has it.
+#[test]
+fn what_a_fourth_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let files = "a.txt b.txt c.txt d.txt e.txt g.txt";
+  let mut noted = 0;
+  for round in 0..24u32 {
+    let (root, run) = two_writers(&format!("fourth-pass-edit-after-kill-{round}"));
+    assert_eq!(
+      run(
+        "w1",
+        &format!("for f in c d e g; do echo base > $f.txt; done && $NV git add {files} && $NV git commit -qm files && $NV git push -q")
+      )
+      .0,
+      0
+    );
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", &format!("for f in {files}; do echo W1-$f >> $f; done && $NV git commit -qam w1 && $NV git push -q")).0, 0);
+    assert_eq!(run("w2", &format!("for f in {files}; do echo W2-$f >> $f; done && $NV git commit -qam w2")).0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase >/dev/null").0, 1);
+    assert_eq!(run("w2", &format!("sed -i '/^[<=>]\\{{7\\}}/d' {files} && $NV git add {files}")).0, 0);
+    let pause = 2 + round % 7;
+    run(
+      "w2",
+      &format!(
+        "$NV git rebase --abort >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true"
+      ),
+    );
+    if !root.join("w2/.nv/undoing").exists() {
+      continue;
+    }
+    noted += 1;
+    run("w2", "echo EDITED-AFTER-THE-KILL >> a.txt");
+    let (code, said) = run("w2", "$NV git rebase --abort");
+    assert_eq!(code, 0, "{said}");
+    let kept = said.split("kept as ").nth(1).map(|t| t.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap().to_string());
+    let kept = kept.unwrap_or_else(|| panic!("an edit written over, and nothing named as kept: {said}"));
+    let (code, out) = run("w2", &format!("$NV checkout .nv/store {kept} ../kept >/dev/null && cat ../kept/a.txt"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("EDITED-AFTER-THE-KILL"), "the state named as kept lacks the edit: {out}");
+  }
+  eprintln!("{noted} of 24 kills left an undo cut short");
 }

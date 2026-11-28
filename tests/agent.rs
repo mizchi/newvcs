@@ -441,7 +441,16 @@ fn a_command_given_wrongly_says_what_was_wrong_and_does_nothing() {
   assert_eq!(ok(&dir, "$NV log . | grep -c snapshot || true"), "0", "none of those recorded anything");
   // Help and version are answers, not errors.
   assert!(ok(&dir, "$NV --version").starts_with("nv "));
-  assert!(ok(&dir, "$NV help").contains("nv snapshot <dir>") && ok(&dir, "$NV --help").contains("nv commit <dir>"));
+  // `nv help` is what a writer reads first, and every turn after carries it: the everyday
+  // commands, in a few lines, and where the rest is (`eval/agent-bench`: 8 KB, read by every
+  // writer, was most of what nv's writers read beyond Git's).
+  let short = ok(&dir, "$NV help");
+  assert!(short.len() < 2000, "{} bytes", short.len());
+  for command in ["nv commit <dir>", "nv push <dir>", "nv sync <dir>", "nv pending <dir>", "nv restore <dir>", "nv help all"] {
+    assert!(short.contains(command), "{command}: {short}");
+  }
+  assert_eq!(ok(&dir, "$NV --help"), short);
+  assert!(ok(&dir, "$NV help all").contains("nv snapshot <dir> [--recorded | --tracked]"));
   assert_eq!(ok(&dir, "$NV snapshot --help | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
   assert_eq!(ok(&dir, "$NV help snapshot | head -1"), "nv snapshot <dir> [--recorded | --tracked]");
   // States counted back reach behind the first one recorded here, to the commit the work began on.
@@ -1287,6 +1296,10 @@ fn a_watched_writer_gets_a_commit_for_each_state_that_passes() {
   let waited = ok(&dir, "$NV pending . --wait");
   assert!(waited.contains("did not pass (unit did not)"), "{waited}");
   assert_eq!(waited.matches("checkpoint: unit passed").count(), 1, "{waited}");
+  // The runners it started are gone once they are done, not left for it to reap when it stops:
+  // a watcher left running for days would fill the process table with them.
+  std::thread::sleep(std::time::Duration::from_millis(500));
+  assert_eq!(ok(&dir, "ps -axo ppid=,stat= | awk -v w=$(cat .nv/watch.pid) '$1 == w && $2 ~ /Z/' | wc -l | tr -d ' '"), "0");
   ok(&dir, "$NV watch . --stop >/dev/null");
 }
 
@@ -1360,6 +1373,34 @@ fn a_note_names_the_next_commit_the_conditions_pass_on() {
   assert_eq!(ok(&dir, "$NV git show --name-only --format= HEAD"), "three");
   // A note is a line that says something.
   assert_ne!(code_of(&dir, "$NV note . '  ' 2>&1").0, 0);
+}
+
+/// A supervisor's line to a writer that runs no version control (`nv tell`): it reaches the writer
+/// the next time anything of nv's speaks to it there, once: `nv inbox`, `nv note`, or the hook
+/// behind each of a Claude Code session's tool calls.
+#[test]
+fn a_line_told_to_a_writer_reaches_it_once() {
+  let dir = workspace("inbox");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  ok(&dir, "$NV tell . 'Leave README.md to me' && $NV tell . 'wrap goes first'");
+  assert_eq!(ok(&dir, "$NV inbox ."), "told: Leave README.md to me\ntold: wrap goes first");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  // A note says what it did, and then what was told.
+  ok(&dir, "$NV tell . 'Stop after this step'");
+  let said = ok(&dir, "echo 2 > two && $NV note . 'Add two'");
+  assert!(said.ends_with("told: Stop after this step"), "{said}");
+  assert!(!ok(&dir, "$NV note . 'Add two again'").contains("told:"));
+  // The hook hands it to the session as context for its next turn.
+  ok(&dir, "$NV tell . 'Run the tests'");
+  let event = format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"cwd":"{}"}}"#, dir.display());
+  let said = ok(&dir, &format!("printf '%s' '{event}' | $NV hook claude"));
+  let answer: serde_json::Value = serde_json::from_str(&said).unwrap_or_else(|e| panic!("{e}: {said}"));
+  assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+  assert!(answer["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Run the tests"), "{said}");
+  assert_eq!(ok(&dir, "$NV inbox ."), "nothing has been told here");
+  // A line is one line that says something.
+  assert_ne!(code_of(&dir, "$NV tell . ' '").0, 0);
+  assert_ne!(code_of(&dir, "$NV tell . \"two\nlines\"").0, 0);
 }
 
 /// Every note a writer gives reaches a commit (twelfth round: 110 of 184 did not). A note waits

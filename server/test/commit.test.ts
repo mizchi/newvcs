@@ -29,7 +29,7 @@ test("a commit survives encoding, and damaged bytes are refused", () => {
 test("a commit that sets a file and something below it, or spells a change two ways, is refused", () => {
   // Twelfth round: `l` a link and `l/x` a file in one commit were taken and served.
   const set = (path: string, mode: number) => ({ path: text(path), entry: { mode, id: new Uint8Array(32).fill(1) } });
-  const commit = (changes: Commit["changes"]): Commit => ({ parents: [], rest: text("r"), changes });
+  const commit = (changes: Commit["changes"]): Commit => ({ parents: [], rest: text("author a <a@example.com> 1 +0000\ncommitter a <a@example.com> 1 +0000\n\nm\n"), changes });
   for (const [first, mode] of [["l", 0o120000], ["a", 0o100644], ["s", 0o160000]] as const) {
     assert.throws(() => decode(encode(commit([set(first, mode), set(`${first}/x`, 0o100644)]))), /below/);
   }

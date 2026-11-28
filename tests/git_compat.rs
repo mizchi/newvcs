@@ -67,3 +67,101 @@ fn fsck_finds_an_object_that_is_not_what_its_name_says() {
   std::fs::write(&segment, &original).unwrap();
   assert!(git(&["fsck"]).status.success());
 }
+
+/// A tag of the name of a branch only origin has: Git checks the tag out with no branch, which nv
+/// does not do, and `switch` says a branch is expected (fourth pass: nv made the branch).
+#[test]
+fn a_tag_named_like_a_branch_of_origins_is_not_that_branch() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tag-like-origin");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  let setup = "git init -q --bare -b main o.git && git clone -q o.git s 2>/dev/null && cd s && echo a > a.txt && git add a.txt && git commit -qm a \
+    && git push -q origin main 2>/dev/null && git checkout -q -b dev && echo d > d.txt && git add d.txt && git commit -qm d && git push -q origin dev 2>/dev/null \
+    && cd .. && $NV git clone -q o.git w && cd w && $NV git tag dev main";
+  assert!(sh(setup).status.success());
+  let checkout = sh("cd w && $NV git checkout -q dev");
+  assert_eq!(checkout.status.code(), Some(125), "{checkout:?}");
+  let switch = sh("cd w && $NV git switch -q dev");
+  assert_eq!(switch.status.code(), Some(128), "{switch:?}");
+  assert!(String::from_utf8_lossy(&switch.stderr).contains("a branch is expected, got tag 'dev'"), "{switch:?}");
+  let after = sh("cd w && $NV git branch --show-current && $NV git branch && ls");
+  assert_eq!(String::from_utf8_lossy(&after.stdout), "main\n* main\na.txt\n");
+}
+
+/// A `commit -a` refused for a date nv does not read stages nothing, as one Git refuses does not
+/// (fifth pass: the files were left staged, and the next commit of others published them).
+#[test]
+fn a_refused_commit_stages_nothing() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("refused-commit-a");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  assert!(sh("$NV git init -q -b main && echo a > a.txt && $NV git add a.txt && $NV git commit -qm a && echo b >> a.txt").status.success());
+  let refused = sh("GIT_AUTHOR_DATE='Tue, 14 Nov 2023 22:13:20 +0100' $NV git commit -qam b");
+  assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+  assert_eq!(String::from_utf8_lossy(&sh("$NV git status --short").stdout), " M a.txt\n");
+}
+
+/// A file of the tree is made where no file of the tree can be, and put in place whole: a name as
+/// long as a file system takes is written, and a checkout killed part-way leaves nothing in the
+/// tree to be committed (sixth pass: a name beside the file was too long, and was left behind).
+#[test]
+fn a_file_is_made_out_of_the_tree_and_put_in_place() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("made-out-of-the-tree");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  let long = "n".repeat(255);
+  let made = sh(&format!(
+    "$NV git init -q -b main && echo a > {long} && for k in $(seq 1 30); do head -c 400000 /dev/zero | tr '\\0' a > big$k; done && $NV git add -A && $NV git commit -qm a && $NV git branch o \
+     && echo b > {long} && for k in $(seq 1 30); do head -c 400000 /dev/zero | tr '\\0' b > big$k; done && $NV git commit -qam b && $NV git checkout -q o && cat {long} && $NV git checkout -q main && cat {long}"
+  ));
+  assert!(made.status.success(), "{made:?}");
+  assert_eq!(String::from_utf8_lossy(&made.stdout), "a\nb\n");
+  for round in 0..20 {
+    sh(&format!(
+      "$NV git checkout -q o >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true",
+      2 + round * 3
+    ));
+    let left = sh("ls -a | grep -v '^\\.nv$' | grep '^\\.' | grep -v '^\\.\\.\\?$'; true");
+    assert_eq!(String::from_utf8_lossy(&left.stdout), "", "a killed checkout left this in the tree");
+    sh("$NV git reset -q --hard >/dev/null 2>&1; $NV git checkout -q main >/dev/null 2>&1; $NV git reset -q --hard >/dev/null 2>&1");
+  }
+}

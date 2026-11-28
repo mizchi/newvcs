@@ -9,7 +9,6 @@ revert HEAD
 stash
 blame a.txt
 clean -fd
-remote -v
 submodule status
 worktree list
 bisect start
@@ -33,7 +32,6 @@ hash-object a.txt
 bundle create x HEAD
 
 # Commands that are spoken, with an option that is not.
-status --branch
 status -uno
 diff -w
 diff --numstat
@@ -47,6 +45,8 @@ log --author=someone
 commit --fixup HEAD
 commit -S -m signed
 commit --no-verify -m skip
+commit -qS -m signed, a letter not spoken in a cluster
+remote add other /nowhere
 add -p
 add -u
 add -f a.txt
@@ -81,7 +81,6 @@ fsck --lost-found
 
 # Options that are spoken, with arguments that are not.
 checkout HEAD~1
-commit -m one -m two
 config core.editor vim
 log main side
 
@@ -89,3 +88,18 @@ log main side
 show HEAD -- '*.txt'
 diff HEAD~1 HEAD -- ':(exclude)a.txt'
 show HEAD -- :/a.txt
+# The thirteenth round: revisions nv does not look for, refused where Git's error said they were nothing.
+diff HEAD@{0}
+diff HEAD^@
+diff :/one
+show HEAD^!
+diff HEAD^0
+rev-parse origin
+log -1 refs/remotes/origin/HEAD
+# The second pass: a tree where a commit is meant is refused, not read as a damaged commit.
+show -s HEAD^{tree}
+diff HEAD^{tree}
+log -1 HEAD^{tree}
+merge origin
+merge FETCH_HEAD
+merge ORIG_HEAD

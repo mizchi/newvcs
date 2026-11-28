@@ -1,0 +1,71 @@
+{
+ "name": "clash-in-one-step",
+ "seed": {
+  "README.md": "# kit\n\n## Functions\n\n- (none yet)\n\n## Notes\n\nNothing yet.\n",
+  "kit/__init__.py": "__all__ = [\n]\n",
+  ".gitattributes": "kit/__init__.py merge=union\n"
+ },
+ "settle": "both",
+ "writers": [
+  {
+   "name": "ann",
+   "steps": [
+    {
+     "note": "List slugify",
+     "edits": [
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- slugify(text)\n"
+       ]
+      },
+      {
+       "file": "kit/slug.py",
+       "write": "def slugify(t):\n    return t\n"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "steps": [
+    {
+     "note": "Add wrap",
+     "edits": [
+      {
+       "file": "kit/wrap.py",
+       "write": "def wrap(t, w):\n    return [t]\n"
+      },
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- wrap(text, width)\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Test wrap",
+     "edits": [
+      {
+       "file": "tests/test_wrap.py",
+       "write": "import kit.wrap\n\nassert kit.wrap.wrap('a', 1) == ['a']\n"
+      }
+     ]
+    },
+    {
+     "note": "Explain wrap",
+     "edits": [
+      {
+       "file": "docs/wrap.md",
+       "write": "# wrap\n\nGreedy.\n"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

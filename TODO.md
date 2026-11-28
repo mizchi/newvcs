@@ -1,5 +1,116 @@
 # TODO
 
+## From the thirteenth round
+
+Found by the thirteenth round of independent review and not fixed yet (the rest is fixed and
+listed in the README under "The thirteenth round"). The reproductions are scripts against the
+binary; each item gets a failing test or Git case before its fix.
+
+### Differs from Git (`nv git`)
+
+- [ ] A failed `merge` (exit 2 both sides) where a file was staged as new and then deleted: Git
+  writes it back from the index, nv leaves it deleted.
+- [ ] `pull --no-rebase` conflict markers end `>>>>>>> origin/main` where Git writes the fetched
+  commit's id.
+- [ ] A `pull` refused for a conflict that is not between lines has already fetched (Git fetches
+  too, but the refusal should change nothing).
+- [ ] `show dev` where `dev` is a tracked file and a branch: Git refuses it as ambiguous.
+- [ ] A branch deleted and made again (`branch -D main; switch -c main`) still follows origin.
+- [ ] Output: `switch -c`/`checkout -b` print `M`/`D` lines Git does not; `status` inside an
+  untracked directory prints an empty name for `./`; `commit` with nothing to commit from a
+  subdirectory names paths from the top and adds `git pull`'s hint on a diverged branch; `rm a a`
+  says `rm 'a'` twice; `add` with no paths writes to stdout.
+- [ ] Exit codes where several things are wrong at once: an empty message with nothing to
+  commit, `--diff-filter=Z` with paths and no `--`, `rev-parse nosuch^{tree}`, `pull` printing
+  "Updating" before its error, `merge --ff-only` of a diverged branch over edits, `add` of a
+  staged file under a newly ignored directory.
+- [ ] "Auto-merging" and "CONFLICT" lines C-quote paths Git prints as they are.
+- [ ] A killed merge driver: `nv git merge` exits 128 where Git exits 2.
+- [ ] Speed, on 5,000 files and 43 commits: a full `log` 16 times Git's, `ls-tree -r` 8 times, a
+  diff of two revisions and `show --stat` 4 times, `fsck` 3.6 times, `switch` and `reset --hard`
+  twice.
+
+### Merge drivers
+
+- [ ] Where Git defines a driver or an attribute that nv does not read: `include.path` in the
+  user's configuration, `GIT_CONFIG_COUNT`/`KEY`/`VALUE`, `~/.config/git/attributes`, and beside
+  Git, `.git/info/attributes`.
+- [ ] Macros are read for `merge` only: `text`, `eol` and `binary` by way of a macro are not.
+- [ ] A driver that replaces `%A` with a link is read through (as Git does).
+- [ ] `merge_cst.py`: a unit one side moved to another section and the other changed (8 of 1,600
+  random merges).
+
+### From the second pass
+
+- [ ] `conflict-marker-size` is not read: a driver is given `%L` 7, and nv writes markers of 7.
+- [ ] A file whose text holds an example of a sync's markers at the start of lines (documentation)
+  can be committed with `nv git commit` and never pushed.
+- [ ] A `git pull --rebase` that clashes only with an edit not committed speaks nv's verbs, and
+  `rebase --continue` there is not spoken (Git refuses the pull over unstaged changes).
+- [ ] Seen once, not made again: `rev-parse origin/main` answered "blob is not in the store" after
+  three pushes at once.
+- [ ] The empty tree by its id, or as the tree of a commit of no files, in `rev-parse`, `ls-tree`,
+  `show` and `diff` (only `cat-file` knows it).
+- [ ] `checkout <b>` where `b`
+  is origin's branch and also a path (Git refuses it as ambiguous); `reset <b> <path>` where `b`
+  is a branch and a file; `merge -m` that fast-forwards does not say the message was ignored; a
+  branch made from another of origin's branches (`-b x origin/y`) follows nothing.
+- [ ] `NV_*` limits given a value that is not a number are taken as not given.
+
+### From the third pass
+
+- [ ] `merge_cst.py` can run a comment into the statement before it (`print(x)# comment`): the
+  read-back takes it, as the comment is still a unit of its own (1 of 2,800 random merges).
+- [ ] Seen in a random tester, not made again: `git log HEAD` answered "blob is not in the store"
+  right after a `git pull --rebase` that went through, in a workspace with no fork; and after a
+  pull that finished a killed one, `origin/main` stayed on an older tip (5 times in 4 runs).
+- [ ] `git pull --rebase` with a new file staged went ahead once after a push whose answer was
+  lost (nothing was written).
+- [ ] The state that keeps what a push's catching-up unstaged is refused by `nv restore <id>`
+  ("from before this workspace last caught up"); only `nv checkout` gets it back, and nothing
+  says so.
+- [ ] Several pushes at once, each within the union bound, to different repositories, hold an
+  unrelated repository's reads for 2–2.7 s on the local runtime (5 at once).
+- [ ] A header with two spaces before the date is refused where Git 2.43 takes it (Git never
+  writes one); 8 union merges in 1,100 random cases are refused where Git merges by union.
+- [ ] `merge origin` and other revisions nv does not look for are refused naming `rev-parse`.
+
+### From the fourth pass
+
+- [ ] `switch` and `checkout` against what the index holds: where the index already has what the
+  target has (`-AAA`, `-ABA`, `AA-B`, `AB-B`, `ABBB`, `ABCB`, as HEAD/index/disk/target), nv refuses
+  where Git switches; with a file staged as the target has it and the disk as HEAD (`ABAB`), nv
+  writes the target's over the disk where Git keeps it; a file deleted on disk that HEAD and the
+  target have (`-A-A`) is written back.
+- [ ] `git branch <new>` on a branch whose name is also a tag's: Git fails ("ambiguous object
+  name"), nv makes the branch. `diff` of an ambiguous name warns three times; a ref whose name is
+  the start of an object's id is taken without Git's warning.
+- [ ] While an undo cut short waits to be finished, `git status` says nothing of it.
+- [ ] Seen once, not made again (seed 316): `.nv/settling` named files as held out of the commit
+  that already were as HEAD has them, and nothing could complete or undo the stop.
+- [ ] A push of the workspace's own commit unstages a file staged after that commit, saying the
+  ref changed it (the staged copy is kept, and named).
+- [ ] An undo after a kill that was itself killed after it was done, and before it said so: the
+  state it kept is named nowhere but in `nv log`.
+- [ ] A file being written when a command is killed is left under `.nv/writing`, and nothing
+  removes it; in a checkout to a new directory, killed before its `.nv` exists, it is left as
+  `.nv-<pid>-<n>` beside the file.
+- [ ] A list item whose whole text is one of the placeholder words (`- None` in a list of states,
+  `- todo` as a column) is taken for a placeholder, and both sides' edits of it are kept.
+- [ ] `show` of a tag with an empty message prints a blank line Git does not.
+- [ ] `merge -m ''` of a branch that is only ahead is refused (Git moves the files and not the
+  branch).
+- [ ] Once, a sync stopped by SIGHUP exited 2 rather than by the signal (nothing outlived it).
+
+### Server
+
+- [ ] On a ref whose first commit has no parent, the rules a union push states at its base are
+  believed though the ref's history shows there were none.
+- [ ] Ref names Git cannot hold (`a/`, `/a`, `a//b`, `.a`, `a..b`, `main.lock`, `-x`) are taken,
+  and `x/` is `x`, `p//q` is `p/q`.
+- [ ] Two union merges Git would make that the server refuses: a macro on a line that ends in
+  CRLF, and `[attr]` defined again in a subdirectory.
+
 ## From the twelfth round
 
 Found by the twelfth round of independent review and not fixed yet (the rest of what it found is
@@ -149,3 +260,9 @@ Nothing known: case 33 covers what was found, and everything listed before is fi
   look waits for the next write. Conditions run in the workspace, not a copy.
 - [ ] Share checkpoints with other workspaces, and run one's own conditions on another writer's
   checkpoint merged in, to take it in early.
+
+## Found by the agent bench
+
+- A sync whose own commit changed nothing but files left with both versions drops that commit,
+  message and all: settled, the files are a commit of their own, under a message the writer has
+  to give again (`a_sync_merges_by_the_driver_the_attributes_name`, Bob's "Bob hard").

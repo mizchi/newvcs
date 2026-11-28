@@ -36,6 +36,12 @@ impl Entry {
 /// `..`, not from the root), is nobody's own directory (`.git`, `.nv`, in
 /// any case of letters), has no NUL in it, and has no part longer than a
 /// file system will take. These are Git's rules for a tree, and one more.
+/// Whether a link's content is somewhere a file system can make a link lead (`linkOk` on the
+/// server): not nothing, no NUL, and no longer than a path may be.
+pub fn link_ok(target: &[u8]) -> bool {
+  !target.is_empty() && target.len() <= MAX_PATH && !target.contains(&0)
+}
+
 pub fn path_ok(path: &[u8]) -> bool {
   !path.is_empty() && path.len() <= MAX_PATH && path.split(|&b| b == b'/').all(name_ok)
 }

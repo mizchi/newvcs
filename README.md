@@ -56,6 +56,7 @@ nv log <dir>                               the workspace's operations
 nv remote <dir> <url-of-repository> <ref>  point the workspace at a server: http://host/<owner>/<repo>
 nv push <dir>                              send the commits the ref has not seen, then catch up
 nv sync <dir>                              bring the workspace to the ref's tip, its own work merged on top
+nv fetch <dir> [--quiet]                   bring the ref's commits into the store; no file changes
 nv export <dir> <git-repo> <ref>           write the workspace's commit into a Git repository
 
 nv name <store> /<owner>/<repo> <rev>      name a repository in the store
@@ -64,8 +65,11 @@ nv links <dir> [--update]                  how each link stands; follow the ones
 nv unlink <dir> <path>                     stop following one
 
 nv check <dir>                             how the workspace stands with Git and with its watcher
-nv git <command>                           Git's command line (see below)
-nv help [command], nv --version
+nv git <command>                           Git's command line (see below); toward the ref a
+                                           workspace pushes to, `push` is nv push,
+                                           `fetch` nv fetch, `pull --rebase` nv sync, and where it stopped
+                                           `rebase --continue` and `--abort` finish or undo it
+nv help [command | all], nv --version     the everyday commands; one command; all of them
 ```
 
 A state is a name given with `nv mark`, `base` (the last commit), `pushed`
@@ -94,21 +98,25 @@ against nv.
 
 What is spoken is one table in `src/gitcli.rs`, each command with the
 options it takes (`nv git --spoken` prints it). An invocation is checked
-against the table before any of it runs:
+against the table before any of it runs; short options run together
+(`-qa`, `-qaF <file>`, `-m<text>`) are taken apart first, as Git's parser
+takes them, and a cluster with a letter the table does not have is
+refused as it was written:
 
 | Command | Options |
 | --- | --- |
 | `init` | `-q` `-b <branch>` |
+| `remote` | the list, `-v`, `get-url origin`: the server `nv remote` set, or the Git repository it was cloned from |
 | `clone`, `fetch`, `pull`, `push` | `-q`; `pull --ff-only`, `--no-rebase`; `push` of the branch one is on, to the branch of its name on `origin`. A Git repository on this machine only |
 | `add` | `-A`, paths |
 | `rm`, `mv` | `rm -r -q -f --cached` (the file stays on disk, where Git then does not track it) |
 | `restore` | `--staged`, paths |
 | `reset` | `--soft` `--mixed` `--hard` `-q`, a revision or paths |
-| `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
-| `status` | the long form, `--porcelain`, `--short` |
+| `commit` | `-m` (more than once, a paragraph each) `-F <file>` (`-` for standard input) `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
+| `status` | the long form, `--porcelain`, `--short`, `-b` (`-sb`) |
 | `log` | `--oneline` `--format=` `--pretty=format:` `--pretty=tformat:` `-n`, a revision; the default format. Placeholders: `%H %h %T %t %P %p %s %b %B %an %ae %at %cn %ce %ct %n %%` |
 | `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>`; a commit kept to paths after `--` |
-| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--` |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`, `--diff-filter=`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--`, or named without it where Git would take them for paths |
 | `rev-parse` | a revision, `<rev>^{tree}`, `<rev>:<path>`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
 | `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags, by revision or `<rev>:<path>` |
 | `ls-tree` | `-r` `--name-only`, a revision or `<rev>:<path>`, one path (`dir/` lists what is in it) |
@@ -298,6 +306,22 @@ all of Git has it by keeping Git in the directory.
   `eol`, `-text`, `binary`), and for `merge=union`, which `git merge` and
   `nv sync` both honour: where both sides changed the same lines of such a
   path, both sides' lines are kept, ours first, and the path is merged.
+  `merge=<name>` is merged by the command `merge.<name>.driver` gives, as
+  in Git (`%O %A %B %L %P %S %X %Y`, the result left in `%A`, exit 0 where
+  it is clean), wherever the workspace's configuration (`nv git config
+  merge.<name>.driver <command>`) or Git's defines it, never the
+  repository's files; a name nobody defined is the text merge. `nv sync`
+  runs a driver as `git merge` does, but there is no index to hold a path
+  unmerged, and a file is unsettled for as long as it holds markers: a
+  driver that says it could not merge and leaves no `<<<<<<< yours` line
+  is not believed to have left something to settle by, and the file is
+  merged as text instead. The server runs no driver: a push that the ref
+  clashes with on such a path is refused, and the sync runs it.
+  `tools/merge-cst` is one such driver, optional and outside nv: it merges
+  Python and Markdown by their syntax trees (tree-sitter), unit by unit
+  (top-level statements, sections, list items), and merges as text, with
+  markers, whatever it cannot decide. It assumes what it merged is tested
+  afterwards, as the conditions behind writes test what a sync made.
   Line endings are read as Git does with `core.autocrlf` unset on a
   system whose line ending is LF. Filters, `ident` and
   `working-tree-encoding` are not applied. A file under `text=auto` that
@@ -590,6 +614,54 @@ again before anyone else sees them:
   the change as it now lands, and pushes again; where catching up leaves
   a file with both versions, it stops with exit 1 and says so, and the
   note of a commit the files held is kept for when they are settled.
+
+A file a sync left with both versions is held out of the commit of the
+workspace's own that changed it, and its settling completes that commit:
+committed by the runner behind writes, or by `nv commit <dir>` given no
+message, which keeps the message of the commit it completes, as
+`git rebase --continue` does, and puts those after it on top again.
+Given a message, `nv commit` makes the settling a commit of its own, and
+the commits below it are on the ref without it.
+
+`nv fetch <dir>` (and `nv git fetch` toward the ref) brings the ref's
+commits since the workspace last looked into the store, with the
+contents of the files they changed that are in view, and writes no file:
+what the workspace stands on stays where it was, and only `nv sync` moves
+it. In `nv git`, `origin/<ref>` (and `origin`) is the ref's tip as the
+workspace last saw it, from a sync, a push or a fetch, whichever came
+furthest along the ref; `log`, `show`, `diff` and `status` compare with
+it, as Git's do after `git fetch`. `git rebase origin/<ref>` is not
+spoken: nv puts work on the ref's tip as it is now (`pull --rebase`), not
+on a tip fetched earlier.
+
+A `git pull --rebase` that left files with both versions says what comes
+next in Git's verbs: `git add` them and `git rebase --continue`, or
+`git commit -m <message>`, which completes the commit the settling goes
+into under that message, wherever it is among the commits not pushed, as
+Git's `commit` at a rebase stopped at that commit does. Either commits
+what was added, as Git's index has it: the settled files and whatever
+else was added, not files that are only on disk. Until that commit is
+made, no sync or push goes ahead, whether the markers are still in the
+files or were edited out and not committed (`git rebase --abort`, which is
+`nv restore <dir> before-sync`, undoes the pull, its staging included).
+Anything staged with `git add` before a `git pull --rebase` makes it
+refuse, as Git's does; `nv sync` refuses only where the ref changed a
+staged path, whose staged copy would not have what the ref brings, and a
+push that landed and caught up unstages such a path and says so.
+
+A file a sync left with both versions is settled by whoever settles it,
+and the commit that holds the settling says so, as a Git trailer: which
+file, and the commits of others' it was settled against, as
+`Settled: README.md with 1a2b3c4 (Add a)`. Remade by `nv rebuild` or
+`nv publish`, a commit keeps the trailers of those it is made of. Nothing
+else in a history says that two writers' work met there, and a reader of
+it could not tell (`eval/commit-agents`, "Readers").
+
+A writer that runs no version control can still be told things by
+whoever supervises it: `nv tell <dir> <line>` leaves a line in that
+workspace, which the writer is given once, the next time nv speaks to it
+there (`nv inbox <dir>`, the answer to `nv note`, or the hook behind a
+Claude Code session's tool calls, as context for its next turn).
 
 A commit's message is written of what was there when it was made. When a
 sync or a push puts it on top of other writers' commits that change the
@@ -962,7 +1034,13 @@ before:
   directory moving above or below the path, and a ref that began before
   the server indexed every change to every path (one row per path a commit
   changes, beside the row it had). A merged push writes the bucket twice:
-  the contents it brought, then the merged ones.
+  the contents it brought, then the merged ones. A file over 256 KiB is
+  not merged here: the push is refused and its writer's sync merges it, so
+  that no push holds the server for longer than a moment. Where pushes
+  arrive at once, a merge made on a tip that moved is made again, up to
+  sixteen times. Macros of `.gitattributes` (`[attr]m merge=union`) are
+  read as Git reads them, here and in a sync: set, a macro says what its
+  attributes say; defined anywhere but the top file, it is not one.
 - **What a workspace pushed is its own work, not a change of someone
   else's.** A file committed, edited again and then pushed stays as
   edited, the edit an unpublished change on the commit; a file committed
@@ -1067,7 +1145,7 @@ its own (14,716 contents, 1.1 s) and then linked into another:
 | --- | ---: |
 | `nv link` of the 14,716 files, most of it writing them | 2.8 s |
 | Stored by the link, and by publishing it | 464 + 530 bytes |
-| `nv push` of the link | 833 ms |
+| `nv push` of the link | 833 ms (measured before the server walked a directory set whole for its links as well, in the thirteenth round's fourth pass) |
 | File contents sent in that push | 1 (`nv.links`) |
 | Contents the other repository's table was asked for and gave | 13,693 |
 | `nv sync` into a store that had never seen oxc | 3.8 s, 14,717 files |
@@ -1895,6 +1973,263 @@ status` took 1.3 to 1.75 times `git status`, where on oxc it is ahead, and
 a history with one commit of 20,000 files makes every full `nv git log`
 take 33 ms against Git's 2.1.
 
+**The thirteenth round** was given the build that added Git's verbs toward
+a server's ref (`fetch`, `pull --rebase`, `rebase --continue`), commits put
+on the tip one by one and settled into the writer's own commit, merge
+drivers and `tools/merge-cst`. Four reviewers: one with the server's
+address alone (about 20,000 requests); three writing random testers with
+an oracle of their own: three to six writers on one ref through `nv git`,
+with kills and answers dropped after the server acted (3,340 steps, 108
+kills, 133 answers lost); `nv git` against real Git in a twin directory
+(17,686 steps); and drivers, against Git merging the same histories and
+against properties `merge_cst.py` must keep (4,720 twin merges, 571
+syncs, 3,200 random merges of its own). What they found, each fixed with
+a test or a Git case that failed first, most severe first:
+
+- **A file staged before `git pull --rebase` kept its staged copy through
+  the pull, and the next commit took the other writer's line back out of
+  the ref.** The pull is refused as Git refuses it; `nv sync` refuses
+  where the ref changed a staged path. At a pull that stopped, a file
+  settled and added but not committed let a second pull or a push go
+  through, dropping the writer's commit or landing it without its change;
+  undoing the pull kept what was added during it staged, and a plain commit
+  then committed the other writer's line as this writer's change. Nothing
+  moves now until the commit is completed or the pull undone, and undoing
+  it gives back the index as it was.
+- **A commit's header was taken as any bytes.** A `parent` line there gave
+  every client's Git history a parent the ref did not have (a merge on a
+  ref of one line, or a parent nobody had), and an empty one made the ref
+  impossible to export. Both sides hold it to an author line first and no
+  `tree`, `parent` or NUL in the header.
+- **A link to 5,000 bytes, to a NUL or to nothing, was taken**, and no
+  client could sync the ref, or push the fix, again. **An empty file
+  could not be fetched by itself**, so a sync of a ref holding one failed
+  for everyone.
+- **`merge_cst.py` called merges clean that were not.** A unit put after
+  one with no line end of its own ran into it (`# note` and `b = 2` became
+  one comment); a list one side removed went with the items the other put
+  in it. A clean result now has to read back as the units merged. Of the
+  reviewer's 1,600 random merges, 128 broke a property before and 8 do now,
+  all of them a unit moved between sections; 16,000 units put in at one
+  place take 0.3 s where they took 16.
+- **`.gitattributes` macros were not read**, so the server merged by union
+  a path Git gives a driver. **The server's union merge had no bound**: one
+  push of 200,000 reordered lines held it for seconds and the watchdog
+  restarted it; and a dozen union pushes at once had half refused.
+- **A merge driver that never returned went on after `NV_TIMEOUT` stopped
+  the sync**, and wrote into the workspace without its lock. One killed by
+  a signal had its half-written result taken as the conflict; one that
+  exited 0 and left markers had them committed. A file name with a newline
+  broke the notes of what a sync left unsettled, and a push went through
+  with the markers on disk.
+- **`git fetch` left `log origin/<ref>` unable to name the commits it
+  brought**, and after a push never heard back left origin behind the tip.
+  `nv restore` over an edit a push had recorded did not say where it was
+  kept. A union push sent again was not told what was merged; `after` took
+  `0x1` and an empty value.
+- **`nv git` beside Git**: `merge origin/dev` made another commit than Git
+  ("Merge remote-tracking branch"); annotated tags with a blank message or
+  runs of empty lines were other objects; `pull` on a branch that follows
+  nothing merged anyway; `checkout <branch>` of a branch only origin has
+  was taken for a path; the empty tree was unknown; and revisions nv does
+  not look for (`HEAD@{0}`, `HEAD^@`, `:/text`, `origin`) were answered with
+  Git's error for a name that is nothing, not refused (case 48).
+
+Not fixed, and in `TODO.md`: the rest of what the Git reviewer found of
+output and exit codes, a failed `merge` that leaves a staged file deleted
+where Git writes it back, places Git defines a driver that nv does not read
+(`include.path`, `GIT_CONFIG_COUNT`, `~/.config/git/attributes`), a ref
+whose first commit has no rules taking the rules a union push states, ref
+names Git cannot hold, and the reviewer's timings: on 5,000 files and 43
+commits, a full `nv git log` takes 16 times Git's, `ls-tree -r` 8 times
+and a diff of two revisions 4 times (`status`, `add`, `commit` and `fetch`
+are at parity or ahead).
+
+The same four were given the build with those fixes, told what each
+changed, and asked to break them (about 15,000 more steps and 12,000
+requests). Every finding of the first pass held but those in `TODO.md`.
+What the second pass found, fixed the same way:
+
+- **What was added at a stopped pull to a file a later commit of the
+  writer's also changed was lost** under that commit's version, and a
+  catching-up after a push that unstaged a file lost what was staged of it
+  and not on disk. Others added at a stop go on the last commit; what is
+  unstaged is kept as a state, and named. A completion killed in its first
+  milliseconds left the workspace naming a commit never written, which no
+  command could open: it is stored before it is named. A branch left
+  behind by such a kill is taken along; staging a completion spent is no
+  reason to refuse a pull.
+- **A link inside a directory set whole got past the check of a commit's
+  own changes**, and the ref was again one nobody could sync: the server
+  checks the links of a directory handed over, or their contents when they
+  come, and a client opens such a directory for its links.
+- **Headers Git's `fsck` refuses** (no committer, a date or zone that is not
+  one, two authors, no email, no end) were taken, and a Git that checks
+  what it is given refused the export. A server takes, and a client takes
+  from one, only what `fsck` would.
+- **A macro set on one line and unset by a later one still expanded**:
+  attributes are filled as Git fills them, the line of highest priority
+  first, each once. **The union merge was bounded by file and not by
+  push**: sixteen files of 248 KiB held the server for 2.4 s; a push's
+  merging is now bounded as a whole.
+- **`merge_cst.py` called clean a unit run into the next under the same
+  name** (`a = 1` and `@d` read as `a = 1@d`, and `f` lost its decorator),
+  and Lean units with no line end between them: the read-back compares
+  text, and Lean units that run together are a conflict. **A driver killed
+  inside a shell** (an exit above 128) and **one that started a process in
+  a session of its own** are stopped and give no result, as Git has it.
+- **`nv git`**: tag messages given in several `-m`, or with lines of `#`,
+  made other tags than Git's, and a tag of a tree said it tagged a commit;
+  merging a revision that is no branch's name made another commit ("Merge
+  commit"); `checkout -b b origin/b` followed nothing, and pull was then
+  refused; an amend refused in a stopped merge staged the markers first;
+  `tags/<t>` and `remotes/<r>/<b>` were not read; and a tree or a file named
+  where a commit is meant read as a damaged store (case 49).
+
+A third pass, given the build with those fixes (about 13,500 steps, 700
+kills and 12,000 requests), found every second-pass fix holding but the
+items `TODO.md` lists, and these, fixed the same way:
+
+- **An undo at a stopped pull, killed while it wrote files, left the
+  workspace half undone**, still at the stop: going on from there with
+  Git's verbs (add, commit, push) took the other writer's committed lines
+  off the ref, 17 times in 27; and an undo run again after a later kill
+  refused, leaving the stop's index on the commit gone back to. An undo now
+  notes where it goes, from where, and from which commit the branch is to
+  be taken back, before the first file is written; while the note is
+  there, nothing records, commits or pushes, and the undo run again
+  finishes the work from what was recorded, not from the half-written
+  files (as an arrival cut short is finished). A file edited between the
+  kill and that second run, so that it is neither what the undo went from
+  nor what it goes to, is recorded before it is written over, and the state
+  that holds it is the one named as kept.
+- **A driver went on after nv was stopped** by SIGTERM, SIGINT or SIGHUP
+  (as `timeout(1)`, a supervisor or a Ctrl-C stops it), and wrote into the
+  workspace without its lock: what nv started is stopped first, then nv
+  ends as the signal would have ended it.
+- **The server took a link's content sent by itself** (`PUT
+  /objects/<id>`) after a directory holding that link had been handed over
+  without it, and the ref was again one nobody could sync; **dates past a
+  64-bit `time_t`** got past the check of headers. **`nv commit` and `nv
+  git commit` wrote a name or an address as the environment gave it**
+  (`A <b>`, a line end), which the server then refused, so the writer's own
+  commit could not be pushed: both are cleaned as Git cleans them.
+- **`merge_cst.py` read a unit whose own text names it (a list item, a
+  heading, a function's name) edited on one side and taken out on the
+  other as taken out and added**, and brought it back; two different edits
+  of one list item were both kept. Both are conflicts. Only a list item
+  that holds a place (`TBD`, `TODO`, `none yet`, `n/a`, `...`, `empty` and a
+  few more, alone, in brackets or emphasis or not: `(none yet)`, `*(empty)*`)
+  may be put in place of by both sides, each with its own items; any other
+  item replaced differently by the two, or taken out by one and replaced by
+  the other, is a conflict. An item with a list of its own below it holds
+  no place. On 800 random merges, 183 are conflicts where 162 were before
+  the third pass.
+- **`nv git`**: a tag and a branch of one name were the branch, where Git
+  takes the tag (and says the name is ambiguous); merges of `tags/<t>`,
+  `refs/tags/<t>` and `remotes/origin/<b>` were "Merge commit"; `merge` of a
+  revision nv does not look for answered with Git's error, not a refusal;
+  `branch -d` deleted a branch merged to HEAD and not to the branch it
+  follows, which Git refuses (and refused one merged to that branch and not
+  to HEAD, which Git deletes); `switch` went over a file staged as new and
+  gone from disk that the branch gone to has; and `show` of a file by its
+  id read it as a damaged commit (case 50).
+
+A fourth pass (about 11,000 steps, 600 kills and 10,000 requests) found
+the third pass's fixes holding, and these, fixed the same way:
+
+- **The note of a link whose content had not come refused that content
+  as any file's**: one request handing over a directory with a link to the
+  empty content made every empty file unpushable to that repository; and
+  the content brought by adopting another repository's directory got past
+  it, and the ref was again one nobody could sync. Nothing is noted now: a
+  push that sets a directory whole walks it for its links, wherever their
+  content came from, and holds each to what a link may be.
+- **An identity variable set to nothing was taken as not set**, where Git
+  refuses an empty name and writes an empty address; **a date Git refuses
+  was taken** (`0`, `-5`: a commit with a negative date pushed to a Git
+  origin failed `git fsck` there), and a zone out of range was kept. Of a
+  date, nv reads only what it knows Git to read the same way (see the fifth
+  pass below), and refuses with 125 a form it does not read.
+- **An undo finished after a kill wrote over an edit made in between and
+  named as kept a state without it**: the edit is recorded first.
+- **`merge_cst.py` compared list items by likeness**, which was slow on
+  long items (a list both sides rewrote, 41 KB: 62 s) and wrong below its
+  threshold (`- yes` taken out on one side and made `- no` on the other
+  came back). Only an item that holds a place is filled by both.
+- **`nv git`**: a tag of the name of a branch only origin has was taken for
+  that branch (`checkout` is refused, as it would leave HEAD on no branch,
+  and `switch` says a branch is expected); `merge -m ''` committed an empty
+  message where Git stops; `rev-parse --abbrev-ref HEAD` gave a name that
+  finds something else; and `switch` removed a file taken out of the index
+  and kept on disk, which Git refuses (case 51).
+
+A fifth pass (about 12,000 steps, 200 kills and 7,000 requests) found the
+fourth pass's fixes holding, and these, fixed the same way:
+
+- **A `git commit -a` refused for who made it, or when, had staged every
+  file first**, and the next commit of other files published them: lines
+  nobody committed reached the ref twice in ten runs. Who makes a commit is
+  settled before anything is staged.
+- **Dates**: one before 1970 was written negative and pushed, and a Git
+  origin's `fsck` refused it; forms Git reads otherwise were taken and
+  written otherwise (`+01:00` after seconds, `-0000`); and forms nv does not
+  read answered with Git's error instead of a refusal. A date is taken only
+  as seconds of nine or ten digits before 2100 (`@` before them, or none),
+  with a zone of under 24 hours and 60 minutes, `+hh:mm` or `+hhmm`, or
+  none, or one out of range (this machine's, as Git has it, except after
+  `@`, where it is not read); or ISO 8601 to the second, from 1970 to 2099,
+  with `Z`, such a zone, or none. Seconds too few or a year out of range are
+  refused as Git refuses them (128); RFC 2822, fractions of a second and
+  every other form are not read (125). On 600 random environments, every
+  one nv takes gives Git's commit, and the rest are refused.
+- **Files of the tree were written in place**: killed, a restore or an undo
+  left a file half written (a build saw empty files), and an undo finished
+  after such a kill took the half file for an edit and named it as kept. A
+  file is made under `.nv/writing`, in a directory of each thread's own,
+  and renamed into place; a kill leaves nothing in the tree. (The sixth
+  pass found the first way of it, a name beside the file, too long for a
+  name of 245 bytes, left in the tree by a kill and then committed, and
+  written over an untracked file of that name.) Outside a workspace, in a
+  checkout to a new directory before its `.nv` exists, a short name beside
+  the file is used, made only where nothing is. A checkout of 20,000 files
+  takes the same time as before, within what this container varies
+  (5.0–5.8 s for each way, alternating runs). The state an undo records is
+  written into its note, so that a run after another kill goes on from it.
+- **`merge_cst.py` took items that only begin or end like a placeholder
+  for one** (`TODO: fix the auth bug`, `(urgent) rotate the keys (today)`),
+  and an edit was lost: what holds a place is one of a few words, alone.
+- **The server took a directory of 2^60 files in 3 KB** (shared
+  directories), which no client could finish writing: a directory handed
+  over may hold 4,194,304 files at most, counted with those handed over
+  before, and so may all a push sets whole (the sixth pass set one such
+  directory 64 times in one push). A directory handed over before files
+  were counted is counted when it is first built on, and taken to hold
+  links. **A push that set a large directory walked all of it each time,
+  for its links and its files**: the walk now goes only where a link is
+  below, and not again into a directory found whole and sound. Setting a
+  directory of 2,021 trees, each holding a link, takes 1.1 s the first time
+  on the local runtime, where every repository shares one process and
+  waits; set again, 0.03 s.
+- **`nv git`**: `merge -m x -m y` kept only `x`, and a merge's message was
+  not cleaned; a tag without a message of an annotated tag named the commit
+  under it; `--abbrev-ref` gave `origin` and `refs/tags/y` for branches of
+  those names; `checkout -b` in a merge that stopped was refused, where Git
+  makes the branch (or refuses while a file is unmerged); and `merge -m ''`
+  that would only move the branch forward is refused, where Git moves the
+  files and not the branch (case 51).
+
+A sixth pass (about 10,000 steps, 300 kills and 5,000 requests) found the
+fifth pass's fixes holding but the way files were written, and these,
+fixed the same way: the file bound per push and for directories counted
+before (above); an adopt that asked the repository once for each
+directory it held (1,011 trees: 11.9 s, now 7.4 s); `git push origin <b>`
+where `b` also names a tag or a remote's branch, which Git refuses and nv
+pushed as a new branch; `checkout -b` in a merge with a file unmerged,
+which Git does unless told `-q`; ISO dates Git takes at the edges of its
+years, which nv refused as Git refusing them (now 125); and `- ...`, not
+taken for a placeholder (case 51).
+
 ## Why these choices
 
 Measured on real histories before any of this was written (the tools are
@@ -1925,6 +2260,7 @@ was meant, as one killed at any moment does.
 | A lock another nv command holds (the workspace, the store, a commit still being made beside Git) | 60 s | `NV_LOCK_TIMEOUT` | exit 2, naming the lock; the command does not go ahead without it |
 | A server: making the connection / a request with no byte moving | 10 s / 60 s | `NV_HTTP_TIMEOUT` | the request fails, and the command with it |
 | A commit Git makes for `nv commit` beside it, its hooks included | 300 s | `NV_GIT_TIMEOUT` | Git and everything it started are stopped; Git's index is as it was |
+| A merge driver on one file | 120 s | `NV_MERGE_DRIVER_TIMEOUT` | the driver and everything it started, in its process group or a session of its own, are stopped; nothing of the merge is taken from it. The same is done when nv itself is stopped by SIGTERM, SIGINT or SIGHUP, before nv ends |
 | One command, all of it | 1,800 s | `NV_TIMEOUT` | exit 124, as `timeout(1)` gives |
 
 A watcher (`nv watch <dir>`) is no command but a process that stays, and
@@ -2097,9 +2433,28 @@ stops.
   timed locally, and a worker's limits on time and memory have not been
   met by a real file of a gigabyte. Nothing yet fetches a large file only
   when it is opened.
-- A workspace with several unpushed commits that has to catch up first gets
-  them back as one commit, under the lines of all of them (their summary
-  lines joined by `; `, their bodies one after another); the sync says so.
+- A workspace with several unpushed commits that has to catch up gets them
+  put on the ref's tip one by one, each with its message, where each file of
+  each merges as a sync merges and the last comes to the same files as one
+  commit would; a file left with both versions belongs to the last commit
+  that changed it, and its settling goes into that commit, those after it
+  made again on top. Those before it that changed the file are held out of
+  it too, and when it is settled each is given its own version with what
+  the settling brought in (three-way: from the last commit's version, to
+  its own and to the settled one), and the same trailer, as a rebase
+  stopped at each would have them; where that does not merge clean, the
+  commit keeps the tip's version and nothing says so. A commit that
+  changed nothing but such files is on the tip with nothing in it until
+  then; where its version does not merge clean, it is one commit with the
+  one after it, under the lines of both. While such a commit waits, the
+  settling cannot be made a commit of its own (`nv commit <dir>
+  <message>` is refused and says to give no message). Where none of this
+  can be (a commit clashes with the ref on the way though the commits
+  together do not; a directory set whole), they are one commit,
+  under the lines of all of them (their summary lines joined by `; `, their
+  bodies one after another), and the sync says so. The model in
+  `formal/sync` folds them always: it does not cover the commits put on the
+  tip one by one.
 - The server compares paths. Two changes to different functions of one file
   need a sync and a second push from one of the writers; the merge is the
   client's. A push that was refused stays on the server as a row nobody
@@ -2120,10 +2475,8 @@ stops.
 - A fork keeps build output, but whether a build tool still trusts it under
   a new absolute path has not been tried.
 - In a workspace with no Git beside it, `.gitattributes` is read for line
-  endings and `merge=union` only: no filters, no LFS, no `-merge` (it is
-  merged as text), no merge drivers of one's own (`merge=<name>` with
-  `merge.<name>.driver`, which would let a syntax-aware tool or an agent
-  settle a conflict before a person sees it). Beside Git, commits are Git's and
+  endings, `merge=union` and merge drivers only: no filters, no LFS, no
+  `-merge` (it is merged as text). Beside Git, commits are Git's and
   filters apply to them; nv's own snapshots hold the files as they are on
   disk.
 - `.gitignore` is honoured, and `.nv/exclude` is a workspace's own list in
@@ -2160,9 +2513,10 @@ stop root: run them as another user.
 
 On Linux (ext4, Git 2.43, the tests run as an unprivileged user and against
 a local server) everything passes but case 27 of the Git cases (Git 2.43
-takes `log -n abc`, newer Git refuses it), and, now and then, the check that
-a hook's process is gone after it was stopped, which can still be seen there
-for a moment until it is reaped.
+takes `log -n abc`, newer Git refuses it), and the check that a hook's
+process is gone after it was stopped: it can still be seen there for a
+moment until it is reaped, and for ever in a container whose first process
+reaps nothing (the hook's `sleep` is killed, and stays a zombie of it).
 
 The server:
 

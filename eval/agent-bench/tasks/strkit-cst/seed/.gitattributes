@@ -1,0 +1,4 @@
+strkit/__init__.py merge=union
+strkit/errors.py merge=cst
+README.md merge=cst
+CHANGELOG.md merge=cst

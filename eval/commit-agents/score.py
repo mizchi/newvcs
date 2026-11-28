@@ -5,7 +5,7 @@ A round directory holds two files beside the workspaces `setup.sh` made:
 
   verify.txt  what `verify.sh <round-dir> <ref-url>` printed
   usage.tsv   one line per agent, as the orchestrator was told when each finished:
-              role (worker, committer, script, hook or baseline), task, tokens, tool uses (for a hook,
+              role (worker, committer, script, supervisor, hook or baseline), task, tokens, tool uses (for a hook,
               its calls), milliseconds,
               and for a committer the pushes it had refused (from its report); for a script,
               also the milliseconds from the developer's done file to its end
@@ -94,14 +94,17 @@ def scores(round_dir):
     # A hook (`body.sh`) has no agent's start to cost: what its calls used is counted whole.
     hooks = sum(r["tokens"] for r in rows if r["role"] == "hook")
     vcs += hooks
-    total = sum(r["tokens"] for r in rows if r["role"] in ("worker", "committer")) + hooks
+    # One agent that makes every developer's commits (round 17): counted as a committer is, once.
+    supervisors = [r for r in rows if r["role"] == "supervisor"]
+    vcs += sum(r["tokens"] - base for r in supervisors)
+    total = sum(r["tokens"] for r in rows if r["role"] in ("worker", "committer", "supervisor")) + hooks
     return held, {
-        "makespan s": max(r["ms"] for r in committers.values()) / 1000,
+        "makespan s": max([r["ms"] for r in committers.values()] + [r["ms"] for r in supervisors]) / 1000,
         "latency s": statistics.median(latency) / 1000,
         "vcs tokens": vcs,
         "dev tokens": dev,
         "vcs share %": 100 * vcs / (vcs + dev),
-        "vcs calls": sum(r["calls"] for r in committers.values()) + sum(r["calls"] for r in rows if r["role"] == "hook"),
+        "vcs calls": sum(r["calls"] for r in committers.values()) + sum(r["calls"] for r in rows if r["role"] in ("hook", "supervisor")),
         "total tokens": total,
     }, {
         "refused pushes": sum(r["refused"] for r in committers.values()),

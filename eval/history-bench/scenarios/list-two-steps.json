@@ -1,0 +1,90 @@
+{
+ "name": "list-two-steps",
+ "seed": {
+  "README.md": "# kit\n\n## Functions\n\n- (none yet)\n\n## Notes\n\nNothing yet.\n",
+  "kit/__init__.py": "__all__ = [\n]\n",
+  ".gitattributes": "kit/__init__.py merge=union\n"
+ },
+ "settle": "both",
+ "writers": [
+  {
+   "name": "ann",
+   "steps": [
+    {
+     "note": "Add slugify",
+     "edits": [
+      {
+       "file": "kit/slug.py",
+       "write": "def slugify(t):\n    return t\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .slug import slugify\n__all__ = [\n    \"slugify\",\n"
+       ]
+      },
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- slugify(text)\n"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "steps": [
+    {
+     "note": "Add word_count",
+     "edits": [
+      {
+       "file": "kit/stats.py",
+       "write": "def word_count(t):\n    return len(t.split())\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .stats import word_count\n__all__ = [\n    \"word_count\",\n"
+       ]
+      },
+      {
+       "file": "README.md",
+       "replace": [
+        "- (none yet)\n",
+        "- word_count(text)\n"
+       ]
+      }
+     ]
+    },
+    {
+     "note": "Add reading_time",
+     "edits": [
+      {
+       "file": "kit/stats.py",
+       "append": "\n\ndef reading_time(t):\n    return 1\n"
+      },
+      {
+       "file": "kit/__init__.py",
+       "replace": [
+        "__all__ = [\n",
+        "from .stats import reading_time\n__all__ = [\n    \"reading_time\",\n"
+       ]
+      },
+      {
+       "file": "README.md",
+       "after": [
+        "- word_count(text)\n",
+        "- reading_time(text)\n"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

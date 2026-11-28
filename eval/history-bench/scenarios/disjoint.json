@@ -1,0 +1,79 @@
+{
+ "name": "disjoint",
+ "seed": {
+  "README.md": "# kit\n\n## Functions\n\n- (none yet)\n\n## Notes\n\nNothing yet.\n",
+  "kit/__init__.py": "__all__ = [\n]\n",
+  ".gitattributes": "kit/__init__.py merge=union\n"
+ },
+ "writers": [
+  {
+   "name": "ann",
+   "steps": [
+    {
+     "note": "Add ann one",
+     "edits": [
+      {
+       "file": "ann/one.py",
+       "write": "x = 1\n"
+      }
+     ]
+    },
+    {
+     "note": "Add ann two",
+     "edits": [
+      {
+       "file": "ann/two.py",
+       "write": "y = 2\n"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "bob",
+   "steps": [
+    {
+     "note": "Add bob one",
+     "edits": [
+      {
+       "file": "bob/one.py",
+       "write": "x = 1\n"
+      }
+     ]
+    },
+    {
+     "note": "Add bob two",
+     "edits": [
+      {
+       "file": "bob/two.py",
+       "write": "y = 2\n"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "cy",
+   "steps": [
+    {
+     "note": "Add cy one",
+     "edits": [
+      {
+       "file": "cy/one.py",
+       "write": "x = 1\n"
+      }
+     ]
+    },
+    {
+     "note": "Add cy two",
+     "edits": [
+      {
+       "file": "cy/two.py",
+       "write": "y = 2\n"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

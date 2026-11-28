@@ -47,6 +47,12 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Say in a line what was just done: the next commit the conditions
         pass on (`[commit] each`), of these files or later ones, is made
         under it. Where that commit was made already, it is renamed
+  nv tell <dir> <line>
+        Leave a line for the writer of a workspace, from whoever supervises
+        it: it is given once, the next time `nv inbox`, `nv note` or the
+        hook behind its tool calls speaks to it there
+  nv inbox <dir>
+        The lines told here and not yet read, which are read now
   nv pending <dir> [--wait]
         The commits made here and not pushed, oldest first: each with its
         number, its Git id and nv's, message, the conditions its files
@@ -98,6 +104,10 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Bring the workspace to the ref's tip, keeping its own work on top. A
         file both changed is merged as text; where the same lines changed it is
         left with both versions between markers, and the exit code is 1
+  nv fetch <dir> [--quiet]
+        Bring the ref's commits since the workspace last looked into the store,
+        and the files they changed; no file on disk changes. `origin/<ref>`
+        names that tip in `nv git` until a sync or a push sees a newer one
   nv fork <dir> <new-dir>
         Clone a workspace copy-on-write, build output included
   nv export <dir> <git-repo> <ref>
@@ -190,6 +200,12 @@ fn claude_hook() -> Option<()> {
   workspace::snapshot(&mut store, &mut ws, AUTHOR, look).ok()?;
   // Where the repository declares conditions to run behind writes, they are started here.
   newvcs::checks::start_behind(&root);
+  // What a supervisor told this writer goes to the session, as context for its next turn.
+  let told = newvcs::checks::take_told(&root);
+  if !told.is_empty() {
+    let context = told.iter().map(|line| format!("told by the supervisor of this workspace: {line}")).collect::<Vec<_>>().join("\n");
+    println!("{}", serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": context } }));
+  }
   Some(())
 }
 
@@ -455,6 +471,38 @@ fn run(args: &[String]) -> Result<()> {
       // The message given, or else the one drafted for the state this commit is of.
       let given = args.get(2).filter(|a| !["--recorded", "--tracked", "--no-checks"].contains(&a.as_str()));
       let config = newvcs::checks::load(&ws.root)?;
+      // Given one while commits of this workspace's own wait on the settling with nothing in them,
+      // the settling made a commit of its own would leave them so: refused, before anything.
+      if given.is_some() && !newvcs::colocated::shared(&ws.root) {
+        let waiting = workspace::waiting_on_settling(&mut store, &ws)?;
+        if !waiting.is_empty() {
+          return Err(format!(
+            "these commits made here hold nothing until the files the last sync held out of them are settled: {}. Given a message, the settling would be a commit of its own and they would stay empty; run `nv commit <dir>` with no message, which gives each of them its version",
+            waiting.join("; ")
+          ));
+        }
+      }
+      // Given none, the settling of what a sync held out of a commit of this workspace's own
+      // completes that commit, under its message.
+      if given.is_none() && !newvcs::colocated::shared(&ws.root) && workspace::settles_into(&ws.root).is_some() {
+        let what = match workspace::settles_into(&ws.root).map(|id| newvcs::commit::Commit::load(&mut store, &id)) {
+          Some(Ok(commit)) => {
+            let said = String::from_utf8_lossy(&commit.rest).into_owned();
+            said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+          }
+          _ => String::new(),
+        };
+        if let Some(id) = workspace::complete_settling(&mut store, &mut ws, AUTHOR, look(3), None)? {
+          // Everything on disk is in it: what `nv git add` had set apart is spent (second pass).
+          let _ = std::fs::remove_file(ws.root.join(".nv").join("git-staged"));
+          println!(
+            "{} in {:.0} ms: the settling completes {what}, under its message, and what came after it is on top",
+            hex(&id),
+            ms(started)
+          );
+          return Ok(());
+        }
+      }
       // Refused before anything is recorded: a refused command changes nothing.
       if given.is_none() && config.as_ref().is_none_or(|c| c.message.is_none()) {
         return Err("a commit needs a message: give one, or declare a [message] hook in nv.toml to draft one".into());
@@ -700,7 +748,25 @@ fn run(args: &[String]) -> Result<()> {
     "note" => {
       let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
       println!("{}", newvcs::checks::note(&root, arg(2)?, AUTHOR)?);
+      // What a supervisor told this writer, with the answer to what the writer said.
+      for line in newvcs::checks::take_told(&root) {
+        println!("told: {line}");
+      }
       newvcs::checks::start_behind(&root);
+    }
+    "tell" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      newvcs::checks::tell(&root, arg(2)?)?;
+    }
+    "inbox" => {
+      let root = workspace::top_of(Path::new(arg(1)?)).ok_or("not in a workspace")?;
+      let told = newvcs::checks::take_told(&root);
+      if told.is_empty() {
+        println!("nothing has been told here");
+      }
+      for line in told {
+        println!("told: {line}");
+      }
     }
     "pending" => {
       let (ws, mut store) = opened(arg(1)?)?;
@@ -711,6 +777,7 @@ fn run(args: &[String]) -> Result<()> {
       if ws.pushed.or(ws.start).is_none() && !chain.is_empty() {
         println!("(this workspace has no ref it pushes to, nor a commit it was made at: all of its history is listed)");
       }
+      let held = workspace::held_out(&mut store, &ws)?;
       for (n, (id, commit)) in chain.iter().enumerate() {
         let said = String::from_utf8_lossy(&commit.rest).into_owned();
         let message = said.split_once("\n\n").map_or("", |(_, m)| m).trim();
@@ -734,6 +801,9 @@ fn run(args: &[String]) -> Result<()> {
           };
           println!("       {what} {}", String::from_utf8_lossy(path));
         }
+        for path in held.get(id).into_iter().flatten() {
+          println!("       {path} (held out until it is settled)");
+        }
         if let Some((_, under)) = workspace::moved_under(&ws).filter(|(moved, _)| moved == id) {
           println!(
             "       its message was written before it was put on top of: {} (they change files it changes); what it says of them may not hold. Read it: `nv rebuild` writes it again, or, given the same message, keeps it and says no more of it; a push does not wait on it",
@@ -743,8 +813,23 @@ fn run(args: &[String]) -> Result<()> {
       }
       let unsettled = workspace::unsettled(&ws);
       if !unsettled.is_empty() {
+        // The commit they complete: the last of this workspace's that changed them, which need
+        // not be the last made here.
+        let into = workspace::settles_into(&ws.root).and_then(|id| chain.iter().find(|(c, _)| *c == id)).map(|(_, commit)| {
+          let said = String::from_utf8_lossy(&commit.rest).into_owned();
+          said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+        });
+        let into = match into {
+          Some(first) if !held.is_empty() => {
+            format!(
+              "each commit above that changed them gets its own version of them, with what the settling brought in, and {first} the settled one"
+            )
+          }
+          Some(first) => format!("they go into {first}, which they complete"),
+          None => "they go into the last commit above, which they complete".to_string(),
+        };
         println!(
-          "still holding both versions, and so in none of the commits above: {}. Once they are settled and the conditions pass, they go into the last commit above, which they complete",
+          "still holding both versions, and so in none of the commits above: {}. Once they are settled and the conditions pass, {into}",
           unsettled.join(", ")
         );
       }
@@ -971,11 +1056,25 @@ fn run(args: &[String]) -> Result<()> {
     "sync" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
       newvcs::colocated::locked(&ws.root)?;
+      // `git pull --rebase` with anything staged is refused by Git, whatever the ref changed: the
+      // index would not survive the rebase. Not at a pull that stopped, where adding is the way on.
+      if AS_GIT.load(std::sync::atomic::Ordering::Relaxed)
+        && workspace::settles_into(&ws.root).is_none()
+        && !workspace::staged_apart(&mut store, &ws)?.is_empty()
+      {
+        eprintln!("error: cannot pull with rebase: Your index contains uncommitted changes.\nerror: Please commit or stash them.");
+        std::process::exit(128);
+      }
       let done = remote::sync(&mut store, &mut ws, AUTHOR)?;
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
       }
-      println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
+      // As `git pull -q`: nothing said of a catching-up that left nobody anything to do.
+      let quiet =
+        args.iter().any(|a| a == "--quiet") && done.conflicts.is_empty() && done.unstaged.is_empty() && done.moved_under.is_empty();
+      if !quiet {
+        println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
+      }
       // Where the conditions run behind writes, they are run on what the sync made as well: where
       // that is a commit of this workspace's put on a newer tip, the committer is told where to
       // hear how they end, so as not to push what nothing ran on.
@@ -990,6 +1089,20 @@ fn run(args: &[String]) -> Result<()> {
       // As `git pull` does: a sync that left something for a person does not look like one that did not.
       if !done.conflicts.is_empty() {
         std::process::exit(1);
+      }
+    }
+    "fetch" => {
+      let (mut ws, mut store) = opened(arg(1)?)?;
+      let done = remote::fetch(&mut store, &mut ws)?;
+      let name = ws.remote_ref.clone().unwrap_or_default();
+      let short = |id: &Option<newvcs::Id>| id.map_or("nothing".to_string(), |id| hex(&id)[..12].to_string());
+      if done.tip != done.was && !args.iter().any(|a| a == "--quiet") {
+        let commits = if done.commits == 1 { "1 commit".to_string() } else { format!("{} commits", done.commits) };
+        println!(
+          "fetched {commits} of `{name}`: origin/{name} is at {} (was {}); nothing on disk changed, `nv sync` puts the workspace on it",
+          short(&done.tip),
+          short(&done.was)
+        );
       }
     }
     "fork" => {
@@ -1064,6 +1177,10 @@ fn counted(n: usize, what: &str) -> String {
   if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
+/// Whether the command was asked for in Git's words (`nv git pull --rebase`), and should say what
+/// comes next in them.
+static AS_GIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn describe(s: &remote::Synced, root: &Path) -> String {
   let nothing = s.commits == 0
     && s.written == 0
@@ -1071,7 +1188,8 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     && s.contents_fetched == 0
     && s.outside_view == 0
     && s.merged == 0
-    && s.moved_under.is_empty();
+    && s.moved_under.is_empty()
+    && s.unstaged.is_empty();
   if nothing && s.conflicts.is_empty() && s.cancelled == 0 && s.superseded == 0 && s.folded <= 1 && s.before.is_none() {
     return "nothing else came from the ref".to_string();
   }
@@ -1096,10 +1214,24 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     text.push_str(&format!(
       "\nboth sides changed the same lines of: {}\nEach holds both versions between <<<<<<< and >>>>>>> markers, and is left out of the commit put on the ref's tip. {}",
       s.conflicts.join(", "),
-      if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
-        "Edit them: once the conditions pass on them, they go into the commit of yours put on the tip, which they complete (where you have none, they are a commit of their own). Then `nv push`."
+      if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) && s.folded > 1 {
+        "Edit them: once the conditions pass on them, they complete the commit of yours put on the tip, under its message. Then `nv push`."
+      } else if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
+        "Edit them: once the conditions pass on them, each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one (where you have none, they are a commit of their own; `nv pending` lists what each is held out of). Then `nv push`."
+      } else if AS_GIT.load(std::sync::atomic::Ordering::Relaxed) && newvcs::workspace::settles_into(root).is_some() {
+        if s.folded > 1 {
+          "Edit them and `git add` them, then `git rebase --continue`: they complete the commit of yours put on the tip, under its message, or under a new one given with `git commit -m <message>` instead. Then `git push`."
+        } else {
+          "Edit them and `git add` them, then `git rebase --continue`: they complete the commit of yours that changed them last, under its message, or under a new one given with `git commit -m <message>` instead; each earlier commit of yours that changed them gets its own version of them. Then `git push`."
+        }
       } else {
-        "Edit them, then `nv commit` and `nv push`."
+        if newvcs::workspace::settles_into(root).is_some() && s.folded > 1 {
+          "Edit them, then `nv commit <dir>` with no message: they complete the commit of yours put on the tip, under its message. Then `nv push`."
+        } else if newvcs::workspace::settles_into(root).is_some() {
+          "Edit them, then `nv commit <dir>` with no message: each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one, each under its message (`nv pending` lists what each is held out of). Then `nv push`."
+        } else {
+          "Edit them, then `nv commit` and `nv push`."
+        }
       }
     ));
   }
@@ -1119,6 +1251,13 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     text.push_str(&format!(
       "\n{} commits made here and not yet pushed are now one commit on top of the ref's, under the lines of all of them",
       s.folded
+    ));
+  }
+  if !s.unstaged.is_empty() {
+    let kept = s.unstaged_kept.map(|id| format!("; what was staged of them is kept as {}", hex(&id))).unwrap_or_default();
+    text.push_str(&format!(
+      "\nunstaged, as the ref changed them since they were added: {}. What is on disk is merged with what the ref brought, and is to be added again{kept}",
+      s.unstaged.join(", ")
     ));
   }
   if s.before.is_some() {
@@ -1155,6 +1294,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("commit", 1, 2, &["--recorded", "--tracked", "--no-checks"]),
   ("checkpoint", 1, 1, &["--until-still"]),
   ("note", 2, 2, &[]),
+  ("tell", 2, 2, &[]),
+  ("inbox", 1, 1, &[]),
   ("publish", 1, 2, &["--message"]),
   ("pending", 1, 1, &["--wait"]),
   ("rebuild", 3, usize::MAX, &[]),
@@ -1166,7 +1307,8 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("agent-init", 1, 1, &[]),
   ("remote", 3, 3, &[]),
   ("push", 1, 1, &[]),
-  ("sync", 1, 1, &[]),
+  ("sync", 1, 1, &["--quiet"]),
+  ("fetch", 1, 1, &["--quiet"]),
   ("fork", 2, 2, &[]),
   ("export", 3, 3, &[]),
   ("adopt", 1, 1, &["--undo"]),
@@ -1181,6 +1323,25 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("stats", 1, 1, &[]),
 ];
 
+/// What `nv help` says: the commands a writer uses every day, each in a line, and where the rest
+/// is. A writer reads it first, and carries it through every turn after.
+const SHORT: &str = "\
+nv: version control for many writers committing often, exchangeable with Git
+
+Every day, in a workspace <dir>:
+  nv status <dir>                 what changed since the last commit
+  nv commit <dir> [<message>]     commit what is on disk; given no message after a sync
+                                  that clashed, complete the commits it held files out of
+  nv push <dir>                   send the commits to the ref; refused where it changed them too
+  nv sync <dir>                   bring in what the ref took, and your commits on top of it
+  nv pending <dir> [--wait]       the commits made here and not pushed, and what each holds
+  nv restore <dir> <state>        go back to a recorded state (`before-sync` undoes a sync)
+  nv git <command> [<args>]       Git's everyday commands: log, show, diff, status, add, ...;
+                                  toward the ref, `nv git push` is nv push, `pull --rebase` nv sync,
+                                  `fetch` nv fetch, which changes no file
+
+`nv help <command>` says all of one command, `nv help all` all of them.";
+
 /// The lines of the usage text that are about one command.
 fn usage_of(command: &str) -> String {
   let mut lines = USAGE.lines().skip_while(|line| {
@@ -1193,15 +1354,16 @@ fn usage_of(command: &str) -> String {
 /// The arguments as the commands expect them (options last), or what is wrong with them.
 /// `Ok(None)`: the question was answered here, by printing help.
 fn shaped(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
-  let Some(command) = args.first().map(String::as_str) else { return Err(USAGE.to_string()) };
+  let Some(command) = args.first().map(String::as_str) else { return Err(SHORT.to_string()) };
   match command {
     "help" | "--help" | "-h" => {
       match args.get(1).map(String::as_str) {
         Some(about) if about == "hook" || about == "git" || COMMANDS.iter().any(|(name, ..)| *name == about) => {
           println!("{}", usage_of(about))
         }
+        Some("all") => println!("{USAGE}"),
         Some(about) => return Err(format!("nv: `{about}` is not a command. `nv help` lists them.")),
-        None => println!("{USAGE}"),
+        None => println!("{SHORT}"),
       }
       return Ok(None);
     }
@@ -1254,6 +1416,18 @@ fn main() -> ExitCode {
   if !stays && args.first().is_none_or(|a| a != "publish-step") {
     newvcs::limits::watch_the_clock(&args.iter().take(2).cloned().collect::<Vec<_>>().join(" "));
   }
+  // Git's verbs for the ref a workspace pushes to are nv's own push and sync (`toward_the_ref`).
+  let (args, exit_as_git) = match toward_the_ref(&args) {
+    Ok(Some(nv)) => {
+      AS_GIT.store(true, std::sync::atomic::Ordering::Relaxed);
+      (nv, true)
+    }
+    Ok(None) => (args, false),
+    Err(why) => {
+      eprintln!("nv: {why}");
+      return ExitCode::from(125);
+    }
+  };
   // `nv git …` answers as Git would, exit code and all.
   if args.first().is_some_and(|a| a == "git") {
     return ExitCode::from(newvcs::gitcli::run(&args[1..]) as u8);
@@ -1385,9 +1559,88 @@ fn main() -> ExitCode {
   };
   match run(&args) {
     Ok(()) => ExitCode::SUCCESS,
+    // Git's push says it was refused with 1, as its other failures to do what was asked.
     Err(e) => {
       eprintln!("{e}");
-      ExitCode::from(2)
+      ExitCode::from(if exit_as_git { 1 } else { 2 })
     }
+  }
+}
+
+/// `nv git push`, `nv git fetch` and `nv git pull --rebase` in a workspace that pushes to a ref of
+/// nv's (`nv remote`), with no Git beside it: the ref is where its work goes, not the repository it
+/// was cloned from, and so they are `nv push`, `nv fetch` and `nv sync`, saying what those say. A
+/// pull that would merge is not something nv does with a ref: refused, saying what is. `None` for
+/// everything else, which `nv git` answers as ever.
+fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
+  let Some(rest) = args.strip_prefix(&["git".to_string()]) else { return Ok(None) };
+  let mut rest = rest;
+  let mut at = PathBuf::from(".");
+  while let [flag, dir, more @ ..] = rest {
+    if flag != "-C" {
+      break;
+    }
+    at = at.join(dir);
+    rest = more;
+  }
+  let Some((verb, options)) = rest.split_first() else { return Ok(None) };
+  if !matches!(verb.as_str(), "push" | "pull" | "fetch" | "rebase") {
+    return Ok(None);
+  }
+  let Some(root) = workspace::top_of(&at) else { return Ok(None) };
+  if newvcs::colocated::shared(&root) {
+    return Ok(None);
+  }
+  let Ok(ws) = workspace::Workspace::open(&root) else { return Ok(None) };
+  let (Some(_), Some(ref_name)) = (ws.remote.as_ref(), ws.remote_ref.as_ref()) else { return Ok(None) };
+  // The rebase a pull with --rebase began, where its settling waits: finished by committing the
+  // settling, under the message of the commit it completes, or undone as the sync is undone.
+  if verb == "rebase" {
+    let waiting = workspace::settles_into(&root).is_some() || !workspace::unsettled(&ws).is_empty() || workspace::undoing(&ws).exists();
+    let dir = root.to_string_lossy().into_owned();
+    return match options.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+      // What was added completes the commit, as Git's index does: not whatever else the
+      // directory holds (thirteenth round).
+      ["--continue"] if waiting => Ok(Some(vec!["git".into(), "-C".into(), dir, "commit".into(), "-q".into(), "--no-edit".into()])),
+      ["--abort"] if waiting => Ok(Some(vec!["restore".into(), dir, "before-sync".into()])),
+      _ => Ok(None),
+    };
+  }
+  let quiet = |o: &str| o == "-q" || o == "--quiet";
+  let plain: Vec<&str> = options.iter().map(String::as_str).filter(|o| !quiet(o)).collect();
+  let rebase = |o: &str| o == "--rebase" || o == "-r";
+  let named: Vec<&str> = plain.iter().copied().filter(|o| !rebase(o) && !o.starts_with('-')).collect();
+  let flags: Vec<&str> = plain.iter().copied().filter(|o| o.starts_with('-') && !rebase(o)).collect();
+  // Where the work goes: `origin`, and the ref's own name or `HEAD`, or nothing.
+  let toward = match named[..] {
+    [] | ["origin"] => true,
+    ["origin", name] => name == ref_name || name == "HEAD" || name == format!("HEAD:{ref_name}"),
+    _ => false,
+  };
+  let instead = format!(
+    "where the workspace pushes to `{ref_name}` on a server of nv's, `nv git push` is `nv push`, `nv git fetch` is `nv fetch` and `nv git pull --rebase` is `nv sync`, which puts the commits made here on the ref's tip"
+  );
+  if !toward || !flags.is_empty() {
+    return Err(format!("`git {} {}` is not supported: {instead}", verb, options.join(" ")));
+  }
+  let dir = root.to_string_lossy().into_owned();
+  match verb.as_str() {
+    "push" if !plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["push".into(), dir])),
+    "fetch" if !plain.iter().any(|o| rebase(o)) => {
+      let mut nv = vec!["fetch".to_string(), dir];
+      if options.iter().any(|o| quiet(o)) {
+        nv.push("--quiet".into());
+      }
+      Ok(Some(nv))
+    }
+    "pull" if plain.iter().any(|o| rebase(o)) => {
+      let mut nv = vec!["sync".to_string(), dir];
+      if options.iter().any(|o| quiet(o)) {
+        nv.push("--quiet".into());
+      }
+      Ok(Some(nv))
+    }
+    "pull" => Err(format!("`git pull` without --rebase is not supported: it would make a merge commit, which nv does not; {instead}")),
+    _ => Err(format!("`git {verb}` is not supported: {instead}")),
   }
 }

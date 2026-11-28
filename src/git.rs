@@ -72,40 +72,177 @@ pub fn config_value(root: &Path, section: &str, key: &str) -> Option<String> {
   })
 }
 
-/// A date as a commit carries it, `<seconds> <+hhmm>`, from the forms of
-/// `GIT_AUTHOR_DATE` that are spoken: that one, with or without `@` before
-/// it, and `YYYY-MM-DD HH:MM:SS +hh:mm` with `T` for the space, `Z` for the
-/// zone, or the colon left out.
-pub fn stamp(date: &str) -> Option<String> {
-  let date = date.trim();
-  let zone_ok =
-    |zone: &str| zone.len() == 5 && (zone.starts_with('+') || zone.starts_with('-')) && zone[1..].bytes().all(|b| b.is_ascii_digit());
-  if let Some((seconds, zone)) = date.trim_start_matches('@').split_once(' ')
-    && seconds.parse::<i64>().is_ok()
-    && zone_ok(zone)
-  {
-    return Some(format!("{seconds} {zone}"));
+/// A name or an address as Git puts it in a commit (`strbuf_addstr_without_crud`): what Git calls
+/// crud taken off both ends, and `<`, `>` and line ends taken out, so that what the environment or
+/// the configuration says can never make a header Git's fsck, or a server, refuses (third pass).
+pub fn ident_part(text: &str) -> String {
+  let crud = |c: char| c as u32 <= 32 || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'');
+  text.trim_matches(crud).chars().filter(|c| !matches!(c, '\n' | '<' | '>')).collect()
+}
+
+/// What a date given in the environment is to nv: one it writes as Git would, one Git refuses, or
+/// one in a form nv does not read (and Git may).
+#[derive(Debug, PartialEq)]
+pub enum Stamp {
+  Taken(String),
+  Refused,
+  NotRead,
+}
+
+impl Stamp {
+  pub fn taken(self) -> Option<String> {
+    match self {
+      Stamp::Taken(stamp) => Some(stamp),
+      _ => None,
+    }
   }
-  let (day, rest) = date.split_at_checked(10)?;
-  let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' '))?;
-  let (time, zone) = rest.split_at_checked(8)?;
-  let zone = match zone.trim() {
-    "Z" | "" => "+0000".to_string(),
-    zone => zone.replace(':', ""),
+}
+
+/// A date as Git takes one from `GIT_AUTHOR_DATE` and the like, written as a commit has it
+/// (`seconds zone`). Only forms whose reading by Git is known are taken: seconds since 1970 of
+/// nine or ten digits before 2100, with a zone `+hhmm` or `+hh:mm` of under 24 hours and 60
+/// minutes, or none, or one out of range (this machine's zone, as Git has it); `@seconds` with such
+/// a zone; and ISO 8601 to the second, from 1970 to 2099, with `Z`, such a zone, or none. Seconds
+/// too few, a minus or a year out of that range are refused as Git refuses them; any other form is
+/// not read (fourth and fifth pass: dates Git refuses were taken, dates before 1970 written
+/// negative, and zones Git reads otherwise were dropped).
+pub fn stamp(date: &str) -> Stamp {
+  let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+  // `Some(Some(zone))` a zone; `Some(None)` one given out of range; `None` not one at all.
+  let zone_of = |zone: &str| -> Option<Option<String>> {
+    let zone = if zone.len() == 6 && zone.as_bytes()[3] == b':' { zone.replacen(':', "", 1) } else { zone.to_string() };
+    let bytes = zone.as_bytes();
+    if bytes.len() != 5 || !(bytes[0] == b'+' || bytes[0] == b'-') || !digits(&zone[1..]) {
+      return None;
+    }
+    let (hours, minutes): (u32, u32) = (zone[1..3].parse().ok()?, zone[3..5].parse().ok()?);
+    Some((hours < 24 && minutes < 60).then(|| if &zone[1..] == "0000" { "+0000".to_string() } else { zone }))
   };
-  let number = |text: &str| text.parse::<i64>().ok();
-  let (year, month, date_of) = (number(day.get(..4)?)?, number(day.get(5..7)?)?, number(day.get(8..10)?)?);
-  let (hour, minute, second) = (number(time.get(..2)?)?, number(time.get(3..5)?)?, number(time.get(6..8)?)?);
-  if !zone_ok(&zone) || !(1..=12).contains(&month) || !(1..=31).contains(&date_of) || hour > 23 || minute > 59 || second > 60 {
-    return None;
+  let in_range = |seconds: i64| (0..4_102_444_800).contains(&seconds);
+  let words: Vec<&str> = date.split_whitespace().collect();
+  let Some(first) = words.first().copied() else { return Stamp::NotRead };
+  let is_seconds = |text: &str| digits(text) || (text.starts_with('-') && digits(&text[1..]));
+  if let Some(after) = first.strip_prefix('@') {
+    if words.len() > 2 {
+      return Stamp::NotRead;
+    }
+    if after.starts_with('-') && digits(&after[1..]) {
+      return Stamp::Refused;
+    }
+    // After `@`, Git takes zones it takes nowhere else: only one in range is read.
+    return match (digits(after), words.get(1).map(|zone| zone_of(zone))) {
+      (true, Some(Some(Some(zone)))) => match after.parse::<i64>() {
+        Ok(seconds) if in_range(seconds) => Stamp::Taken(format!("{seconds} {zone}")),
+        _ => Stamp::NotRead,
+      },
+      // With no zone, as seconds without the `@` are: nine digits or more, from 1973 on.
+      (true, None) => match after.parse::<i64>() {
+        Ok(seconds) if after.len() >= 9 && (100_000_000..4_102_444_800).contains(&seconds) => {
+          Stamp::Taken(format!("{seconds} {}", local_zone(seconds)))
+        }
+        Ok(seconds) if seconds >= 4_102_444_800 => Stamp::NotRead,
+        _ => Stamp::Refused,
+      },
+      _ => Stamp::NotRead,
+    };
   }
+  if is_seconds(first) {
+    if words.len() > 2 {
+      return Stamp::NotRead;
+    }
+    let zone = match words.get(1).map(|zone| zone_of(zone)) {
+      None => None,
+      Some(Some(zone)) => zone,
+      Some(None) => return Stamp::NotRead,
+    };
+    let Ok(seconds) = first.parse::<i64>() else { return Stamp::Refused };
+    if first.starts_with('-') || first.len() < 9 || seconds < 100_000_000 {
+      return Stamp::Refused;
+    }
+    if !in_range(seconds) {
+      return Stamp::Refused;
+    }
+    let zone = zone.unwrap_or_else(|| local_zone(seconds));
+    return Stamp::Taken(format!("{seconds} {zone}"));
+  }
+  // ISO 8601: `YYYY-MM-DDTHH:MM:SS` (or a space for the T), then the zone, joined or apart.
+  let (iso, zone) = match words[..] {
+    [one] if one.len() >= 19 && one.is_char_boundary(19) => (one[..19].to_string(), Some(&one[19..]).filter(|z| !z.is_empty())),
+    [one, zone] if one.len() == 19 => (one.to_string(), Some(zone)),
+    [day, time] if day.len() == 10 && time.len() >= 8 && time.is_char_boundary(8) => {
+      (format!("{day}T{}", &time[..8]), Some(&time[8..]).filter(|z| !z.is_empty()))
+    }
+    [day, time, zone] if day.len() == 10 && time.len() == 8 => (format!("{day}T{time}"), Some(zone)),
+    _ => return Stamp::NotRead,
+  };
+  let b = iso.as_bytes();
+  let shape = b.len() == 19
+    && b[4] == b'-'
+    && b[7] == b'-'
+    && (b[10] == b'T' || b[10] == b' ')
+    && b[13] == b':'
+    && b[16] == b':'
+    && [0..4, 5..7, 8..10, 11..13, 14..16, 17..19].iter().all(|r| digits(&iso[r.clone()]));
+  if !shape {
+    return Stamp::NotRead;
+  }
+  let number = |range: std::ops::Range<usize>| iso[range].parse::<i64>().unwrap_or(-1);
+  let (year, month, day, hour, minute, second) =
+    (number(0..4), number(5..7), number(8..10), number(11..13), number(14..16), number(17..19));
+  if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+    return Stamp::NotRead;
+  }
+  let zone = match zone {
+    None => None,
+    Some("Z") => Some("+0000".to_string()),
+    Some(zone) => match zone_of(zone) {
+      Some(Some(zone)) => Some(zone),
+      _ => return Stamp::NotRead,
+    },
+  };
   // Days since the epoch, by the civil calendar.
   let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
   let era = y.div_euclid(400);
   let of_era = y.rem_euclid(400);
-  let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + (153 * m + 2) / 5 + date_of - 1 - 719_468;
-  let east = (number(&zone[1..3])? * 3600 + number(&zone[3..5])? * 60) * if zone.starts_with('-') { -1 } else { 1 };
-  Some(format!("{} {zone}", days * 86_400 + hour * 3600 + minute * 60 + second - east))
+  let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + (153 * m + 2) / 5 + day - 1 - 719_468;
+  let wall = days * 86_400 + hour * 3600 + minute * 60 + second;
+  let zone = zone.unwrap_or_else(|| local_zone(wall - offset_of(&local_zone(wall))));
+  let seconds = wall - offset_of(&zone);
+  // Git judges the year as written; a time it takes that falls outside 1970 to 2099 once its zone
+  // is taken off is not read (sixth pass: Git takes `1970-01-01T00:00:00+01:00`, and writes it
+  // wrapped round).
+  if !(1970..=2099).contains(&year) {
+    return Stamp::Refused;
+  }
+  if !in_range(seconds) {
+    return Stamp::NotRead;
+  }
+  Stamp::Taken(format!("{seconds} {zone}"))
+}
+
+/// Seconds east of UTC that a zone written `+hhmm` is.
+fn offset_of(zone: &str) -> i64 {
+  let number = |text: &str| text.parse::<i64>().unwrap_or(0);
+  (number(&zone[1..3]) * 3600 + number(&zone[3..5]) * 60) * if zone.starts_with('-') { -1 } else { 1 }
+}
+
+/// This machine's zone at a moment, as `+hhmm`.
+pub fn local_zone(seconds: i64) -> String {
+  // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
+  let east = unsafe {
+    let mut tm: libc::tm = std::mem::zeroed();
+    let at: libc::time_t = seconds as libc::time_t;
+    libc::localtime_r(&at, &mut tm);
+    tm.tm_gmtoff
+  };
+  let (sign, east) = if east < 0 { ('-', -east) } else { ('+', east) };
+  format!("{sign}{:02}{:02}", east / 3600, east / 60 % 60)
+}
+
+/// What the environment says of a commit's author or committer (`role`): a variable set is taken
+/// even when empty, as Git takes it (fourth pass: an empty one was read as unset).
+pub fn ident_env(role: &str, key: &str) -> Option<String> {
+  std::env::var(format!("GIT_{role}_{key}")).ok()
 }
 
 /// The file of patterns Git ignores in every repository of this user's.
@@ -813,4 +950,56 @@ pub fn export(store: &mut Store, id: &Id, repo: &Path, refname: &str) -> Result<
     return Err(format!("git could not set {refname} to {}", hex(&oid)));
   }
   Ok((oid, written))
+}
+
+#[cfg(test)]
+mod ident_tests {
+  use super::ident_part;
+
+  #[test]
+  fn names_and_addresses_are_cleaned_as_git_cleans_them() {
+    assert_eq!(ident_part("A <b>"), "A b");
+    assert_eq!(ident_part("A>"), "A");
+    assert_eq!(ident_part("<a@b>"), "a@b");
+    assert_eq!(ident_part(" A\nB, "), "AB");
+    assert_eq!(ident_part("\"a@b\";"), "a@b");
+    assert_eq!(ident_part("J. R. Writer."), "J. R. Writer.");
+  }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+  use super::{Stamp, stamp};
+
+  /// What Git reads otherwise than nv could is not read, rather than read wrongly (fifth pass).
+  #[test]
+  fn a_date_in_a_form_nv_does_not_read_is_not_read() {
+    for date in [
+      "14 Nov 2023 22:13:20 +0100",
+      "Tue, 14 Nov 2023 22:13:20 +0100",
+      "2023-11-14T22:13:20.123Z",
+      "14.11.2023 22:13:20",
+      "2023-11-14 22:13",
+      "1700000000,5",
+      "1700000000.5 +0000",
+      "@1700000000.5 GMT",
+      "2023-11-14T23:60:59",
+      "20261128T100000Z",
+      "1795000000 0100",
+      "1795000000 +01",
+      "@123456789 EST",
+      "@999999999 +2400",
+      "@100000000 +9999",
+      "@4102444800 Z",
+      "1970-01-01T00:00:00+01:00",
+      "2099-12-31T23:59:59-01:00",
+    ] {
+      assert_eq!(stamp(date), Stamp::NotRead, "{date}");
+    }
+    assert_eq!(stamp("1795000000 +01:00"), Stamp::Taken("1795000000 +0100".into()));
+    assert_eq!(stamp("100000000 -0000"), Stamp::Taken("100000000 +0000".into()));
+    for date in ["1969-12-31T23:59:59Z", "2100-01-01T00:00:00Z", "@0", "@99999999", "-5 +0000", "4102444800 +0000"] {
+      assert_eq!(stamp(date), Stamp::Refused, "{date}");
+    }
+  }
 }

@@ -485,26 +485,70 @@ fn place_one(files_dir: &Path, root: &Path, job: &Job) -> Result<(u64, u128)> {
       let _ = std::fs::remove_file(&dest);
       std::os::unix::fs::symlink(&to, &dest).map_err(|e| fail("link", &dest, e))?;
     }
-  } else if job.direct {
-    std::fs::write(&dest, job.bytes.as_deref().ok_or("a file without content")?.as_slice()).map_err(|e| fail("write", &dest, e))?;
-    if job.entry.mode & 0o111 != 0 {
-      std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
-    }
   } else {
-    let cached = shared_copy(files_dir, &job.entry.id);
-    if let Some(bytes) = &job.bytes {
-      // Written under another name first: a reader never sees half a file.
-      let temp = cached.with_extension(format!("tmp{}-{:?}", std::process::id(), std::thread::current().id()));
-      std::fs::write(&temp, bytes.as_slice()).map_err(|e| fail("write", &temp, e))?;
-      std::fs::rename(&temp, &cached).map_err(|e| fail("write", &cached, e))?;
+    // A file of the tree is made under another name and put in place whole: killed while it is
+    // written, a file is what it was or what it was to be, never half of it (fifth pass: an undo
+    // finished after a kill took a half-written file for an edit, and a build saw empty files).
+    let temp = writing_name(root, &dest);
+    if job.direct {
+      use std::io::Write;
+      let bytes = job.bytes.as_deref().ok_or("a file without content")?;
+      let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp).map_err(|e| fail("write", &temp, e))?;
+      file.write_all(bytes).map_err(|e| fail("write", &temp, e))?;
+    } else {
+      let cached = shared_copy(files_dir, &job.entry.id);
+      if let Some(bytes) = &job.bytes {
+        // Written under another name first: a reader never sees half a file.
+        let made = cached.with_extension(format!("tmp{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::write(&made, bytes.as_slice()).map_err(|e| fail("write", &made, e))?;
+        std::fs::rename(&made, &cached).map_err(|e| fail("write", &cached, e))?;
+      }
+      clone_file(&cached, &temp).map_err(|e| fail("write", &dest, e))?;
     }
-    clone_file(&cached, &dest).map_err(|e| fail("write", &dest, e))?;
     if job.entry.mode & 0o111 != 0 {
-      std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
+      std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
+    }
+    if let Err(e) = std::fs::rename(&temp, &dest) {
+      let _ = std::fs::remove_file(&temp);
+      return Err(fail("write", &dest, e));
     }
   }
   let meta = std::fs::symlink_metadata(&dest).map_err(|e| fail("look at", &dest, e))?;
   Ok((meta.len(), mtime_of(&meta)))
+}
+
+/// A name for a file of the tree while it is made, on the file system the tree is on, so that it
+/// is put in place by a rename. In a workspace it is under `.nv/writing`, in a directory of each
+/// thread's own (one directory for all made a checkout's threads queue for it): never in the
+/// tree, where a kill would leave it to be committed, never as long as a name of the tree can
+/// be, and never over anything (sixth pass: a name beside the file was too long for a name of 245
+/// bytes, was left in the tree by a kill, and wrote over an untracked file of that name). Outside
+/// a workspace, a short name beside the file, made only where nothing is.
+fn writing_name(root: &Path, dest: &Path) -> PathBuf {
+  static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  static THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  thread_local! {
+    static THREAD: u64 = THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+  let pid = std::process::id();
+  let meta = root.join(META);
+  let dir = if meta.is_dir() {
+    let dir = meta.join("writing").join(format!("{pid}-{}", THREAD.with(|t| *t)));
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+  } else {
+    None
+  };
+  loop {
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = match &dir {
+      Some(dir) => dir.join(n.to_string()),
+      None => dest.with_file_name(format!(".nv-{pid}-{n}")),
+    };
+    if std::fs::symlink_metadata(&name).is_err() {
+      return name;
+    }
+  }
 }
 
 fn shared_dirs(files_dir: &Path) -> Result<()> {
@@ -1832,6 +1876,30 @@ pub(crate) fn unheard(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("pushing")
 }
 
+/// Where a fetch last found the ref: its tip and its position in the ref's history. It is only
+/// something to look at (`origin/<ref>` in `nv git`); what the workspace stands on is `pushed`.
+fn fetched_note(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("fetched")
+}
+
+pub fn set_fetched(ws: &Workspace, tip: Id, seq: u64) -> Result<()> {
+  crate::write_whole(&fetched_note(ws), format!("{} {seq}\n", hex(&tip)))
+}
+
+/// The ref's tip as this workspace last saw it: from its last sync or push, or from a fetch
+/// since, whichever is further along the ref's history.
+pub fn ref_as_seen(ws: &Workspace) -> Option<Id> {
+  let fetched = std::fs::read_to_string(fetched_note(ws)).ok().and_then(|text| {
+    let mut fields = text.split_whitespace();
+    let id = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok())?;
+    Some((id, fields.next()?.parse::<u64>().ok()?))
+  });
+  match fetched {
+    Some((id, seq)) if ws.pushed.is_none() || seq > ws.seq => Some(id),
+    _ => ws.pushed,
+  }
+}
+
 /// The commits a push carried that the workspace has not heard about: `(how many, the last)`.
 pub fn unheard_push(ws: &Workspace) -> Option<(usize, Id)> {
   let text = std::fs::read_to_string(unheard(ws)).ok()?;
@@ -1859,8 +1927,20 @@ pub fn interrupted(ws: &Workspace) -> Result<()> {
       "a sync was cut short while it was writing files here: `nv sync <dir>` finishes it, and nothing is recorded until then".to_string(),
     );
   }
+  if undoing(ws).exists() {
+    return Err(UNDO_CUT_SHORT.to_string());
+  }
   Ok(())
 }
+
+/// The note an undo of a catching-up leaves from before it writes the first file until it is
+/// done: killed in between, its files are half the state gone back to and half the stop's, and
+/// recorded or committed as they are they would take back another writer's work (third pass).
+pub fn undoing(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("undoing")
+}
+
+pub const UNDO_CUT_SHORT: &str = "an undo of the last catching-up was cut short while it was writing files here: `nv restore <dir> before-sync` (or `git rebase --abort`) finishes it, and nothing is recorded or committed until then";
 
 /// The rules of what is left out that are not files of the tree, and so are never reported: the
 /// workspace's `.nv/exclude`, and Git's `info/exclude` where Git shares the directory. Their
@@ -1969,6 +2049,7 @@ pub fn commit_saying(store: &mut Store, ws: &mut Workspace, author: &str, rest: 
     ws.save()?;
     return Ok(None);
   }
+  let rest = with_settled(store, ws, rest, &changes)?;
   let id = Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?;
   root_of(store, &id)?;
   store.flush()?;
@@ -1986,7 +2067,7 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
   let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
   let own =
     |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
-  let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
+  let from_env = |key: &str| crate::git::ident_env(role, key);
   let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| crate::git::config_value(&ws.root, "user", "name"));
   let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| crate::git::config_value(&ws.root, "user", "email"));
   // A commit is published under somebody's name. Git refuses to make one up, and so does this.
@@ -1995,19 +2076,18 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
       "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
     ));
   };
-  let when = match from_env("DATE") {
-    Some(date) => crate::git::stamp(&date)
-      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
+  // Cleaned as Git cleans them, so that no header is made that a server refuses (third pass).
+  let (name, email) = (crate::git::ident_part(&name), crate::git::ident_part(&email));
+  if name.is_empty() {
+    return Err(format!("the name to sign the commit as is empty, once what Git takes out of a name is taken out (for <{email}>)"));
+  }
+  let when = match from_env("DATE").filter(|date| !date.is_empty()) {
+    Some(date) => crate::git::stamp(&date).taken().ok_or_else(|| {
+      format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601, as Git takes them")
+    })?,
     None => {
       let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
-      let east = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let at: libc::time_t = now as libc::time_t;
-        libc::localtime_r(&at, &mut tm);
-        tm.tm_gmtoff
-      };
-      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
+      format!("{now} {}", crate::git::local_zone(now))
     }
   };
   Ok(format!("{name} <{email}> {when}"))
@@ -2020,6 +2100,23 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
 /// For a writer that does not commit: what its conditions passed on is committed as it was, while
 /// it goes on writing. Not beside Git, where a commit is made by Git, from the files.
 pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<u8>, author: &str) -> Result<Option<Id>> {
+  commit_state_with(store, ws, state, rest, author, None, false)
+}
+
+/// The same, where the settling of what a sync left out of a commit completes it: under a message
+/// of its own (`reword`: the message, and who commits it now), as `git commit` at a rebase that
+/// stopped gives the commit it stopped at.
+fn commit_state_with(
+  store: &mut Store,
+  ws: &mut Workspace,
+  state: Id,
+  rest: Vec<u8>,
+  author: &str,
+  reword: Option<(&str, &str)>,
+  // Whatever else the state changed goes into the commit completed too, as what was added with
+  // the settled files does at Git's rebase stopped there.
+  with_others: bool,
+) -> Result<Option<Id>> {
   if crate::colocated::shared(&ws.root) {
     return Err("committing a state the files have moved on from is not done beside Git, where Git commits the files".to_string());
   }
@@ -2050,26 +2147,87 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
   // The settling of files a sync left out of this workspace's own commit completes that commit,
   // under its message: not a commit of its own after one that falls short of what it says.
   let id = match incomplete(store, ws)? {
-    Some((short, paths)) if changes.iter().all(|(path, _)| paths.contains(path)) => {
-      let was = Commit::load(store, &short)?;
-      let mut whole = was.changes.clone();
-      for (path, entry) in changes {
-        match whole.iter_mut().find(|(p, _)| *p == path) {
-          Some(change) => change.1 = entry,
-          None => whole.push((path, entry)),
+    Some((short, paths))
+      if changes.iter().all(|(path, _)| paths.contains(path)) || (with_others && changes.iter().any(|(path, _)| paths.contains(path))) =>
+    {
+      let chain = pending(store, ws)?;
+      let at_short = chain.iter().position(|(id, _)| *id == short).ok_or("the commit a settling completes is not here")?;
+      // The commits before it that changed a settled file have it too: their own version of it,
+      // with what the settling brought in that the last version did not have, where that merges
+      // clean. As a rebase that stopped at each of them would have them settled.
+      let settled: Vec<Change> = changes.iter().filter(|(path, _)| paths.contains(path)).cloned().collect();
+      let earlier = earlier_settled(store, ws, &chain[..at_short], short, &settled)?;
+      // A commit the sync left with nothing in it until now, whose version of the files does not
+      // merge clean, is not left empty: it is one with the commit after it, under the lines of both.
+      let empty: Vec<bool> = (0..at_short).map(|k| chain[k].1.changes.is_empty() && earlier[k].is_empty()).collect();
+      let first = (0..at_short).find(|&k| !earlier[k].is_empty() || empty[k]).unwrap_or(at_short);
+      let lines = settling_lines(ws, &changes);
+      let mut parents = chain[first].1.parents.clone();
+      let mut made = None;
+      let mut carried: Option<Vec<u8>> = None;
+      for (j, (_, c)) in chain.iter().enumerate().skip(first) {
+        if j < at_short && empty[j] {
+          carried = Some(match carried.take() {
+            Some(before) => joined_rest(&before, &c.rest),
+            None => c.rest.clone(),
+          });
+          continue;
         }
+        let rest = match carried.take() {
+          Some(before) => joined_rest(&before, &c.rest),
+          None => c.rest.clone(),
+        };
+        let rest = match reword.filter(|_| j == at_short) {
+          Some((message, committer)) => reworded(&rest, message, committer),
+          None => rest,
+        };
+        let c = &Commit { parents: c.parents.clone(), rest, changes: c.changes.clone() };
+        // The settled files complete the commit they were held out of; anything else added with
+        // them goes on the last commit, where no commit after it puts its own version over it
+        // (second pass of the thirteenth round: added to a file a later commit changed, it was
+        // lost under that commit's version).
+        let last = j + 1 == chain.len();
+        let add: Vec<Change> = if j < at_short {
+          earlier[j].clone()
+        } else {
+          changes.iter().filter(|(path, _)| (j == at_short && paths.contains(path)) || (last && !paths.contains(path))).cloned().collect()
+        };
+        let mut whole = c.changes.clone();
+        for (path, entry) in &add {
+          match whole.iter_mut().find(|(p, _)| p == path) {
+            Some(change) => change.1 = *entry,
+            None => whole.push((path.clone(), *entry)),
+          }
+        }
+        whole.sort_by(|a, b| a.0.cmp(&b.0));
+        let rest = if add.is_empty() {
+          c.rest.clone()
+        } else {
+          let said: Vec<String> =
+            lines.iter().filter(|(path, _)| add.iter().any(|(p, _)| p.as_slice() == path.as_bytes())).map(|(_, l)| l.clone()).collect();
+          with_trailers(c.rest.clone(), &said)
+        };
+        let id = Commit { parents, rest, changes: whole }.store(store)?;
+        root_of(store, &id)?;
+        parents = vec![id];
+        made = Some(id);
       }
-      whole.sort_by(|a, b| a.0.cmp(&b.0));
-      let _ = std::fs::remove_file(incomplete_file(ws));
-      let made = Commit { parents: was.parents.clone(), rest: was.rest.clone(), changes: whole }.store(store)?;
+      let made = made.ok_or("nothing was made of the settling")?;
+      // Spent: the note of what was settled against, and of what the commits were made from.
+      let left = unsettled(ws);
+      set_settling(ws, &settling(ws).into_iter().filter(|(path, _)| left.contains(path)).collect::<Vec<_>>())?;
+      set_incomplete(ws, None, &[])?;
+      let last_was = ws.base;
       // The settling does not answer for the message: what was said of its base still stands.
-      if let Some((moved, under)) = moved_under(ws).filter(|(id, _)| *id == short) {
-        let _ = moved;
+      if let Some((_, under)) = moved_under(ws).filter(|(id, _)| Some(*id) == last_was || *id == short) {
         set_moved(ws, Some(made), &under)?;
       }
       made
     }
-    _ => Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?,
+    _ => {
+      let rest = with_settled(store, ws, rest, &changes)?;
+      Commit { parents: ws.base.into_iter().collect(), rest, changes }.store(store)?
+    }
   };
   root_of(store, &id)?;
   // What came after the state, recorded again on the new commit.
@@ -2163,8 +2321,13 @@ pub fn rebuild(store: &mut Store, ws: &mut Workspace, plan: &[(Id, Vec<u8>)], au
     root_of(store, &id)?;
     Ok(Some(id))
   };
+  let mut start = 0;
   for ((_, rest), end) in plan.iter().zip(&ends) {
-    if let Some(id) = next(store, on, chain[*end].0, rest.clone())? {
+    // What the commits it is made of said they settled, it says too.
+    let settled: Vec<String> = chain[start..=*end].iter().flat_map(|(_, c)| settled_lines(&c.rest)).collect();
+    start = end + 1;
+    let rest = with_trailers(rest.clone(), &settled);
+    if let Some(id) = next(store, on, chain[*end].0, rest)? {
       made.push(id);
       on = Some(id);
     }
@@ -2406,6 +2569,14 @@ pub fn restore_to(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
 
 /// `restore_to` without asking whether the state knows of what the ref has.
 fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &str, look: Look) -> Result<Restored> {
+  restore_noted(store, ws, target, author, look, None)
+}
+
+/// `restore_across`; `undo`, for the undo of a catching-up: a note of it is left before the first
+/// file is written, and where one is left already, the files are half written and not looked at:
+/// what was recorded when that undo began is what it goes on from.
+fn restore_noted(store: &mut Store, ws: &mut Workspace, target: Id, author: &str, look: Look, undo: Option<&str>) -> Result<Restored> {
+  let resuming = undo.is_some() && undoing(ws).exists();
   let before = ws.head;
   if look == Look::Recorded {
     let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
@@ -2413,9 +2584,28 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
     let differing: Vec<Vec<u8>> = crate::manifest::diff(store, from, to)?.into_iter().map(|(path, _)| path).collect();
     ws.note(&differing)?;
   }
-  let (_, looked) = snapshot_looking(store, ws, author, look)?;
-  let kept = ws.head.filter(|head| Some(*head) != before);
-  let from = match ws.head {
+  let looked = if resuming { Looked::default() } else { snapshot_looking(store, ws, author, look)?.1 };
+  // The state the undo goes from, in the note: resumed, it writes all of what differs from there
+  // again, and puts it in the index, wherever the kill came (the workspace may already say it is
+  // at the state gone back to, with the index not yet).
+  if let Some(note) = undo.filter(|_| !resuming) {
+    store.flush()?;
+    let from = ws.head.map_or("-".to_string(), |id| hex(&id));
+    crate::write_whole(&undoing(ws), format!("{} {from}\n", note.trim_end()))?;
+  }
+  let went_from = if resuming {
+    std::fs::read_to_string(undoing(ws))
+      .ok()
+      .and_then(|text| text.split_whitespace().nth(2).and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok()))
+      .filter(|id| store.get(id).is_ok_and(|bytes| bytes.is_some()))
+  } else {
+    None
+  };
+  // What was on disk and not committed, recorded now or already (a push records it too): the
+  // state left behind, by its id (thirteenth round).
+  let _ = before;
+  let kept = went_from.or(ws.head).filter(|head| Some(*head) != ws.base && *head != target);
+  let from = match went_from.or(ws.head) {
     Some(head) => root_of(store, &head)?,
     None => None,
   };
@@ -2528,6 +2718,48 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
       blocking.join(", ")
     ));
   }
+  // An undo finished from what was recorded writes over what is on disk without looking at it
+  // first. A file there that is neither what the undo went from nor what it goes to was edited
+  // after the undo was cut short: recorded first, on what it went from, and named as kept (fourth
+  // pass: the second run said it kept what was on disk, of a state without the edit).
+  if resuming {
+    let mut edited: Vec<(Vec<u8>, Option<Entry>)> = Vec::new();
+    for (path, entry) in &changes {
+      let full = ws.root.join(to_path(path));
+      let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+      if !meta.is_file() && !meta.file_type().is_symlink() {
+        continue;
+      }
+      let Ok((mode, bytes)) = read_content(&full, &meta) else { continue };
+      let id = object_id(Kind::Blob, &bytes);
+      let had = match from {
+        Some(root) => crate::manifest::lookup(store, root, path)?,
+        None => None,
+      };
+      let is = |e: &Option<Entry>| e.is_some_and(|e| e.mode == mode && e.id == id);
+      if !is(&had) && !is(entry) {
+        let id = store.put(Kind::Blob, &bytes, had.map(|e| e.id))?;
+        edited.push((path.clone(), Some(Entry { mode, id })));
+      }
+    }
+    if let (false, Some(went)) = (edited.is_empty(), went_from.or(ws.head)) {
+      let rest = rest_of(author, "what was on disk, edited after an undo was cut short, before the undo was finished");
+      let id = Commit { parents: vec![went], rest, changes: edited }.store(store)?;
+      root_of(store, &id)?;
+      store.flush()?;
+      ws.log("snapshot", &id)?;
+      // The undo goes on from that state now: killed again, the next run starts from it, and
+      // names it (fifth pass: it named the first run's, which did not have the edit).
+      if let Ok(text) = std::fs::read_to_string(undoing(ws)) {
+        let mut fields: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+        if fields.len() >= 3 {
+          fields[2] = hex(&id);
+          crate::write_whole(&undoing(ws), format!("{}\n", fields.join(" ")))?;
+        }
+      }
+      done.kept = Some(id);
+    }
+  }
   // The rules of what is left out, when a restore changes them, change which files there are to
   // record: the next command that trusts reported writes is told, and looks at everything.
   let rules: Vec<Vec<u8>> = changes
@@ -2597,6 +2829,15 @@ impl Standing {
   }
 
   pub(crate) fn keep(&self, ws: &Workspace) -> Result<()> {
+    // What `nv git add` had staged, which undoing the catching-up gives back as it was.
+    let staged = ws.root.join(META).join("git-staged");
+    let kept = ws.root.join(META).join("before-sync-staged");
+    match std::fs::read(&staged) {
+      Ok(bytes) => crate::write_whole(&kept, bytes)?,
+      Err(_) => {
+        let _ = std::fs::remove_file(&kept);
+      }
+    }
     let id = |id: Option<Id>| id.map_or("-".to_string(), |id| hex(&id));
     crate::write_whole(&Self::file(ws), format!("{} {} {} {}\n", id(self.head), id(self.base), id(self.pushed), self.seq))
   }
@@ -2618,6 +2859,7 @@ impl Standing {
 
   pub(crate) fn forget(ws: &Workspace) {
     let _ = std::fs::remove_file(Self::file(ws));
+    let _ = std::fs::remove_file(ws.root.join(META).join("before-sync-staged"));
   }
 
   pub fn kept(ws: &Workspace) -> Option<Standing> {
@@ -2644,19 +2886,40 @@ pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, 
   let head = was.head.ok_or("before it caught up, this workspace had no commit to go back to")?;
   // Commits made since, or another branch gone to, are not part of that catching-up, and undoing
   // it would drop them without a word.
-  if let Some(left) = Standing::left_at(ws)
+  // An undo cut short is finished, wherever it had got to.
+  let resuming = undoing(ws).exists();
+  if !resuming
+    && let Some(left) = Standing::left_at(ws)
     && ws.base != Some(left)
   {
     return Err(
       "this workspace has committed, or moved to other commits, since it last caught up: undoing that catching-up now would drop what was done since.\nTo set this workspace's unpushed work aside instead: nv restore <dir> pushed".to_string(),
     );
   }
-  let based = ws.base;
-  let done = restore_across(store, ws, head, author, look)?;
+  // Where the workspace stood at the stop, for the branch to be taken back from: kept in the note,
+  // as a kill may come after the workspace says it is back.
+  let based = match std::fs::read_to_string(undoing(ws)) {
+    Ok(text) => text.split_whitespace().nth(1).and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok()),
+    Err(_) => ws.base,
+  };
+  let note = format!("{} {}\n", hex(&head), based.map_or("-".to_string(), |id| hex(&id)));
+  let done = restore_noted(store, ws, head, author, look, Some(&note))?;
   (ws.base, ws.pushed, ws.seq) = (was.base, was.pushed, was.seq);
   ws.save()?;
   take_branch_along(store, ws, based)?;
   set_unsettled(ws, &[])?;
+  set_settling(ws, &[])?;
+  set_incomplete(ws, None, &[])?;
+  // The index as it was before the catching-up, as `git rebase --abort` leaves it: what was added
+  // while the pull stood stopped is not staged on the commit gone back to (thirteenth round).
+  let staged = ws.root.join(META).join("git-staged");
+  match std::fs::read(ws.root.join(META).join("before-sync-staged")) {
+    Ok(bytes) => crate::write_whole(&staged, bytes)?,
+    Err(_) => {
+      let _ = std::fs::remove_file(&staged);
+    }
+  }
+  let _ = std::fs::remove_file(undoing(ws));
   Ok(done)
 }
 
@@ -2691,11 +2954,227 @@ pub fn set_aside(store: &mut Store, ws: &mut Workspace, author: &str, look: Look
   ws.save()?;
   take_branch_along(store, ws, based)?;
   set_unsettled(ws, &[])?;
+  set_settling(ws, &[])?;
+  set_incomplete(ws, None, &[])?;
+  // Staged against commits the workspace is no longer on.
+  let _ = std::fs::remove_file(ws.root.join(META).join("git-staged"));
   if let Some(was) = was {
     ws.log("set-aside", &was)?;
   }
   done.kept = was;
   Ok(done)
+}
+
+/// What a sync left with both versions, and the commits of others' it met there: for the commit
+/// that settles each file to say so (`Settled:`), as a history read later can find out no other way.
+fn settling_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("settling")
+}
+
+fn settling(ws: &Workspace) -> Vec<(String, Vec<String>)> {
+  std::fs::read_to_string(settling_file(ws))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| {
+      let (path, against) = line.split_once('\t')?;
+      Some((unnoted(path), against.split('\t').filter(|a| !a.is_empty()).map(str::to_string).collect()))
+    })
+    .collect()
+}
+
+fn set_settling(ws: &Workspace, entries: &[(String, Vec<String>)]) -> Result<()> {
+  if entries.is_empty() {
+    let _ = std::fs::remove_file(settling_file(ws));
+    return Ok(());
+  }
+  let text: String = entries.iter().map(|(path, against)| format!("{}\t{}\n", noted(path), against.join("\t"))).collect();
+  crate::write_whole(&settling_file(ws), text)
+}
+
+/// Note, of each of `paths` a sync left with both versions, the commits on the way back from
+/// `tip` to `common` that changed it: what it was settled against, by Git's id and summary line.
+/// Where a Git id cannot be had, nv's is given, and said to be nv's.
+pub(crate) fn note_settling(store: &mut Store, ws: &Workspace, tip: Id, common: Option<Id>, paths: &[String]) -> Result<()> {
+  if paths.is_empty() {
+    return Ok(());
+  }
+  let mut met: Vec<(String, Vec<Id>)> = paths.iter().map(|p| (p.clone(), Vec::new())).collect();
+  let (mut at, mut walked) = (Some(tip), 0);
+  while let Some(id) = at.filter(|id| Some(*id) != common && walked < 100_000) {
+    let commit = Commit::load(store, &id)?;
+    for (path, ids) in met.iter_mut() {
+      if commit.changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()) {
+        ids.insert(0, id);
+      }
+    }
+    at = commit.parents.first().copied();
+    walked += 1;
+  }
+  let mut all = settling(ws);
+  for (path, ids) in met {
+    let mut against = Vec::new();
+    for id in ids {
+      let named = match crate::git::git_id_of(store, &id) {
+        Ok(oid) => hex(&oid)[..7].to_string(),
+        Err(_) => format!("nv {}", &hex(&id)[..12]),
+      };
+      let said = String::from_utf8_lossy(&Commit::load(store, &id)?.rest).into_owned();
+      let subject = said.split_once("\n\n").and_then(|(_, m)| m.lines().next()).unwrap_or_default().to_string();
+      against.push(format!("{named} ({subject})"));
+    }
+    match all.iter_mut().find(|(p, _)| *p == path) {
+      Some((_, known)) => known.extend(against.into_iter().filter(|a| !known.contains(a)).collect::<Vec<_>>()),
+      None => all.push((path, against)),
+    }
+  }
+  set_settling(ws, &all)
+}
+
+/// A commit's message, with a `Settled:` line for each file it holds that a sync left with both
+/// versions, now settled: which, and against whose commits. Those are then no longer noted.
+fn with_settled(_store: &mut Store, ws: &Workspace, rest: Vec<u8>, changes: &[Change]) -> Result<Vec<u8>> {
+  let all = settling(ws);
+  if all.is_empty() {
+    return Ok(rest);
+  }
+  let left = unsettled(ws);
+  let (taken, kept): (Vec<_>, Vec<_>) =
+    all.into_iter().partition(|(path, _)| !left.contains(path) && changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()));
+  if taken.is_empty() {
+    return Ok(rest);
+  }
+  let lines: Vec<String> = taken
+    .iter()
+    .map(
+      |(path, against)| {
+        if against.is_empty() { format!("Settled: {path}") } else { format!("Settled: {path} with {}", against.join(", ")) }
+      },
+    )
+    .collect();
+  set_settling(ws, &kept)?;
+  Ok(with_trailers(rest, &lines))
+}
+
+/// The message of two commits as one: their summary lines joined by `; `, their bodies one after
+/// the other, under the author and committer of the second.
+fn joined_rest(first: &[u8], second: &[u8]) -> Vec<u8> {
+  let split = |rest: &[u8]| -> (String, String, String) {
+    let said = String::from_utf8_lossy(rest).into_owned();
+    let (head, message) = said.split_once("\n\n").map_or((said.clone(), String::new()), |(h, m)| (h.to_string(), m.trim_end().to_string()));
+    let (subject, body) = message.split_once("\n\n").map_or((message.clone(), String::new()), |(s, b)| (s.to_string(), b.to_string()));
+    (head, subject.lines().next().unwrap_or_default().trim().to_string(), body.trim().to_string())
+  };
+  let ((_, s1, b1), (head, s2, b2)) = (split(first), split(second));
+  let subject = if s1.is_empty() || s1 == s2 { s2 } else { format!("{s1}; {s2}") };
+  let bodies: Vec<String> = [b1, b2].into_iter().filter(|b| !b.is_empty()).collect();
+  let message = if bodies.is_empty() { subject } else { format!("{subject}\n\n{}", bodies.join("\n\n")) };
+  format!("{head}\n\n{message}\n").into_bytes()
+}
+
+/// The commits a sync put on the tip with nothing in them until the files it held out of them
+/// are settled: what a settling made a commit of its own would leave empty.
+pub fn waiting_on_settling(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
+  let Some(into) = settles_into(&ws.root) else { return Ok(Vec::new()) };
+  let from = made_from(ws);
+  Ok(
+    pending(store, ws)?
+      .into_iter()
+      .filter(|(id, c)| c.changes.is_empty() && (from.contains_key(id) || *id == into))
+      .map(|(_, c)| {
+        let said = String::from_utf8_lossy(&c.rest).into_owned();
+        said.split_once("\n\n").map_or("", |(_, m)| m).trim().lines().next().unwrap_or_default().to_string()
+      })
+      .collect(),
+  )
+}
+
+/// The trailer of each file settled among these changes, by path: what `with_settled` would add.
+fn settling_lines(ws: &Workspace, changes: &[Change]) -> Vec<(String, String)> {
+  let left = unsettled(ws);
+  settling(ws)
+    .into_iter()
+    .filter(|(path, _)| !left.contains(path) && changes.iter().any(|(changed, _)| changed.as_slice() == path.as_bytes()))
+    .map(|(path, against)| {
+      let line = if against.is_empty() { format!("Settled: {path}") } else { format!("Settled: {path} with {}", against.join(", ")) };
+      (path, line)
+    })
+    .collect()
+}
+
+/// For each of the commits before the one a settling completes, the settled files it changed
+/// before the sync, as it would have them settled: three-way, from the version the last of them
+/// had, to this commit's own, and to the settling. A file that does not merge clean is left as
+/// the tip has it, as before: those commits are what the sync made of them.
+fn earlier_settled(store: &mut Store, ws: &Workspace, earlier: &[(Id, Commit)], short: Id, settled: &[Change]) -> Result<Vec<Vec<Change>>> {
+  let mut out = vec![Vec::new(); earlier.len()];
+  let from = made_from(ws);
+  let Some(last) = from.get(&short).copied() else { return Ok(out) };
+  let last_root = root_of(store, &last)?;
+  let content = |store: &mut Store, entry: Option<Entry>| -> Result<std::sync::Arc<Vec<u8>>> {
+    match entry {
+      Some(entry) => store.get(&entry.id)?.ok_or_else(|| format!("the content {} is missing", hex(&entry.id))),
+      None => Ok(Default::default()),
+    }
+  };
+  for (path, entry) in settled {
+    let Some(settling) = entry.filter(|e| e.mode & 0o170000 == 0o100000) else { continue };
+    let had = match last_root {
+      Some(root) => crate::manifest::lookup(store, root, path)?,
+      None => None,
+    };
+    for (k, (id, _)) in earlier.iter().enumerate() {
+      let Some(origin) = from.get(id) else { continue };
+      let Some((_, Some(own))) = Commit::load(store, origin)?.changes.into_iter().find(|(p, _)| p == path) else { continue };
+      if own.mode & 0o170000 != 0o100000 {
+        continue;
+      }
+      let (base, ours, theirs) = (content(store, had)?, content(store, Some(own))?, content(store, Some(settling))?);
+      if base.contains(&0) || ours.contains(&0) || theirs.contains(&0) {
+        continue;
+      }
+      let (text, clean) = crate::drivers::merge_file_marked(&ws.root, path, &base, &ours, &theirs)?;
+      if clean {
+        let id = store.put(Kind::Blob, &text, Some(own.id))?;
+        out[k].push((path.clone(), Some(Entry { mode: own.mode, id })));
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// `rest` with these lines at the end of its message, as Git's trailers are, those it has already
+/// left out.
+pub(crate) fn with_trailers(rest: Vec<u8>, lines: &[String]) -> Vec<u8> {
+  let said = String::from_utf8_lossy(&rest).into_owned();
+  let new: Vec<&String> = lines.iter().filter(|line| !said.lines().any(|l| l == line.as_str())).collect();
+  if new.is_empty() {
+    return rest;
+  }
+  let body = said.trim_end();
+  // After a paragraph of trailers, more of them; after anything else, a paragraph of their own.
+  let last = body.rsplit("\n\n").next().unwrap_or_default();
+  let trailing = !last.is_empty() && last.lines().all(|l| l.starts_with("Settled: "));
+  let joined = new.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+  format!("{body}{}{joined}\n", if trailing { "\n" } else { "\n\n" }).into_bytes()
+}
+
+/// The `Settled:` lines of a commit's message.
+pub(crate) fn settled_lines(rest: &[u8]) -> Vec<String> {
+  String::from_utf8_lossy(rest).lines().filter(|l| l.starts_with("Settled: ")).map(str::to_string).collect()
+}
+
+/// A path as one line of a note: as it is, unless a newline, a tab or the escape's own prefix
+/// would make it something else; then in hex, after `x:`.
+fn noted(path: &str) -> String {
+  if path.contains(['\n', '\r', '\t']) || path.starts_with("x:") { format!("x:{}", hex(path.as_bytes())) } else { path.to_string() }
+}
+
+/// A path from one line of a note.
+fn unnoted(line: &str) -> String {
+  match line.strip_prefix("x:").and_then(unhex) {
+    Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    None => line.to_string(),
+  }
 }
 
 fn unsettled_file(ws: &Workspace) -> PathBuf {
@@ -2735,12 +3214,144 @@ fn incomplete_file(ws: &Workspace) -> PathBuf {
 /// left holding both versions, and which they are: the commit their settling completes.
 pub(crate) fn set_incomplete(ws: &Workspace, commit: Option<Id>, paths: &[String]) -> Result<()> {
   match commit.filter(|_| !paths.is_empty()) {
-    Some(id) => crate::write_whole(&incomplete_file(ws), format!("{}\n{}\n", hex(&id), paths.join("\n"))),
+    Some(id) => {
+      crate::write_whole(&incomplete_file(ws), format!("{}\n{}\n", hex(&id), paths.iter().map(|p| noted(p)).collect::<Vec<_>>().join("\n")))
+    }
     None => {
       let _ = std::fs::remove_file(incomplete_file(ws));
+      let _ = std::fs::remove_file(made_from_file(ws));
       Ok(())
     }
   }
+}
+
+fn made_from_file(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("incomplete-from")
+}
+
+/// Note which commit of this workspace's own each commit a sync put on the tip was made from,
+/// for a settling to give the earlier ones their versions of the files it settles.
+pub(crate) fn set_made_from(ws: &Workspace, pairs: &[(Id, Id)]) -> Result<()> {
+  if pairs.is_empty() {
+    let _ = std::fs::remove_file(made_from_file(ws));
+    return Ok(());
+  }
+  crate::write_whole(&made_from_file(ws), pairs.iter().map(|(made, from)| format!("{} {}\n", hex(made), hex(from))).collect::<String>())
+}
+
+/// For each commit not pushed that a sync put on the tip, the files it changed that the sync
+/// holds out of it until they are settled.
+pub fn held_out(store: &mut Store, ws: &Workspace) -> Result<std::collections::HashMap<Id, Vec<String>>> {
+  let left = unsettled(ws);
+  let mut out = std::collections::HashMap::new();
+  if left.is_empty() {
+    return Ok(out);
+  }
+  for (made, from) in made_from(ws) {
+    let paths: Vec<String> = Commit::load(store, &from)?
+      .changes
+      .iter()
+      .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+      .filter(|path| left.contains(path))
+      .collect();
+    if !paths.is_empty() {
+      out.insert(made, paths);
+    }
+  }
+  Ok(out)
+}
+
+fn made_from(ws: &Workspace) -> std::collections::HashMap<Id, Id> {
+  let id = |text: &str| unhex(text).and_then(|b| <Id>::try_from(b.as_slice()).ok());
+  std::fs::read_to_string(made_from_file(ws))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.split_once(' ').and_then(|(made, from)| Some((id(made)?, id(from)?))))
+    .collect()
+}
+
+/// The commit a settling is noted to complete, as noted: whether it still can is `incomplete`'s.
+pub fn settles_into(root: &Path) -> Option<Id> {
+  let text = std::fs::read_to_string(root.join(META).join("incomplete")).ok()?;
+  text.lines().next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())
+}
+
+/// A commit's header and trailers under another message: who wrote it stays, who commits it is
+/// whoever does now.
+fn reworded(rest: &[u8], message: &str, committer: &str) -> Vec<u8> {
+  let said = String::from_utf8_lossy(rest).into_owned();
+  let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
+  let author = head.lines().find(|l| l.starts_with("author ")).unwrap_or_default();
+  let new = format!("{author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes();
+  with_trailers(new, &settled_lines(rest))
+}
+
+/// For `nv commit` given no message: where a sync left files out of a commit of this workspace's
+/// own and the files now differ from that commit's only in those, they complete it, under its
+/// message, as `git rebase --continue` keeps the message of the commit that stopped. `Ok(None)`
+/// where there is no such commit; an error that names them where other files changed too.
+pub fn complete_settling(
+  store: &mut Store,
+  ws: &mut Workspace,
+  author: &str,
+  look: Look,
+  reword: Option<(&str, &str)>,
+) -> Result<Option<Id>> {
+  let Some((_, paths)) = incomplete(store, ws)? else { return Ok(None) };
+  snapshot(store, ws, author, look)?;
+  let state = ws.head.ok_or("nothing to commit")?;
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let (from, to) = (tree(store, ws.base)?, tree(store, Some(state))?);
+  let whole = whole_since(store, Some(state), ws.base)?;
+  let changes = crate::manifest::diff_keeping(store, from, to, &whole)?;
+  let other: Vec<String> =
+    changes.iter().filter(|(path, _)| !paths.contains(path)).map(|(path, _)| String::from_utf8_lossy(path).into_owned()).collect();
+  if !other.is_empty() {
+    return Err(format!(
+      "a commit needs a message: given none, a commit completes the one a sync left the settling out of, with nothing else, and these changed besides: {}",
+      other.join(", ")
+    ));
+  }
+  commit_state_with(store, ws, state, Vec::new(), author, reword, false)
+}
+
+/// `complete_settling` for `nv git commit` and `git rebase --continue`: what the index has, the
+/// commit's files with `staged` on them, completes the commit the sync held files out of, and
+/// nothing else on disk goes in; it stays as it is, a change not committed. `Ok(None)` where there
+/// is no such commit; an error that names them where a file held out of it is not among `staged`.
+pub fn complete_settling_staged(
+  store: &mut Store,
+  ws: &mut Workspace,
+  staged: Vec<Change>,
+  author: &str,
+  reword: Option<(&str, &str)>,
+) -> Result<Option<Id>> {
+  let Some((_, paths)) = incomplete(store, ws)? else { return Ok(None) };
+  let missing: Vec<String> =
+    paths.iter().filter(|p| !staged.iter().any(|(s, _)| s == *p)).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+  if !missing.is_empty() {
+    return Err(format!(
+      "these were held out of the commit the pull stopped at, and are not added: {}. Settle them, `git add` them, and commit again",
+      missing.join(", ")
+    ));
+  }
+  // What is on disk, recorded; then the index's state on top of it, and what is on disk again on
+  // top of that, so that the state is one recorded since the last commit.
+  snapshot(store, ws, author, Look::Everywhere)?;
+  let head = ws.head.ok_or("nothing to commit")?;
+  let tree = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
+  let indexed = Commit { parents: ws.base.into_iter().collect(), rest: rest_of(author, "snapshot"), changes: staged }.store(store)?;
+  let (on_disk, wanted) = (tree(store, Some(head))?, tree(store, Some(indexed))?);
+  let forth = crate::manifest::diff(store, on_disk, wanted)?;
+  let state = carry(store, head, forth, author)?;
+  let back = crate::manifest::diff(store, wanted, on_disk)?;
+  let now = if back.is_empty() { state } else { carry(store, state, back, author)? };
+  // Stored before the workspace names it (second pass: killed between the two, the workspace
+  // named a commit that was never written, and nothing could open it again).
+  store.flush()?;
+  ws.head = Some(now);
+  ws.save()?;
+  commit_state_with(store, ws, state, Vec::new(), author, reword, true)
 }
 
 /// The commit a settling completes, and the paths it was left without, while that commit is
@@ -2749,10 +3360,113 @@ fn incomplete(store: &mut Store, ws: &Workspace) -> Result<Option<(Id, Vec<Vec<u
   let Ok(text) = std::fs::read_to_string(incomplete_file(ws)) else { return Ok(None) };
   let mut lines = text.lines();
   let Some(id) = lines.next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok()) else { return Ok(None) };
-  if ws.base != Some(id) || unheard(ws).exists() || pending(store, ws)?.last().map(|(c, _)| *c) != Some(id) {
+  // One of the commits not pushed (a sync puts them on the tip one by one, and a clash is the
+  // one's that changed the file); those after it are made again on top when it is completed.
+  if unheard(ws).exists() || !pending(store, ws)?.iter().any(|(c, _)| *c == id) {
     return Ok(None);
   }
-  Ok(Some((id, lines.map(|l| l.as_bytes().to_vec()).collect())))
+  Ok(Some((id, lines.map(|l| unnoted(l).into_bytes()).collect())))
+}
+
+/// The files a sync held out of a commit of this workspace's own that are settled on disk and not
+/// yet in it: until that commit is completed, or the sync undone, as unfinished as markers. A push
+/// would carry the commit without them, and a sync would put it on the tip so.
+pub fn settled_uncommitted(store: &mut Store, ws: &Workspace) -> Result<Vec<String>> {
+  let Some((_, paths)) = incomplete(store, ws)? else { return Ok(Vec::new()) };
+  let base = match ws.base {
+    Some(base) => root_of(store, &base)?,
+    None => None,
+  };
+  let mut out = Vec::new();
+  for path in paths {
+    let had = match base {
+      Some(root) => crate::manifest::lookup(store, root, &path)?,
+      None => None,
+    };
+    let had = match had.filter(|e| !e.is_dir()) {
+      Some(entry) => store.get(&entry.id)?.map(|bytes| bytes.to_vec()),
+      None => None,
+    };
+    let at = ws.root.join(std::ffi::OsStr::from_bytes(&path));
+    let now = match std::fs::symlink_metadata(&at) {
+      Ok(meta) if meta.file_type().is_symlink() => std::fs::read_link(&at).ok().map(|l| l.into_os_string().into_encoded_bytes()),
+      Ok(meta) if meta.is_file() => std::fs::read(&at).ok(),
+      _ => None,
+    };
+    if had != now {
+      out.push(String::from_utf8_lossy(&path).into_owned());
+    }
+  }
+  Ok(out)
+}
+
+/// The paths `nv git add` (or `rm`) staged apart from what the last commit has.
+pub fn staged_paths(root: &Path) -> Vec<Vec<u8>> {
+  std::fs::read_to_string(root.join(META).join("git-staged"))
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.split(' ').next().and_then(unhex))
+    .collect()
+}
+
+/// Of the paths staged apart, those the index has otherwise than the commit the workspace is on:
+/// one committed already (a completion killed before it cleared the staging) is staged no more.
+pub fn staged_apart(store: &mut Store, ws: &Workspace) -> Result<Vec<Vec<u8>>> {
+  let text = std::fs::read_to_string(ws.root.join(META).join("git-staged")).unwrap_or_default();
+  let base = match ws.base {
+    Some(base) => root_of(store, &base)?,
+    None => None,
+  };
+  let mut out = Vec::new();
+  for line in text.lines() {
+    let mut fields = line.split(' ');
+    let Some(path) = fields.next().and_then(unhex) else { continue };
+    let staged = match (fields.next().and_then(|m| u32::from_str_radix(m, 8).ok()), fields.next().and_then(unhex)) {
+      (Some(mode), Some(id)) => Id::try_from(id).ok().map(|id| Entry { mode, id }),
+      _ => None,
+    };
+    let had = match base {
+      Some(root) => crate::manifest::lookup(store, root, &path)?,
+      None => None,
+    };
+    if had != staged {
+      out.push(path);
+    }
+  }
+  Ok(out)
+}
+
+/// The entries staged for these paths, as `nv git add` left them (`None` for a removal).
+pub fn staged_entries(root: &Path, paths: &[Vec<u8>]) -> Vec<(Vec<u8>, Option<Entry>)> {
+  let text = std::fs::read_to_string(root.join(META).join("git-staged")).unwrap_or_default();
+  text
+    .lines()
+    .filter_map(|line| {
+      let mut fields = line.split(' ');
+      let path = fields.next().and_then(unhex)?;
+      if !paths.contains(&path) {
+        return None;
+      }
+      let entry = match (fields.next().and_then(|m| u32::from_str_radix(m, 8).ok()), fields.next().and_then(unhex)) {
+        (Some(mode), Some(id)) => Id::try_from(id).ok().map(|id| Entry { mode, id }),
+        _ => None,
+      };
+      Some((path, entry))
+    })
+    .collect()
+}
+
+/// Take these paths out of what `nv git add` staged: they are again as the last commit has them,
+/// to the index, and what is on disk is a change not staged.
+pub fn unstage(root: &Path, paths: &[Vec<u8>]) -> Result<()> {
+  let file = root.join(META).join("git-staged");
+  let Ok(text) = std::fs::read_to_string(&file) else { return Ok(()) };
+  let kept: String = text
+    .lines()
+    .filter(|line| line.split(' ').next().and_then(unhex).is_none_or(|path| !paths.contains(&path)))
+    .map(|line| format!("{line}\n"))
+    .collect();
+  crate::write_whole(&file, kept)
 }
 
 /// Note the files a sync left holding both versions between markers.
@@ -2761,7 +3475,7 @@ pub(crate) fn set_unsettled(ws: &Workspace, paths: &[String]) -> Result<()> {
     let _ = std::fs::remove_file(unsettled_file(ws));
     return Ok(());
   }
-  crate::write_whole(&unsettled_file(ws), paths.join("\n") + "\n")
+  crate::write_whole(&unsettled_file(ws), paths.iter().map(|p| noted(p) + "\n").collect::<String>())
 }
 
 /// The files a sync left for someone to settle that still hold its markers.
@@ -2772,7 +3486,7 @@ pub fn unsettled(ws: &Workspace) -> Vec<String> {
     std::fs::read(ws.root.join(path))
       .is_ok_and(|bytes| bytes.split(|&b| b == b'\n').any(|line| line.starts_with(b"<<<<<<< yours") || line.starts_with(b">>>>>>> theirs")))
   };
-  let left: Vec<String> = listed.lines().filter(marked).map(str::to_string).collect();
+  let left: Vec<String> = listed.lines().map(unnoted).filter(|p| marked(&p.as_str())).collect();
   let _ = set_unsettled(ws, &left);
   left
 }

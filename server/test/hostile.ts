@@ -326,5 +326,129 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
   const landed = (await said.json()) as { status: string; merged?: string[] };
   assert.equal(said.status, 200, JSON.stringify(landed));
   assert.deepEqual(landed.merged, ["list"]);
+  // Sent again, it is told what it was told: merged, and what (thirteenth round).
+  said = await pushStated(stated([["list", start]], [[".gitattributes", rules]]), mine, m.bytes, start.bytes, rules.bytes);
+  const again = (await said.json()) as { status: string; merged?: string[]; commit?: string };
+  assert.deepEqual([again.merged, again.commit], [["list"], (landed as { commit?: string }).commit]);
+}
+
+// ---------------------------------------------------------------- the thirteenth round
+{
+  // What follows a commit's tree and parents in Git's commit is its author, committer and message:
+  // a `parent` or `tree` line there would give every client a Git history it cannot walk.
+  const tipNow = await tip();
+  const withRest = (said: Uint8Array) =>
+    encode({ parents: [Uint8Array.from(tipNow.tip.match(/../g)!.map((b) => parseInt(b, 16)))], rest: said, changes: [{ path: text("r.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }] });
+  for (const [what, said] of [
+    ["a parent line", text(`parent ${"ab".repeat(20)}\nauthor t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["a parent line after the author", text(`author t <t@example.com> 1 +0000\nparent ${"ab".repeat(20)}\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["a tree line", text(`author t <t@example.com> 1 +0000\ntree ${"ab".repeat(20)}\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["nothing", text("")],
+    ["no author", text("committer t <t@example.com> 1 +0000\n\nm\n")],
+    ["a NUL in the header", text("author t <t@example.com> 1 +0000\ncommitter t\0 <t@example.com> 1 +0000\n\nm\n")],
+    // And what Git's fsck refuses (second pass).
+    ["no committer", text("author t <t@example.com> 1 +0000\n\nm\n")],
+    ["a committer that is not one", text("author t <t@example.com> 1 +0000\ncommitter garbage\n\nm\n")],
+    ["a date that is not one", text("author t <t@example.com> x +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["a time zone that is not one", text("author t <t@example.com> 1 +00\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["two authors", text("author t <t@example.com> 1 +0000\nauthor t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["no email", text("author R\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["no end", text("author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000")],
+    // Past what a time_t holds, which Git's fsck calls an overflow (third pass).
+    ["a date past a time_t", text("author t <t@example.com> 9223372036854775808 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+  ] as [string, Uint8Array][]) {
+    assert.equal((await push("main", withRest(said), good)).status, 400, `a commit whose header has ${what} was taken`);
+  }
+  assert.deepEqual(await tip(), tipNow);
+
+  // A link is written where the link's content says it leads: nothing a file system cannot write.
+  for (const [what, target] of [["5,000 bytes", text("x".repeat(5000))], ["a NUL", bytes(0x61, 0, 0x62)], ["nothing", text("")]] as [string, Uint8Array][]) {
+    const refused = await push("main", commit(tipNow.tip, [{ path: text("l"), entry: { mode: 0o120000, id: blobIdOf(target) } }]), target);
+    assert.equal(refused.status, 400, `a link to ${what} was taken`);
+  }
+  assert.deepEqual(await tip(), tipNow);
+
+  // An empty file is a content like any other, asked for alone.
+  const empty = text("");
+  const landed = await push("main", commit(tipNow.tip, [{ path: text("empty.txt"), entry: { mode: 0o100644, id: blobIdOf(empty) } }]), empty);
+  assert.equal(landed.status, 200, await landed.text());
+  const handed = await fetch(`${server}/${repo}/fetch/objects`, { method: "POST", body: hex(blobIdOf(empty)) + "\n" });
+  assert.equal(handed.status, 200, await handed.clone().text());
+  assert.equal((await fetch(`${server}/${repo}/objects/${hex(blobIdOf(empty))}`)).status, 200);
+
+  // A link below a directory is held to what a link may be when the directory is set, however its
+  // content came: by itself, in a push, or from another repository (third and fourth pass). And a
+  // directory holding such a link handed over does not make that content any less a file's.
+  for (const [what, target] of [["5,000 bytes", text("y".repeat(5000))], ["a NUL", bytes(0x63, 0, 0x64)], ["nothing", text("")]] as [string, Uint8Array][]) {
+    for (const how of ["put", "push", "adopted"]) {
+      const here = `t/hostile-link-${how}-${what.length}-${stamp}`;
+      const to = (path: string, init?: RequestInit) => fetch(`${server}/${here}/${path}`, init);
+      const first = await to("push/main", { method: "POST", body: frame(commit(null, [{ path: text("a.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }]), good) });
+      assert.equal(first.status, 200, await first.text());
+      const start = ((await (await to("refs/main")).json()) as { tip: string }).tip;
+      const holding = tree([0o120000, text("l"), blobIdOf(target)]);
+      assert.equal((await to("adopt/trees", { method: "POST", body: frame(holding) })).status, 200);
+      // The same bytes as a file of its own, as an honest writer has them.
+      const file = commit(start, [{ path: text("f.bin"), entry: { mode: 0o100644, id: blobIdOf(target) } }]);
+      if (how === "put") {
+        assert.equal((await to(`objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target })).status, 204, `${what} by itself`);
+        assert.equal((await to("push/main", { method: "POST", body: frame(file) })).status, 200, `a file of ${what}, after a link to it was handed over`);
+      } else if (how === "push") {
+        assert.equal((await to("push/main", { method: "POST", body: frame(file, target) })).status, 200, `a file of ${what}, after a link to it was handed over`);
+      } else {
+        const source = `t/hostile-link-source-${what.length}-${stamp}`;
+        assert.equal((await fetch(`${server}/${source}/objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target })).status, 204);
+        const asFile = tree([0o100644, text("x"), blobIdOf(target)]);
+        assert.equal((await fetch(`${server}/${source}/adopt/trees`, { method: "POST", body: frame(asFile) })).status, 200);
+        assert.equal((await to(`adopt/trees?from=/${source}`, { method: "POST", body: frame(asFile) })).status, 200);
+      }
+      const now = ((await (await to("refs/main")).json()) as { tip: string }).tip;
+      const set = await to("push/main", { method: "POST", body: frame(commit(now, [{ path: text("v"), entry: { mode: 0o40000, id: treeId(holding) } }])) });
+      assert.notEqual(set.status, 200, `a directory with a link to ${what}, its content come by ${how}, was set`);
+      assert.equal(((await (await to("refs/main")).json()) as { tip: string }).tip, now);
+    }
+  }
+
+  // A directory of shared directories names 2^k files in k+1 trees: more than a client could
+  // write is refused when it is handed over (fifth pass: 2^60 files in 3 KB were taken).
+  {
+    let bomb = tree([0o100644, text("f"), blobIdOf(good)]);
+    const chain = [bomb];
+    for (let k = 0; k < 30; k++) {
+      bomb = tree([0o40000, text("a"), treeId(bomb)], [0o40000, text("b"), treeId(bomb)]);
+      chain.push(bomb);
+    }
+    const handed = await adopt(...chain.reverse());
+    assert.equal(handed.status, 400, `a directory of 2^30 files was taken: ${await handed.text()}`);
+    // Handed over a little at a time, the count goes on from what was handed over before.
+    let small = tree([0o100644, text("f"), blobIdOf(good)]);
+    let parts = 0;
+    for (let k = 0; k < 30; k++) {
+      small = tree([0o40000, text("a"), treeId(small)], [0o40000, text("b"), treeId(small)]);
+      const answer = await adopt(small);
+      if (answer.status === 400) break;
+      parts++;
+    }
+    assert.ok(parts < 23, `a directory of 2^${parts} files was taken one level at a time`);
+    // At the bound, handed over; set twice by one push, twice the bound (sixth pass).
+    let full = tree([0o100644, text("f"), blobIdOf(good)]);
+    const levels = [full];
+    for (let k = 0; k < 22; k++) {
+      full = tree([0o40000, text("a"), treeId(full)], [0o40000, text("b"), treeId(full)]);
+      levels.push(full);
+    }
+    assert.equal((await adopt(...levels.reverse())).status, 200);
+    const now = await tip();
+    const twice = commit(now.tip, [
+      { path: text("x1"), entry: { mode: 0o40000, id: treeId(full) } },
+      { path: text("x2"), entry: { mode: 0o40000, id: treeId(full) } },
+    ]);
+    assert.equal((await push("main", twice)).status, 400, "a push setting twice the bound of files was taken");
+    assert.deepEqual(await tip(), now);
+  }
+
+  // A position is a number written as one.
+  for (const bad of ["0x1", "1e0", "+1", "%201", "01", "", "-0"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);
+  assert.equal((await fetch(`${server}/${repo}/since/main?after=-1`)).status, 200);
 }
 console.log("ok");

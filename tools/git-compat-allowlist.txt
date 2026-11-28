@@ -42,3 +42,12 @@
 40-paths-the-index-let-go.sh
 41-staged-files-nobody-walks-to.sh
 42-reset-hard-from-a-directory.sh
+43-merge-drivers.sh
+44-messages-and-diff-names.sh
+45-status-branch-line.sh
+46-clustered-short-options.sh
+47-remote.sh
+48-a-thirteenth-round.sh
+49-a-thirteenth-round-again.sh
+50-a-thirteenth-round-third-pass.sh
+51-a-thirteenth-round-fourth-pass.sh

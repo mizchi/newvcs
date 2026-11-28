@@ -78,6 +78,12 @@ export class Repo extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS live_by_path ON live (ref, path);
       CREATE TABLE IF NOT EXISTS path_index (ref TEXT NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, mode INTEGER, id BLOB, PRIMARY KEY (ref, path, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS links_awaited (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_links (tree BLOB NOT NULL, child BLOB NOT NULL, PRIMARY KEY (tree, child)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_sums (id BLOB PRIMARY KEY, files INTEGER NOT NULL, linked INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS links_checked (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS trees_whole (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS landed_merged (ref TEXT NOT NULL, sent BLOB NOT NULL, paths TEXT NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
     `);
   }
 
@@ -169,7 +175,17 @@ export class Repo extends DurableObject<Env> {
         // A chain with no parent was put on the tip as from the ref's start, as the first time.
         const base = parent ? sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, parent).toArray()[0]?.seq : 0;
         const behind = before.moved && base !== undefined ? Math.max(0, seq - chain.length - base) : 0;
-        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind, since: since() };
+        // And what the server merged of it, as it was told the first time (thirteenth round).
+        const merged = sql.exec<{ paths: string }>("SELECT paths FROM landed_merged WHERE ref = ? AND sent = ?", ref, sent).toArray()[0];
+        return {
+          status: before.moved ? "rebased" : "updated",
+          commit: hex(landed),
+          commits: ids.map((r) => hex(new Uint8Array(r.id))),
+          seq,
+          behind,
+          since: since(),
+          ...(merged ? { merged: JSON.parse(merged.paths) as string[] } : {}),
+        };
       }
 
       const parent = first.parents[0] ?? null;
@@ -363,6 +379,9 @@ export class Repo extends DurableObject<Env> {
       const base = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, commits[0]!.parents[0]!).toArray()[0]!.seq;
       sql.exec("DELETE FROM divergent WHERE ref = ? AND id = ?", ref, sent);
       const result = this.accept(ref, at, commits[0]!.parents[0] ?? null, remade, (i) => merged[i]!, new Uint8Array(at.tip), "rebased", at.seq - base, sent, () => (after === null ? [] : this.steps(ref, after)));
+      if (result.status === "rebased" || result.status === "updated") {
+        sql.exec("INSERT OR REPLACE INTO landed_merged (ref, sent, paths) VALUES (?, ?, ?)", ref, sent, JSON.stringify(unionPaths));
+      }
       return result;
     });
   }
@@ -405,11 +424,16 @@ export class Repo extends DurableObject<Env> {
   private whole(dirs: Uint8Array[]): void {
     const sql = this.ctx.storage.sql;
     const seen = new Set<string>();
+    const walked: Uint8Array[] = [];
     const todo = [...dirs];
     while (todo.length > 0) {
       const dir = todo.pop()!;
       if (seen.has(hex(dir))) continue;
       seen.add(hex(dir));
+      // Found whole before, it is whole still: what the repository was sent it keeps (fifth pass:
+      // a directory set again unchanged was walked again).
+      if (sql.exec("SELECT 1 FROM trees_whole WHERE id = ?", dir).toArray().length > 0) continue;
+      walked.push(dir);
       for (const row of sql.exec<{ child: ArrayBuffer; dir: number }>("SELECT child, dir FROM tree_entries WHERE tree = ?", dir).toArray()) {
         const child = new Uint8Array(row.child);
         if (row.dir) {
@@ -421,6 +445,7 @@ export class Repo extends DurableObject<Env> {
         }
       }
     }
+    for (const id of walked) sql.exec("INSERT OR IGNORE INTO trees_whole (id) VALUES (?)", id);
   }
 
   /// The longest path below a directory handed over, from its top.
@@ -429,9 +454,17 @@ export class Repo extends DurableObject<Env> {
   }
 
   /// Note what a directory handed over holds, and the longest path below it.
-  describe(id: Uint8Array, entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean }[], deepest: number): void {
+  describe(
+    id: Uint8Array,
+    entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean; link: boolean }[],
+    deepest: number,
+    files: number,
+    linked: boolean,
+  ): void {
     const sql = this.ctx.storage.sql;
+    sql.exec("INSERT OR REPLACE INTO tree_sums (id, files, linked) VALUES (?, ?, ?)", id, files, linked ? 1 : 0);
     for (const e of entries) {
+      if (e.link) sql.exec("INSERT OR IGNORE INTO tree_links (tree, child) VALUES (?, ?)", id, e.child);
       // Another repository's commit is neither: nothing below it is this repository's to have.
       sql.exec("INSERT OR IGNORE INTO tree_entries (tree, name, child, dir) VALUES (?, ?, ?, ?)", id, e.name, e.child, e.gitlink ? 2 : e.dir ? 1 : 0);
     }
@@ -443,6 +476,91 @@ export class Repo extends DurableObject<Env> {
     for (const c of contents) {
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO placed (id, pack, at, length) VALUES (?, ?, ?, ?)", c.id, c.pack, c.at, c.length);
     }
+  }
+
+  /// For each of these directories handed over: how many files it holds, whether a link may be
+  /// below it, and its longest path. One handed over before files were counted is counted now,
+  /// once, from what it was described as, and taken to hold links, as nothing noted them then
+  /// (sixth pass: such a directory counted as none, and bounded nothing built on it). One call for
+  /// all of them: an adopt asked once for each, and paid a round trip each time.
+  sumsOf(ids: Uint8Array[]): Map<string, { files: number; linked: boolean; deepest: number }> {
+    const sql = this.ctx.storage.sql;
+    const out = new Map<string, { files: number; linked: boolean; deepest: number }>();
+    const stack: { id: Uint8Array; children: Uint8Array[] | null }[] = ids.map((id) => ({ id, children: null }));
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      const key = hex(top.id);
+      if (out.has(key)) {
+        stack.pop();
+        continue;
+      }
+      const known = this.sums(top.id);
+      if (known) {
+        out.set(key, { ...known, deepest: this.deepest(top.id) });
+        stack.pop();
+        continue;
+      }
+      // Not a directory handed over at all: nothing to count, and nothing to note of it.
+      if (this.trees([top.id]).size === 0) {
+        out.set(key, { files: 0, linked: true, deepest: 0 });
+        stack.pop();
+        continue;
+      }
+      if (top.children === null) {
+        const rows = sql.exec<{ child: ArrayBuffer; dir: number }>("SELECT child, dir FROM tree_entries WHERE tree = ?", top.id).toArray();
+        top.children = rows.filter((r) => r.dir === 1).map((r) => new Uint8Array(r.child));
+        (top as { files?: number }).files = rows.filter((r) => r.dir !== 1).length;
+        for (const child of top.children) if (!out.has(hex(child))) stack.push({ id: child, children: null });
+        continue;
+      }
+      let files = (top as { files?: number }).files ?? 0;
+      for (const child of top.children) files += out.get(hex(child))?.files ?? 0;
+      sql.exec("INSERT OR REPLACE INTO tree_sums (id, files, linked) VALUES (?, ?, 1)", top.id, files);
+      out.set(key, { files, linked: true, deepest: this.deepest(top.id) });
+      stack.pop();
+    }
+    return out;
+  }
+
+  /// How many files a directory handed over holds, and whether a link is below it; `null` for one
+  /// handed over before these were counted.
+  sums(id: Uint8Array): { files: number; linked: boolean } | null {
+    const row = this.ctx.storage.sql.exec<{ files: number; linked: number }>("SELECT files, linked FROM tree_sums WHERE id = ?", id).toArray()[0];
+    return row ? { files: row.files, linked: row.linked === 1 } : null;
+  }
+
+  /// The contents of every link below these directories, walked as `whole` walks them: what a
+  /// push that sets one of them has to hold to what a link may be, however the content came.
+  linksBelow(dirs: Uint8Array[]): { links: Uint8Array[]; walked: Uint8Array[] } {
+    const sql = this.ctx.storage.sql;
+    const seen = new Set<string>();
+    const found = new Map<string, Uint8Array>();
+    const walked: Uint8Array[] = [];
+    const todo = [...dirs];
+    while (todo.length > 0) {
+      const dir = todo.pop()!;
+      if (seen.has(hex(dir))) continue;
+      seen.add(hex(dir));
+      // Nothing to look for below one with no link anywhere in it, nor below one whose links were
+      // found sound when it was set before: a link's content is what its id says (fifth pass: every
+      // tree of a large directory was walked at each push that set it).
+      if (this.sums(dir)?.linked === false) continue;
+      if (sql.exec("SELECT 1 FROM links_checked WHERE id = ?", dir).toArray().length > 0) continue;
+      walked.push(dir);
+      for (const row of sql.exec<{ child: ArrayBuffer }>("SELECT child FROM tree_links WHERE tree = ?", dir).toArray()) {
+        const child = new Uint8Array(row.child);
+        found.set(hex(child), child);
+      }
+      for (const row of sql.exec<{ child: ArrayBuffer }>("SELECT child FROM tree_entries WHERE tree = ? AND dir = 1", dir).toArray()) {
+        todo.push(new Uint8Array(row.child));
+      }
+    }
+    return { links: [...found.values()], walked };
+  }
+
+  /// Note directories whose links below were all found sound.
+  linksSound(dirs: Uint8Array[]): void {
+    for (const id of dirs) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO links_checked (id) VALUES (?)", id);
   }
 
   /// Note that these objects are directories: handed over as trees, and read as trees.
