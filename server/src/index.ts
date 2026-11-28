@@ -123,6 +123,7 @@ function statement(bytes: Uint8Array): Attested | null {
 /// ref moved while it was made.
 const MERGE_LIMIT = 256 * 1024;
 const MERGE_ATTEMPTS = 16;
+const MERGE_PUSH_LIMIT = 1024 * 1024;
 
 /// The contents of these placed ids, from the bucket.
 async function read(env: Env, placed: Placed[]): Promise<Map<string, Uint8Array>> {
@@ -156,6 +157,11 @@ async function mergeOnServer(env: Env, repo: DurableObjectStub<Repo>, ref: strin
     // large to merge in a moment is the writer's to merge, by a sync (thirteenth round: one push of
     // 200,000 reordered lines held the server for seconds).
     if (plan.contents.some((c) => c.length > MERGE_LIMIT)) return null;
+    // And the push as a whole: so many files and commits, each under the bound, held the server
+    // for seconds as one file did (second pass).
+    const size = new Map(plan.contents.map((c) => [hex(c.id), c.length]));
+    const largest = (p: (typeof plan.paths)[number]) => Math.max(...[p.base, p.theirs, ...p.chain].map((id) => (id === null ? 0 : (size.get(id) ?? 0))));
+    if (plan.paths.reduce((n, p) => n + p.chain.length * largest(p), 0) > MERGE_PUSH_LIMIT) return null;
     const bytes = await read(env, plan.contents);
     const of = (id: string) => bytes.get(id)!;
     const rules = new Map(plan.attributes.map((a) => [a.dir, of(a.id)]));
@@ -257,6 +263,11 @@ export default {
           // A link is written where its content says it leads, by every client that syncs: a target
           // no file system takes would leave the ref one nobody can sync (thirteenth round).
           const links = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_LINK ? [c.entry.id] : [])));
+          // And contents a directory handed over earlier holds as links.
+          const noted = await repo.notedLinks(contents.map((bytes) => blobId(bytes)));
+          if (contents.some((bytes) => noted.has(hex(blobId(bytes))) && !linkOk(bytes))) {
+            return json({ error: "a link below a directory leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
+          }
           if (links.length > 0) {
             const sent = new Map(contents.map((bytes) => [hex(blobId(bytes)), bytes]));
             const elsewhere = links.filter((id) => !sent.has(hex(id)));
@@ -326,6 +337,13 @@ export default {
           if ((await has(outside)).size !== outside.length || (await repo.trees(outside)).size !== new Set(outside.map(hex)).size) {
             return json({ error: "a directory below these was not handed over" }, 400);
           }
+          // A link below these leads where its content says, for every client that syncs: one no
+          // file system can make is refused here, or when its content comes (second pass: a link
+          // in a directory set whole got by the check of a commit's own changes).
+          const linkIds = [...new Map(trees.flatMap((t) => t.entries.filter((e) => e.mode === MODE_LINK).map((e) => [hex(e.id), e.id] as const))).values()];
+          const badLink = async (placed: Placed[]) => [...(await read(env, placed)).values()].some((bytes) => !linkOk(bytes));
+          const linkRefused = () => json({ error: "a link below these leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
+          if (linkIds.length > 0 && (await badLink(await repo.where(linkIds)))) return linkRefused();
           const files = [...below(false).values()];
           const had = await has(files);
           let missing = files.filter((id) => !had.has(hex(id)));
@@ -336,11 +354,16 @@ export default {
             // A file's content, not a directory: what the source repository was handed as one stays one.
             const dirs = await source.trees(missing);
             const theirs = (await source.where(missing)).filter((c) => !dirs.has(hex(c.id)));
+            const links = new Set(linkIds.map(hex));
+            if (await badLink(theirs.filter((c) => links.has(hex(c.id))))) return linkRefused();
             await repo.place(theirs);
             adopted = theirs.length;
             const taken = new Set(theirs.map((c) => hex(c.id)));
             missing = missing.filter((id) => !taken.has(hex(id)));
           }
+          // Those whose content is still to come are checked when it does.
+          const awaited = new Set(missing.map(hex));
+          await repo.noteLinks(linkIds.filter((id) => awaited.has(hex(id))));
           const known = await has(trees.map((t) => t.id));
           const fresh = trees.filter((t) => !known.has(hex(t.id)));
           if (fresh.length > 0) {

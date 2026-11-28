@@ -71,26 +71,43 @@ impl State {
   }
 }
 
-/// What one attribute, as stated, says of `merge`, where it says anything: a macro set says what
-/// its own attributes say, in their order, as Git expands it where it is set and only then.
-fn merge_said(name: &str, state: &State, macros: &[(String, Vec<(String, State)>)], depth: usize) -> Option<Merge> {
-  match (name, state) {
-    ("merge", State::Value(value)) => Some(match value.as_str() {
-      "union" => Merge::Union,
-      "text" => Merge::Text,
-      "binary" => Merge::Binary,
-      name => Merge::Driver(name.to_string()),
-    }),
-    ("merge", State::Unset) => Some(Merge::Binary),
-    ("merge", _) => Some(Merge::Text),
-    (name, State::Set) if depth < 8 => match macros.iter().rev().find(|(m, _)| m == name) {
-      Some((_, said)) => said.iter().fold(None, |merge, (n, s)| merge_said(n, s, macros, depth + 1).or(merge)),
-      // `binary` is Git's own macro: `-diff -merge -text`.
-      None if name == "binary" => Some(Merge::Binary),
-      None => None,
-    },
-    _ => None,
+/// What `merge` is, where filling this attribute fills it: Git fills an attribute once, from the
+/// line of highest priority that names it, and a macro filled as set fills its own attributes
+/// that are not filled yet, in its turn (second pass of the thirteenth round: `*.txt m` then
+/// `f.txt -m` left `m` unset, and `merge` unspecified, where nv took the earlier line's union).
+fn fill(
+  name: &str,
+  state: &State,
+  macros: &[(String, Vec<(String, State)>)],
+  filled: &mut std::collections::HashSet<String>,
+  depth: usize,
+) -> Option<Merge> {
+  if !filled.insert(name.to_string()) {
+    return None;
   }
+  if name == "merge" {
+    return Some(match state {
+      State::Value(value) => match value.as_str() {
+        "union" => Merge::Union,
+        "text" => Merge::Text,
+        "binary" => Merge::Binary,
+        name => Merge::Driver(name.to_string()),
+      },
+      State::Unset => Merge::Binary,
+      State::Set | State::Unspecified => Merge::Text,
+    });
+  }
+  if !matches!(state, State::Set) || depth >= 8 {
+    return None;
+  }
+  // `binary` is Git's own macro: `-diff -merge -text`.
+  let builtin = [("diff".to_string(), State::Unset), ("merge".to_string(), State::Unset), ("text".to_string(), State::Unset)];
+  let said: &[(String, State)] = match macros.iter().rev().find(|(m, _)| m == name) {
+    Some((_, said)) => said,
+    None if name == "binary" => &builtin,
+    None => return None,
+  };
+  said.iter().rev().find_map(|(n, s)| fill(n, s, macros, filled, depth + 1))
 }
 
 /// The macros the top `.gitattributes` defines (`[attr]<name> <attributes>`): Git takes them from
@@ -105,33 +122,30 @@ fn macros_of(top: &[u8]) -> Vec<(String, Vec<(String, State)>)> {
   out
 }
 
-/// The `merge` attribute of a path, as `is_union` reads it.
+/// The `merge` attribute of a path, as `is_union` reads it: the lines that match it from the
+/// nearest file to the top, each file's from its last line up, each line's from its last
+/// attribute back, as Git fills them; `Text` where none says anything of `merge`.
 pub fn merge_of(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -> Merge {
   let mut ends: Vec<usize> = path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(at, _)| at).collect();
   let macros = macros_of(&attributes(b"").unwrap_or_default());
+  let mut filled = std::collections::HashSet::new();
   loop {
     let (dir, relative) = match ends.pop() {
       Some(end) => (&path[..end], &path[end + 1..]),
       None => (&path[..0], path),
     };
     let bytes = attributes(dir).unwrap_or_default();
-    let mut said = None;
-    for (kind, assignments, _) in gix_attributes::parse(&bytes).flatten() {
+    let lines: Vec<_> = gix_attributes::parse(&bytes).flatten().collect();
+    for (kind, assignments, _) in lines.into_iter().rev() {
       let gix_attributes::parse::Kind::Pattern(pattern) = kind else { continue };
-      let mut merge = None;
-      for assignment in assignments.flatten() {
-        if let Some(said) = merge_said(assignment.name.as_str(), &State::of(&assignment.state), &macros, 0) {
-          merge = Some(said);
-        }
-      }
-      let Some(merge) = merge else { continue };
       let base = relative.rfind_byte(b'/').map(|at| at + 1);
-      if pattern.matches_repo_relative_path(relative.as_bstr(), base, Some(false), Case::Sensitive, Mode::NO_MATCH_SLASH_LITERAL) {
-        said = Some(merge);
+      if !pattern.matches_repo_relative_path(relative.as_bstr(), base, Some(false), Case::Sensitive, Mode::NO_MATCH_SLASH_LITERAL) {
+        continue;
       }
-    }
-    if let Some(merge) = said {
-      return merge;
+      let said: Vec<(String, State)> = assignments.flatten().map(|a| (a.name.as_str().to_string(), State::of(&a.state))).collect();
+      if let Some(merge) = said.iter().rev().find_map(|(n, s)| fill(n, s, &macros, &mut filled, 0)) {
+        return merge;
+      }
     }
     if dir.is_empty() {
       return Merge::Text;
@@ -187,6 +201,18 @@ mod tests {
     assert_eq!(of(b"j.txt"), Merge::Driver("x".into()));
     assert_eq!(of(b"k.txt"), Merge::Union, "a macro unset is not expanded");
     assert_eq!(of(b"sub/l.txt"), Merge::Driver("x".into()), "a macro is defined at the top only");
+    // A later line that unsets the macro, makes it unspecified or gives it a value leaves it
+    // unexpanded (second pass), here and through another macro.
+    for top in [
+      &b"[attr]m merge=union\n*.txt m\nf.txt -m\n"[..],
+      b"[attr]m merge=union\nf.txt m\nf.txt !m\n",
+      b"[attr]m merge=union\nf.txt m\n*.txt m=foo\n",
+      b"[attr]m merge=x\n[attr]n m\nf.txt n\nf.txt -n\n",
+    ] {
+      assert_eq!(merge_of(|dir: &[u8]| dir.is_empty().then(|| top.to_vec()), b"f.txt"), Merge::Text, "{}", String::from_utf8_lossy(top));
+    }
+    let top = b"*.txt merge=union\nf.txt binary\nf.txt !binary\n".to_vec();
+    assert_eq!(merge_of(|dir: &[u8]| dir.is_empty().then(|| top.clone()), b"f.txt"), Merge::Union);
   }
 
   #[test]

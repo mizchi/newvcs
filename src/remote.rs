@@ -163,6 +163,10 @@ fn take_commits(store: &mut Store, url: &str, answer: &serde_json::Value) -> Res
     let bytes = step["bytes"].as_str().and_then(unhex).filter(|b| object_id(Kind::Commit, b) == id);
     let bytes = bytes.ok_or_else(|| format!("the server did not hand over commit {}", hex(&id)))?;
     let commit = Commit::decode(&bytes)?;
+    // What a Git that checks what it is given would refuse is refused here, not written out later.
+    if !crate::commit::header_as_git_takes(&commit.rest) {
+      return Err(format!("the server handed over commit {} with a header Git would not take as a commit's", hex(&id)));
+    }
     // A ref is one line of commits, as the server keeps it: a merge would leave a parent here
     // nobody has, and a history nobody can write out.
     if commit.parents.len() > 1 {
@@ -592,8 +596,10 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
     done.synced.superseded = 0;
   }
   heard();
-  // What was pushed stands on what the last sync brought: there is no sync left to take back.
+  // What was pushed stands on what the last sync brought: there is no sync left to take back, and
+  // none is offered (second pass: the push said `before-sync` undid it, which then had nothing).
   workspace::Standing::forget(ws);
+  done.synced.before = None;
   Ok(done)
 }
 
@@ -629,6 +635,8 @@ pub struct Synced {
   /// Paths `nv git add` had staged that the ref changed, unstaged by a catching-up that could not
   /// refuse: their files on disk are what it made of them.
   pub unstaged: Vec<String>,
+  /// The state that keeps what was staged of them.
+  pub unstaged_kept: Option<Id>,
 }
 
 /// Bring the workspace to the ref's tip, keeping its own unpushed work on
@@ -908,6 +916,12 @@ fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Res
   }
 }
 
+/// The header of the state that keeps what was staged of paths a catching-up unstaged.
+fn rest_of_staged(author: &str) -> Vec<u8> {
+  let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+  format!("author {author} {now} +0000\ncommitter {author} {now} +0000\n\nwhat was staged, unstaged by a catching-up\n").into_bytes()
+}
+
 /// What an arrival does with what `nv git add` staged of a path the ref changed: the staged copy
 /// would not have what the ref brings, and committed, would take it back out.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1034,7 +1048,7 @@ fn arrive_from(
   let mut theirs = diff_keeping(store, from, tip_root, &whole)?;
   // What `nv git add` staged of a path the ref changed would be committed over what the ref
   // brings (thirteenth round): refused, or, where it is too late for that, unstaged.
-  let staged = workspace::staged_paths(&ws.root);
+  let staged = workspace::staged_apart(store, ws)?;
   let hit: Vec<Vec<u8>> = staged.into_iter().filter(|p| theirs.iter().any(|(t, _)| paths_conflict(t, p))).collect();
   if !hit.is_empty() {
     let named = hit.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>();
@@ -1044,8 +1058,16 @@ fn arrive_from(
         named.join(", ")
       ));
     }
+    // What was staged is kept, as a state of its own, before it is unstaged: a staged copy that is
+    // not what is on disk would otherwise be in no file, index or state (second pass).
+    let entries = workspace::staged_entries(&ws.root, &hit);
+    let kept = Commit { parents: ws.head.into_iter().collect(), rest: rest_of_staged(author), changes: entries }.store(store)?;
+    root_of(store, &kept)?;
+    store.flush()?;
+    ws.log("unstaged", &kept)?;
     workspace::unstage(&ws.root, &hit)?;
     done.unstaged = named;
+    done.unstaged_kept = Some(kept);
   }
   if published_from.is_some() {
     // A change of this workspace's landed commits, as the ref still has it, is no change of theirs.
@@ -1159,8 +1181,14 @@ fn arrive_from(
   done.large_fetched += large;
   // A link is made to lead where its content says: one no file system can make (thirteenth round:
   // a 5,000-byte target left the workspace half way) is refused before anything is written.
-  for (path, entry) in &theirs {
-    let Some(link) = entry.filter(|e| e.mode == 0o120000) else { continue };
+  // A directory set whole is opened for its links too (second pass: a link inside one got by).
+  let dirs: Vec<Change> = theirs.iter().filter(|(_, e)| e.is_some_and(|e| e.is_dir())).cloned().collect();
+  let mut links: Vec<Change> = theirs.iter().filter(|(_, e)| e.is_some_and(|e| e.mode == 0o120000)).cloned().collect();
+  if !dirs.is_empty() {
+    links.extend(crate::manifest::expand(store, from, &dirs)?.into_iter().filter(|(_, e)| e.is_some_and(|e| e.mode == 0o120000)));
+  }
+  for (path, entry) in &links {
+    let Some(link) = *entry else { continue };
     if !in_view(&ws.prefixes, path, false) {
       continue;
     }

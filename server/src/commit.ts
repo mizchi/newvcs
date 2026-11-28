@@ -59,7 +59,7 @@ export function decode(bytes: Uint8Array): Commit {
   const rest = take(u32());
   // Git's commit is the tree, the parents, and then these bytes: a `parent` line among them would
   // be a parent every client's Git history has and the ref does not (thirteenth round).
-  if (!restOk(rest)) throw new Error("what a commit says of who made it and why is not a commit's header and message");
+  if (!restOk(rest) || !headerAsGitTakes(rest)) throw new Error("what a commit says of who made it and why is not a commit's header and message as Git takes them");
   const changes: Change[] = [];
   for (let n = u32(); n > 0; n--) {
     const path = take(u32());
@@ -117,6 +117,24 @@ export function restOk(rest: Uint8Array): boolean {
   if (header.includes(0)) return false;
   const lines = new TextDecoder("latin1").decode(header).split("\n");
   return lines[0]!.startsWith("author ") && !lines.some((line) => line.startsWith("tree ") || line.startsWith("parent "));
+}
+
+/// Whether a commit's header is one Git's `fsck` takes (`commit::header_as_git_takes` on the other
+/// side): an author line, then a committer line, each `name <email> date zone` as `fsck_ident`
+/// checks them; neither again; and the header ended (second pass of the thirteenth round).
+export function headerAsGitTakes(rest: Uint8Array): boolean {
+  let end = -1;
+  for (let i = 0; i + 1 < rest.length; i++) {
+    if (rest[i] === 10 && rest[i + 1] === 10) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end < 0 && rest[rest.length - 1] !== 10) return false;
+  const header = new TextDecoder("latin1").decode(rest.subarray(0, end < 0 ? rest.length : end));
+  const lines = header.replace(/\n$/, "").split("\n");
+  const ident = (line: string | undefined, field: string) => line !== undefined && line.startsWith(field) && /^[^<>\n]*[ ]<[^<>\n]*> (0|[1-9][0-9]*) [+-][0-9]{4}$/.test(line.slice(field.length)) && !line.slice(field.length).startsWith("<") && BigInt(line.slice(field.length).split(" ").at(-2)!) <= 18446744073709551615n;
+  return ident(lines[0], "author ") && ident(lines[1], "committer ") && !lines.slice(2).some((l) => l.startsWith("author ") || l.startsWith("committer "));
 }
 
 export const MODE_LINK = 0o120000;

@@ -2045,6 +2045,47 @@ commits, a full `nv git log` takes 16 times Git's, `ls-tree -r` 8 times
 and a diff of two revisions 4 times (`status`, `add`, `commit` and `fetch`
 are at parity or ahead).
 
+The same four were given the build with those fixes, told what each
+changed, and asked to break them (about 15,000 more steps and 12,000
+requests). Every finding of the first pass held but those in `TODO.md`.
+What the second pass found, fixed the same way:
+
+- **What was added at a stopped pull to a file a later commit of the
+  writer's also changed was lost** under that commit's version, and a
+  catching-up after a push that unstaged a file lost what was staged of it
+  and not on disk. Others added at a stop go on the last commit; what is
+  unstaged is kept as a state, and named. A completion killed in its first
+  milliseconds left the workspace naming a commit never written, which no
+  command could open: it is stored before it is named. A branch left
+  behind by such a kill is taken along; staging a completion spent is no
+  reason to refuse a pull.
+- **A link inside a directory set whole got past the check of a commit's
+  own changes**, and the ref was again one nobody could sync: the server
+  checks the links of a directory handed over, or their contents when they
+  come, and a client opens such a directory for its links.
+- **Headers Git's `fsck` refuses** (no committer, a date or zone that is not
+  one, two authors, no email, no end) were taken, and a Git that checks
+  what it is given refused the export. A server takes, and a client takes
+  from one, only what `fsck` would.
+- **A macro set on one line and unset by a later one still expanded**:
+  attributes are filled as Git fills them, the line of highest priority
+  first, each once. **The union merge was bounded by file and not by
+  push**: sixteen files of 248 KiB held the server for 2.4 s; a push's
+  merging is now bounded as a whole.
+- **`merge_cst.py` called clean a unit run into the next under the same
+  name** (`a = 1` and `@d` read as `a = 1@d`, and `f` lost its decorator),
+  and Lean units with no line end between them: the read-back compares
+  text, and Lean units that run together are a conflict. **A driver killed
+  inside a shell** (an exit above 128) and **one that started a process in
+  a session of its own** are stopped and give no result, as Git has it.
+- **`nv git`**: tag messages given in several `-m`, or with lines of `#`,
+  made other tags than Git's, and a tag of a tree said it tagged a commit;
+  merging a revision that is no branch's name made another commit ("Merge
+  commit"); `checkout -b b origin/b` followed nothing, and pull was then
+  refused; an amend refused in a stopped merge staged the markers first;
+  `tags/<t>` and `remotes/<r>/<b>` were not read; and a tree or a file named
+  where a commit is meant read as a damaged store (case 49).
+
 ## Why these choices
 
 Measured on real histories before any of this was written (the tools are
@@ -2075,6 +2116,7 @@ was meant, as one killed at any moment does.
 | A lock another nv command holds (the workspace, the store, a commit still being made beside Git) | 60 s | `NV_LOCK_TIMEOUT` | exit 2, naming the lock; the command does not go ahead without it |
 | A server: making the connection / a request with no byte moving | 10 s / 60 s | `NV_HTTP_TIMEOUT` | the request fails, and the command with it |
 | A commit Git makes for `nv commit` beside it, its hooks included | 300 s | `NV_GIT_TIMEOUT` | Git and everything it started are stopped; Git's index is as it was |
+| A merge driver on one file | 120 s | `NV_MERGE_DRIVER_TIMEOUT` | the driver and everything it started, in its process group or a session of its own, are stopped; nothing of the merge is taken from it |
 | One command, all of it | 1,800 s | `NV_TIMEOUT` | exit 124, as `timeout(1)` gives |
 
 A watcher (`nv watch <dir>`) is no command but a process that stays, and

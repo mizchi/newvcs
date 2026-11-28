@@ -96,3 +96,7 @@ show HEAD^!
 diff HEAD^0
 rev-parse origin
 log -1 refs/remotes/origin/HEAD
+# The second pass: a tree where a commit is meant is refused, not read as a damaged commit.
+show -s HEAD^{tree}
+diff HEAD^{tree}
+log -1 HEAD^{tree}

@@ -2803,9 +2803,73 @@ fn what_a_thirteenth_reviewer_found_in_drivers_stays_fixed() {
   let text = std::fs::read_to_string(root.join("w2/a.txt")).unwrap();
   assert!(text.contains("<<<<<<< yours") && text.contains("w1") && !text.contains("half"), "{text}");
 
+  // Out of its process group in a session of its own, and still stopped with it (second pass).
+  let (root, run) = clash("thirteenth-driver-setsid", "setsid sh -c 'sleep 2; echo LATE > b.txt' & sleep 100");
+  let (code, said) = run("w2", "NV_MERGE_DRIVER_TIMEOUT=1 $NV sync .");
+  assert_eq!(code, 2, "{said}");
+  std::thread::sleep(std::time::Duration::from_secs(3));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n");
+
+  // Killed inside a shell, which says so by an exit above 128: no result, as Git has it.
+  let (root, run) = clash("thirteenth-driver-wrapped", "echo half > %A; exit 137");
+  let (code, said) = run(
+    "w2",
+    "$NV git checkout -q -b other HEAD~1 && sed -i 's/^1$/other/' a.txt && $NV git commit -qam other && $NV git checkout -q main && $NV git merge -q other",
+  );
+  assert_ne!(code, 0, "{said}");
+  let text = std::fs::read_to_string(root.join("w2/a.txt")).unwrap();
+  assert!(!text.contains("half") && text.starts_with("w2\n"), "{text}");
+
   // Exit 0 with markers: a file to settle, and no push until it is.
   let (_, run) = clash("thirteenth-driver-marks", "printf '<<<<<<< yours\\nA\\n=======\\nB\\n>>>>>>> theirs\\n' > %A");
   let (code, said) = run("w2", "$NV sync .");
   assert_eq!(code, 1, "{said}");
   assert_ne!(run("w2", "$NV push .").0, 0);
+}
+
+/// What the thirteenth round's second pass found with several writers: what was added at a pull
+/// that stopped stays committed whatever commit comes after; a completion by `nv commit` spends
+/// the staging; and what a push's catching-up unstages is kept.
+#[test]
+fn what_a_second_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let stopped = |name: &str| {
+    let (root, run) = two_writers(name);
+    assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+    assert_eq!(run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a && echo W2b >> b.txt && $NV git commit -qam w2b").0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase").0, 1);
+    assert_eq!(run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt").0, 0);
+    (root, run)
+  };
+  // Added to a file a later commit changed: committed, not taken back out by that commit.
+  for finish in ["$NV git rebase --continue", "$NV git commit -qm 'w2a again'"] {
+    let (_, run) = stopped("second-pass-added");
+    let (code, said) = run("w2", &format!("echo ADDED >> b.txt && $NV git add a.txt b.txt && {finish}"));
+    assert_eq!(code, 0, "{finish}: {said}");
+    assert_eq!(run("w2", "$NV git show HEAD:b.txt").1, "x\nW2b\nADDED\n", "{finish}");
+    assert_eq!(run("w2", "$NV git status --porcelain").1, "", "{finish}");
+  }
+  // Completed by `nv commit`, with files added on the way: nothing is left staged.
+  let (_, run) = stopped("second-pass-nv-commit");
+  assert_eq!(run("w2", "$NV git add a.txt && $NV commit . >/dev/null").0, 0);
+  assert_eq!(run("w1", "echo c > c.txt && $NV git add c.txt && $NV git commit -qm w1c && $NV git push -q").0, 0);
+  let (code, said) = run("w2", "$NV git pull --rebase -q");
+  assert_eq!(code, 0, "{said}");
+
+  // Staged, then taken off disk, then a push that catches up on that file: the staged copy is kept.
+  let (_, run) = two_writers("second-pass-unstaged");
+  assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV git commit -qam w1 && $NV git push -q").0, 0);
+  assert_eq!(
+    run("w2", "echo y > b.txt && $NV git commit -qam w2 && echo STAGED >> a.txt && $NV git add a.txt && sed -i '/STAGED/d' a.txt").0,
+    0
+  );
+  let (code, said) = run("w2", "$NV push .");
+  assert_eq!(code, 0, "{said}");
+  let kept = said.split("is kept as ").nth(1).map(|t| t.split_whitespace().next().unwrap().to_string()).unwrap_or_else(|| panic!("{said}"));
+  assert!(!said.contains("before-sync"), "{said}");
+  let (_, shown) = run("w2", &format!("$NV since . {kept}"));
+  assert!(shown.contains("a.txt"), "{shown}");
 }

@@ -70,7 +70,7 @@ pub fn merge_file_marked(root: &Path, path: &[u8], base: &[u8], ours: &[u8], the
 }
 
 /// What the error of a driver killed by a signal says, for a sync to know it by.
-const KILLED: &str = " died of signal ";
+const KILLED: &str = " died, by ";
 
 /// A value as Git puts it on a driver's command line: in single quotes, a quote as `'\''`.
 fn quoted(value: &str) -> String {
@@ -134,7 +134,12 @@ fn run(root: &Path, command: &str, path: &[u8], base: &[u8], ours: &[u8], theirs
     // Killed by a signal, it said nothing of the file: what it left in %A is not a result, and
     // Git takes the merge as failed (thirteenth round: a half-written %A was taken as the conflict).
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
-      return Err(format!("{what}{KILLED}{signal}: nothing of the merge was taken from it"));
+      return Err(format!("{what}{KILLED}signal {signal}: nothing of the merge was taken from it"));
+    }
+    // And as Git takes an exit above 128, the way a shell says what it ran was killed (second
+    // pass: a driver killed inside `sh` had its half-written result taken).
+    if let Some(code) = status.code().filter(|code| *code > 128) {
+      return Err(format!("{what}{KILLED}an exit of {code}: nothing of the merge was taken from it"));
     }
     let result = std::fs::read(root.join(&a)).map_err(|e| format!("{what} left no result: {e}"))?;
     Ok((result, status.success()))

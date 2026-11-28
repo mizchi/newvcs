@@ -40,6 +40,23 @@ binary; each item gets a failing test or Git case before its fix.
 - [ ] `merge_cst.py`: a unit one side moved to another section and the other changed (8 of 1,600
   random merges).
 
+### From the second pass
+
+- [ ] `conflict-marker-size` is not read: a driver is given `%L` 7, and nv writes markers of 7.
+- [ ] A file whose text holds an example of a sync's markers at the start of lines (documentation)
+  can be committed with `nv git commit` and never pushed.
+- [ ] A `git pull --rebase` that clashes only with an edit not committed speaks nv's verbs, and
+  `rebase --continue` there is not spoken (Git refuses the pull over unstaged changes).
+- [ ] Seen once, not made again: `rev-parse origin/main` answered "blob is not in the store" after
+  three pushes at once.
+- [ ] The empty tree by its id, or as the tree of a commit of no files, in `rev-parse`, `ls-tree`,
+  `show` and `diff` (only `cat-file` knows it).
+- [ ] `branch -d` of a branch merged into its upstream and not into HEAD; `checkout <b>` where `b`
+  is origin's branch and also a path (Git refuses it as ambiguous); `reset <b> <path>` where `b`
+  is a branch and a file; `merge -m` that fast-forwards does not say the message was ignored; a
+  branch made from another of origin's branches (`-b x origin/y`) follows nothing.
+- [ ] `NV_*` limits given a value that is not a number are taken as not given.
+
 ### Server
 
 - [ ] On a ref whose first commit has no parent, the rules a union push states at its base are

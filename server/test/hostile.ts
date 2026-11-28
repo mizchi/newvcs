@@ -346,6 +346,14 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
     ["nothing", text("")],
     ["no author", text("committer t <t@example.com> 1 +0000\n\nm\n")],
     ["a NUL in the header", text("author t <t@example.com> 1 +0000\ncommitter t\0 <t@example.com> 1 +0000\n\nm\n")],
+    // And what Git's fsck refuses (second pass).
+    ["no committer", text("author t <t@example.com> 1 +0000\n\nm\n")],
+    ["a committer that is not one", text("author t <t@example.com> 1 +0000\ncommitter garbage\n\nm\n")],
+    ["a date that is not one", text("author t <t@example.com> x +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["a time zone that is not one", text("author t <t@example.com> 1 +00\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["two authors", text("author t <t@example.com> 1 +0000\nauthor t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["no email", text("author R\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
+    ["no end", text("author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000")],
   ] as [string, Uint8Array][]) {
     assert.equal((await push("main", withRest(said), good)).status, 400, `a commit whose header has ${what} was taken`);
   }

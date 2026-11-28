@@ -344,13 +344,21 @@ def plain_key(key):
 
 
 def keys_of(us):
-    """The keys of units and of the units within them, in order, blank space and tails left out."""
+    """The keys and texts of units and of the units within them, in order, blank space and tails
+    left out. The text, not only the key: a unit can run into the next and still be read as one of
+    the same name (second pass: `a = 1` and `@d` became `a = 1@d`, and `f` lost its decorator)."""
     for u in us:
         if u.key == "<tail>" or not u.render().strip():
             continue
-        yield plain_key(u.key)
+        yield plain_key(u.key), u.render().strip() if u.parts is None else None
         if u.parts:
             yield from keys_of(u.parts)
+
+
+def runs_together(us):
+    """Whether a unit begins where the one before ended, with no line end between them."""
+    texts = [u.render() for u in us]
+    return any(a and b and not a.endswith("\n") and not b.startswith(("\n", "\r\n")) for a, b in zip(texts, texts[1:]))
 
 
 def merge_source(parser, language, base, ours, theirs):
@@ -362,7 +370,11 @@ def merge_source(parser, language, base, ours, theirs):
         return ours
     if language == "lean":
         parts = [lean_units(v) for v in (base, ours, theirs)]
-        return "".join(u.render() for u in merge_units(*parts)).encode("utf-8", "surrogateescape")
+        merged = merge_units(*parts)
+        # With no parser to read it back, a merge is clean only where no unit runs into the next.
+        if runs_together(merged):
+            raise Conflict("a unit of the merge runs into the next")
+        return "".join(u.render() for u in merged).encode("utf-8", "surrogateescape")
     trees = [parser.parse(v) for v in (base, ours, theirs)]
     if any(tree.root_node.has_error for tree in trees):
         raise Conflict("a version does not parse")

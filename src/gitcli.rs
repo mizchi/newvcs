@@ -409,6 +409,11 @@ impl Repo {
   /// A commit named the way Git names them: `HEAD`, a branch, a tag, a full id, with `^` and `~N` after.
   fn resolve(&mut self, spec: &str) -> Res<Id> {
     let id = self.resolve_any(spec)?;
+    // A tree or a file named where a commit is meant is refused, not read as a commit and found
+    // damaged (second pass: "a commit object is cut short", of a store `fsck` passes).
+    if matches!(self.store.kind_of(&id)?, Some(Kind::Tree | Kind::Blob)) {
+      return unsupported(format_args!("{spec}` where a commit is meant (a tree or a file)"));
+    }
     Ok(crate::git::peel(&mut self.store, id)?)
   }
 
@@ -469,7 +474,9 @@ impl Repo {
       self.ws.head
     } else if let Some(tip) = full.and_then(|branch| self.branch_tip(branch)) {
       Some(tip)
-    } else if let Some(tag) = name.strip_prefix("refs/tags/").and_then(|tag| self.store.read_ref(&format!("tags/{tag}"))) {
+    } else if let Some(tag) =
+      name.strip_prefix("refs/tags/").or_else(|| name.strip_prefix("tags/")).and_then(|tag| self.store.read_ref(&format!("tags/{tag}")))
+    {
       Some(tag)
     } else if let Some(tip) = self.branch_tip(name) {
       Some(tip)
@@ -477,7 +484,10 @@ impl Repo {
       Some(tag)
     } else if let Some(tip) = self.ref_tip(name) {
       Some(tip)
-    } else if let Some(remote) = self.store.read_ref(&format!("remotes/{}", name.strip_prefix("refs/remotes/").unwrap_or(name))) {
+    } else if let Some(remote) = self
+      .store
+      .read_ref(&format!("remotes/{}", name.strip_prefix("refs/remotes/").or_else(|| name.strip_prefix("remotes/")).unwrap_or(name)))
+    {
       Some(remote)
     } else if name.len() == 40 {
       unhex(name).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|oid| self.store.of_git(&oid))
@@ -1181,6 +1191,7 @@ fn cloned(root: &Path, origin: &Path) -> Res<i32> {
 fn pull(mut repo: Repo, args: &[&str]) -> Res<i32> {
   // A branch that follows nothing is not pulled into (thirteenth round: it was merged with the
   // branch of its name on origin, a commit Git would not make).
+  fetch(&mut repo)?;
   if let Some(branch) = repo.branch().filter(|b| !repo.follows(b)) {
     return fatal(
       1,
@@ -1189,7 +1200,6 @@ fn pull(mut repo: Repo, args: &[&str]) -> Res<i32> {
       ),
     );
   }
-  fetch(&mut repo)?;
   let Some(branch) = repo.branch() else { return fatal(1, "You are not currently on a branch.") };
   let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{branch}")) else {
     return fatal(
@@ -1817,6 +1827,24 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     .collect();
   // Workspaces that share a store share its branches. A branch another of them has moved is not
   // one this workspace's commit can go on: said before the commit is made, not after.
+  // A branch behind this workspace's commit on its own line, left there by a command killed before
+  // it took the branch along (second pass), is taken along now: it is behind, not elsewhere.
+  if let Some(name) = repo.branch()
+    && let Some(tip) = repo.branch_tip(&name)
+    && let Some(head) = repo.ws.head.filter(|head| *head != tip)
+  {
+    let mut at = Some(head);
+    let mut walked = 0;
+    while let Some(id) = at.filter(|id| *id != tip && walked < 1_000) {
+      at = Commit::load(&mut repo.store, &id)?.parents.first().copied();
+      walked += 1;
+    }
+    // Or a commit this workspace itself was on, which only it could have left the branch at.
+    let was_here = || repo.ws.operations().iter().any(|(_, _, id)| *id == hex(&tip));
+    if at == Some(tip) || was_here() {
+      repo.store.compare_and_set_ref(&format!("heads/{name}"), Some(tip), head)?;
+    }
+  }
   if let Some(name) = repo.branch()
     && let Some(tip) = repo.branch_tip(&name)
     && repo.ws.head.is_some_and(|head| head != tip)
@@ -1863,6 +1891,11 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     return unsupported("commit` of named paths");
   }
   let merging = repo.merging();
+  // Refused before anything is staged (second pass: the markers were staged, and the next commit
+  // took them for the merge's result).
+  if merging.is_some() && amend {
+    return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
+  }
   // With -a every tracked file goes in as it is on disk, which settles the ones a merge left unsettled.
   if all && merging.is_some() {
     let states = repo.states_of_tracked()?;
@@ -3242,10 +3275,13 @@ fn cat_file(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let id = if let Some(commit) = spec.strip_suffix("^{tree}") {
     let commit = repo.resolve(commit)?;
     root_of(&mut repo.store, &commit)?.ok_or_else(missing)?
-  } else if let Ok(named) = repo.resolve_any(spec) {
-    named
   } else {
-    unhex(spec).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|oid| repo.store.of_git(&oid)).ok_or_else(missing)?
+    match repo.resolve_any(spec) {
+      Ok(named) => named,
+      // What nv does not look for is refused here as everywhere (second pass).
+      Err(refusal) if refusal.code == UNSUPPORTED => return Err(refusal),
+      Err(_) => unhex(spec).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|oid| repo.store.of_git(&oid)).ok_or_else(missing)?,
+    }
   };
   let kind = repo.store.kind_of(&id)?.ok_or_else(missing)?;
   match (*mode, kind) {
@@ -3404,11 +3440,20 @@ fn tag(mut repo: Repo, args: &[&str]) -> Res<i32> {
         return fatal(128, format!("fatal: tag '{name}' already exists"));
       }
       // With a message it is an object of its own, naming the commit.
-      match value(args, &["-m"]) {
+      // Every -m, a paragraph each, as Git joins them; and Git's `strip` clean-up of a tag's
+      // message, which takes out lines that begin with `#` (second pass of the thirteenth round).
+      let given: Vec<&str> = args.iter().enumerate().filter(|(_, a)| **a == "-m").filter_map(|(i, _)| args.get(i + 1).copied()).collect();
+      let joined = (!given.is_empty()).then(|| given.iter().map(|m| m.trim_end()).collect::<Vec<_>>().join("\n\n"));
+      // Only a commit is tagged here: a tag says what it tags, and this one would say it wrongly.
+      if joined.is_some() && !matches!(repo.store.kind_of(&at)?, Some(Kind::Commit)) {
+        return unsupported(format_args!("tag -a {name} <a tree or a file>` (a tag of what is not a commit)"));
+      }
+      match joined.as_deref() {
         Some(message) => {
           // Cleaned up as a commit's is, and nothing at all where that leaves nothing (thirteenth
           // round: a blank message or runs of empty lines made another tag object than Git's).
-          let message = cleaned(message);
+          let stripped: String = message.lines().filter(|line| !line.starts_with('#')).map(|line| format!("{line}\n")).collect();
+          let message = cleaned(&stripped);
           let message = if message.is_empty() { String::new() } else { format!("{message}\n") };
           let rest = format!("type commit\ntag {name}\ntagger {}\n\n{message}", identity(&repo, "COMMITTER")?);
           at = crate::git::put_tag(&mut repo.store, &at, rest.as_bytes())?;
@@ -3500,6 +3545,16 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
       repo.store.compare_and_set_ref(&format!("heads/{name}"), None, start)?;
     }
     repo.set_branch(name)?;
+    // Made from origin's branch of its name, it follows that branch, as Git sets it up (second
+    // pass: it followed nothing, and `pull` was refused on it).
+    if let [from] = plain[..]
+      && (from == format!("origin/{name}") || from == format!("refs/remotes/origin/{name}") || from == format!("remotes/origin/{name}"))
+    {
+      repo.set_follows(name)?;
+      if !quiet(args) {
+        println!("branch '{name}' set up to track 'origin/{name}'.");
+      }
+    }
     carried(&mut repo)?;
     say(format!("Switched to a new branch '{name}'"));
     return Ok(0);
@@ -3735,9 +3790,17 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     None => None,
   };
   // A branch of origin's, as fetched, is a remote-tracking branch in Git's words (thirteenth round).
-  let remote_tracking = name.strip_prefix("origin/").is_some_and(|b| repo.store.read_ref(&format!("remotes/origin/{b}")).is_some())
+  let remote_tracking = (name.strip_prefix("origin/").is_some_and(|b| repo.store.read_ref(&format!("remotes/origin/{b}")).is_some())
+    || name.strip_prefix("refs/remotes/").is_some_and(|b| repo.store.read_ref(&format!("remotes/{b}")).is_some()))
     && repo.branch_tip(name).is_none();
-  let kind = if remote_tracking { "remote-tracking branch" } else { "branch" };
+  // What is no branch's name is a commit, in Git's words (second pass): an id, `origin/dev~1`.
+  let kind = if remote_tracking {
+    "remote-tracking branch"
+  } else if repo.branch_tip(name).is_some() {
+    "branch"
+  } else {
+    "commit"
+  };
   let message = value(args, &["-m"]).map(str::to_string).or(as_tag).unwrap_or_else(|| format!("Merge {kind} '{name}'{into}"));
   if !marked.is_empty() {
     // The merge stops here: what could be merged is in the files and in the index, and the

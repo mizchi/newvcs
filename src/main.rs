@@ -493,6 +493,8 @@ fn run(args: &[String]) -> Result<()> {
           _ => String::new(),
         };
         if let Some(id) = workspace::complete_settling(&mut store, &mut ws, AUTHOR, look(3), None)? {
+          // Everything on disk is in it: what `nv git add` had set apart is spent (second pass).
+          let _ = std::fs::remove_file(ws.root.join(".nv").join("git-staged"));
           println!(
             "{} in {:.0} ms: the settling completes {what}, under its message, and what came after it is on top",
             hex(&id),
@@ -1058,7 +1060,7 @@ fn run(args: &[String]) -> Result<()> {
       // index would not survive the rebase. Not at a pull that stopped, where adding is the way on.
       if AS_GIT.load(std::sync::atomic::Ordering::Relaxed)
         && workspace::settles_into(&ws.root).is_none()
-        && !workspace::staged_paths(&ws.root).is_empty()
+        && !workspace::staged_apart(&mut store, &ws)?.is_empty()
       {
         eprintln!("error: cannot pull with rebase: Your index contains uncommitted changes.\nerror: Please commit or stash them.");
         std::process::exit(128);
@@ -1252,8 +1254,9 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     ));
   }
   if !s.unstaged.is_empty() {
+    let kept = s.unstaged_kept.map(|id| format!("; what was staged of them is kept as {}", hex(&id))).unwrap_or_default();
     text.push_str(&format!(
-      "\nunstaged, as the ref changed them since they were added: {}. What is on disk has both, and is to be added again",
+      "\nunstaged, as the ref changed them since they were added: {}. What is on disk is merged with what the ref brought, and is to be added again{kept}",
       s.unstaged.join(", ")
     ));
   }

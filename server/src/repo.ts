@@ -78,6 +78,7 @@ export class Repo extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS live_by_path ON live (ref, path);
       CREATE TABLE IF NOT EXISTS path_index (ref TEXT NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, mode INTEGER, id BLOB, PRIMARY KEY (ref, path, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS links_awaited (id BLOB PRIMARY KEY) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS landed_merged (ref TEXT NOT NULL, sent BLOB NOT NULL, paths TEXT NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
     `);
   }
@@ -457,6 +458,18 @@ export class Repo extends DurableObject<Env> {
     for (const c of contents) {
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO placed (id, pack, at, length) VALUES (?, ?, ?, ?)", c.id, c.pack, c.at, c.length);
     }
+  }
+
+  /// Note contents a directory handed over holds as links, not sent yet: checked when they come.
+  noteLinks(ids: Uint8Array[]): void {
+    for (const id of ids) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO links_awaited (id) VALUES (?)", id);
+  }
+
+  /// Of these ids, those noted as links still to come.
+  notedLinks(ids: Uint8Array[]): Set<string> {
+    const found = new Set<string>();
+    for (const id of ids) if (this.ctx.storage.sql.exec("SELECT 1 FROM links_awaited WHERE id = ?", id).toArray().length > 0) found.add(hex(id));
+    return found;
   }
 
   /// Note that these objects are directories: handed over as trees, and read as trees.

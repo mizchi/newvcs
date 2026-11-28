@@ -217,3 +217,18 @@ class WhatTheThirteenthRoundFound(unittest.TestCase):
         self.assertEqual(merge("x.py", base, base, moved), (0, moved))
         self.assertEqual(merge("x.py", base, moved, base), (0, moved))
         self.assertEqual(merge("x.py", base, moved, moved), (0, moved))
+
+
+@needs_tree_sitter
+class WhatTheSecondPassFound(unittest.TestCase):
+    def test_a_unit_that_runs_into_the_next_under_the_same_names_is_a_conflict(self):
+        base = "a = 1\n@d\ndef f():\n    pass\n"
+        ours = "x = 0\na = 1\n@d\ndef f():\n    pass\n"
+        theirs = "@d\ndef f():\n    pass\na = 1"
+        code, text = merge("x.py", base, ours, theirs)
+        self.assertNotIn("1@d", text if code == 0 else "", text)
+
+    def test_lean_units_that_run_together_are_a_conflict(self):
+        base = "def a := 1"
+        code, text = merge("x.lean", base, base + "\ndef c := 3", base + "\ndef d := 4")
+        self.assertNotIn("3def", text)

@@ -58,6 +58,49 @@ pub fn rest_ok(rest: &[u8]) -> bool {
     && !header.split(|&b| b == b'\n').any(|line| line.starts_with(b"tree ") || line.starts_with(b"parent "))
 }
 
+/// Whether a commit's header is one Git's `fsck` takes, as Git checks an author or committer line
+/// (`fsck_ident`): a name, ` <email>`, a date of digits not padded with zeros, and a time zone of a
+/// sign and four digits, then the end of the line; the author first, the committer next, neither
+/// again, and the header ended. Asked of what a server hands over, not of what a store has: a
+/// history Git wrote is read as Git wrote it (second pass of the thirteenth round).
+pub fn header_as_git_takes(rest: &[u8]) -> bool {
+  let (header, ended) = match rest.windows(2).position(|pair| pair == b"\n\n") {
+    Some(end) => (&rest[..end + 1], true),
+    None => (rest, rest.ends_with(b"\n")),
+  };
+  if !ended || !rest_ok(rest) {
+    return false;
+  }
+  let lines: Vec<&[u8]> = header.strip_suffix(b"\n").unwrap_or(header).split(|&b| b == b'\n').collect();
+  let ident = |line: &[u8], field: &[u8]| -> bool {
+    let Some(p) = line.strip_prefix(field) else { return false };
+    let stop = |p: &[u8]| p.iter().position(|b| b"<>\n".contains(b)).unwrap_or(p.len());
+    if p.first() == Some(&b'<') {
+      return false;
+    }
+    let at = stop(p);
+    if p.get(at) != Some(&b'<') || at == 0 || p[at - 1] != b' ' {
+      return false;
+    }
+    let p = &p[at + 1..];
+    let at = stop(p);
+    if p.get(at) != Some(&b'>') {
+      return false;
+    }
+    let Some(p) = p[at + 1..].strip_prefix(b" ") else { return false };
+    let digits = p.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || (p[0] == b'0' && digits > 1) || std::str::from_utf8(&p[..digits]).ok().and_then(|d| d.parse::<u64>().ok()).is_none() {
+      return false;
+    }
+    let Some(tz) = p[digits..].strip_prefix(b" ") else { return false };
+    tz.len() == 5 && (tz[0] == b'+' || tz[0] == b'-') && tz[1..].iter().all(u8::is_ascii_digit)
+  };
+  lines.len() >= 2
+    && ident(lines[0], b"author ")
+    && ident(lines[1], b"committer ")
+    && !lines[2..].iter().any(|line| line.starts_with(b"author ") || line.starts_with(b"committer "))
+}
+
 impl Commit {
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
@@ -182,6 +225,30 @@ pub fn root_of(store: &mut Store, id: &Id) -> Result<Option<Id>> {
 #[cfg(test)]
 mod tests {
   const TEST_REST: &[u8] = b"author a <a@example.com> 1 +0000\ncommitter a <a@example.com> 1 +0000\n\nm\n";
+
+  /// Second pass: headers that pass `rest_ok` and that Git's `fsck` refuses.
+  #[test]
+  fn a_header_is_held_to_what_git_takes_where_a_server_hands_it_over() {
+    assert!(header_as_git_takes(TEST_REST));
+    assert!(header_as_git_takes(b"author  <a@b> 0 +0000\ncommitter c <c@d> 1700000000 -0500\nencoding latin1\n\nm\n"));
+    for rest in [
+      &b"author a <a@b> 1 +0000\n\nm\n"[..],
+      b"author a <a@b> 1 +0000\ncommitter garbage\n\nm\n",
+      b"author a <a@b> x +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 01 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 99999999999999999999999 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 1 +00\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 1 +0000\r\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 1 +0000\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author R\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a<a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a<b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000",
+      b"author a <a@b> 1 +0000\nParent 0123\ncommitter a <a@b> 1 +0000\n\nm\n",
+    ] {
+      assert!(!header_as_git_takes(rest), "{}", String::from_utf8_lossy(rest));
+    }
+  }
 
   /// Thirteenth round: what follows a commit's tree and parents in Git's commit was taken as any
   /// bytes, and a `parent` line there gave every client a parent the ref did not have.

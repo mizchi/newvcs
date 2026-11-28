@@ -2127,15 +2127,18 @@ fn commit_state_with(
           None => rest,
         };
         let c = &Commit { parents: c.parents.clone(), rest, changes: c.changes.clone() };
-        let add: &[Change] = if j < at_short {
-          &earlier[j]
-        } else if j == at_short {
-          &changes
+        // The settled files complete the commit they were held out of; anything else added with
+        // them goes on the last commit, where no commit after it puts its own version over it
+        // (second pass of the thirteenth round: added to a file a later commit changed, it was
+        // lost under that commit's version).
+        let last = j + 1 == chain.len();
+        let add: Vec<Change> = if j < at_short {
+          earlier[j].clone()
         } else {
-          &[]
+          changes.iter().filter(|(path, _)| (j == at_short && paths.contains(path)) || (last && !paths.contains(path))).cloned().collect()
         };
         let mut whole = c.changes.clone();
-        for (path, entry) in add {
+        for (path, entry) in &add {
           match whole.iter_mut().find(|(p, _)| p == path) {
             Some(change) => change.1 = *entry,
             None => whole.push((path.clone(), *entry)),
@@ -3212,6 +3215,9 @@ pub fn complete_settling_staged(
   let state = carry(store, head, forth, author)?;
   let back = crate::manifest::diff(store, wanted, on_disk)?;
   let now = if back.is_empty() { state } else { carry(store, state, back, author)? };
+  // Stored before the workspace names it (second pass: killed between the two, the workspace
+  // named a commit that was never written, and nothing could open it again).
+  store.flush()?;
   ws.head = Some(now);
   ws.save()?;
   commit_state_with(store, ws, state, Vec::new(), author, reword, true)
@@ -3269,6 +3275,53 @@ pub fn staged_paths(root: &Path) -> Vec<Vec<u8>> {
     .unwrap_or_default()
     .lines()
     .filter_map(|line| line.split(' ').next().and_then(unhex))
+    .collect()
+}
+
+/// Of the paths staged apart, those the index has otherwise than the commit the workspace is on:
+/// one committed already (a completion killed before it cleared the staging) is staged no more.
+pub fn staged_apart(store: &mut Store, ws: &Workspace) -> Result<Vec<Vec<u8>>> {
+  let text = std::fs::read_to_string(ws.root.join(META).join("git-staged")).unwrap_or_default();
+  let base = match ws.base {
+    Some(base) => root_of(store, &base)?,
+    None => None,
+  };
+  let mut out = Vec::new();
+  for line in text.lines() {
+    let mut fields = line.split(' ');
+    let Some(path) = fields.next().and_then(unhex) else { continue };
+    let staged = match (fields.next().and_then(|m| u32::from_str_radix(m, 8).ok()), fields.next().and_then(unhex)) {
+      (Some(mode), Some(id)) => Id::try_from(id).ok().map(|id| Entry { mode, id }),
+      _ => None,
+    };
+    let had = match base {
+      Some(root) => crate::manifest::lookup(store, root, &path)?,
+      None => None,
+    };
+    if had != staged {
+      out.push(path);
+    }
+  }
+  Ok(out)
+}
+
+/// The entries staged for these paths, as `nv git add` left them (`None` for a removal).
+pub fn staged_entries(root: &Path, paths: &[Vec<u8>]) -> Vec<(Vec<u8>, Option<Entry>)> {
+  let text = std::fs::read_to_string(root.join(META).join("git-staged")).unwrap_or_default();
+  text
+    .lines()
+    .filter_map(|line| {
+      let mut fields = line.split(' ');
+      let path = fields.next().and_then(unhex)?;
+      if !paths.contains(&path) {
+        return None;
+      }
+      let entry = match (fields.next().and_then(|m| u32::from_str_radix(m, 8).ok()), fields.next().and_then(unhex)) {
+        (Some(mode), Some(id)) => Id::try_from(id).ok().map(|id| Entry { mode, id }),
+        _ => None,
+      };
+      Some((path, entry))
+    })
     .collect()
 }
 
