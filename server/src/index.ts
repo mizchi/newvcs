@@ -271,6 +271,14 @@ export default {
           // the directory comes into the ref, not where a content comes in, as the same bytes may be
           // any file's (fourth pass: a note of them refused honest files, and missed adoption).
           const dirs = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_DIR ? [c.entry.id] : [])));
+          // What a push sets whole is bounded as a whole: many directories set to one large tree
+          // hold its files many times over (sixth pass: 64 of 2^22 each, in 3 KB).
+          if (dirs.length > 0) {
+            const sums = await repo.sumsOf(dirs);
+            const set = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_DIR ? [c.entry.id] : [])));
+            const total = set.reduce((n, id) => n + (sums.get(hex(id))?.files ?? 0), 0);
+            if (total > MAX_FILES) return json({ error: `the directories this push sets hold more than ${MAX_FILES} files` }, 400);
+          }
           const below = dirs.length > 0 ? await repo.linksBelow(dirs) : { links: [], walked: [] };
           links.push(...below.links);
           if (links.length > 0) {
@@ -325,6 +333,10 @@ export default {
               waiting.set(hex(t.id), new Set(inside.map((e) => hex(e.id))).size);
               for (const id of new Set(inside.map((e) => hex(e.id)))) above.set(id, [...(above.get(id) ?? []), hex(t.id)]);
             }
+            // What these hold that was handed over before, asked for at once.
+            const before = new Map<string, Uint8Array>();
+            for (const t of trees) for (const e of t.entries) if (e.mode === MODE_DIR && !byId.has(hex(e.id))) before.set(hex(e.id), e.id);
+            const earlier = before.size > 0 ? await repo.sumsOf([...before.values()]) : new Map<string, { files: number; linked: boolean; deepest: number }>();
             const ready = [...waiting].filter(([, n]) => n === 0).map(([id]) => id);
             while (ready.length > 0) {
               const id = ready.pop()!;
@@ -332,10 +344,10 @@ export default {
               let count = 0;
               let anyLink = false;
               for (const e of byId.get(id)!.entries) {
-                const below = e.mode === MODE_DIR ? 1 + (deepest.get(hex(e.id)) ?? (await repo.deepest(e.id))) : 0;
+                const below = e.mode === MODE_DIR ? 1 + (deepest.get(hex(e.id)) ?? earlier.get(hex(e.id))?.deepest ?? 0) : 0;
                 longest = Math.max(longest, e.name.length + below);
                 if (e.mode === MODE_DIR) {
-                  const known = fileCount.has(hex(e.id)) ? { files: fileCount.get(hex(e.id))!, linked: linkBelow.get(hex(e.id))! } : await repo.sums(e.id);
+                  const known = fileCount.has(hex(e.id)) ? { files: fileCount.get(hex(e.id))!, linked: linkBelow.get(hex(e.id))! } : earlier.get(hex(e.id));
                   // One handed over before these were counted: its files are not known, and it may hold links.
                   count += known?.files ?? 0;
                   anyLink ||= known?.linked ?? true;

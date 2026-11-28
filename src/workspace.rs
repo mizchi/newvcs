@@ -491,7 +491,10 @@ fn place_one(files_dir: &Path, root: &Path, job: &Job) -> Result<(u64, u128)> {
     // finished after a kill took a half-written file for an edit, and a build saw empty files).
     let temp = writing_name(root, &dest);
     if job.direct {
-      std::fs::write(&temp, job.bytes.as_deref().ok_or("a file without content")?.as_slice()).map_err(|e| fail("write", &temp, e))?;
+      use std::io::Write;
+      let bytes = job.bytes.as_deref().ok_or("a file without content")?;
+      let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp).map_err(|e| fail("write", &temp, e))?;
+      file.write_all(bytes).map_err(|e| fail("write", &temp, e))?;
     } else {
       let cached = shared_copy(files_dir, &job.entry.id);
       if let Some(bytes) = &job.bytes {
@@ -514,15 +517,38 @@ fn place_one(files_dir: &Path, root: &Path, job: &Job) -> Result<(u64, u128)> {
   Ok((meta.len(), mtime_of(&meta)))
 }
 
-/// A name beside a file of the tree for it while it is made, so that it is put in place by a
-/// rename in its own directory (one directory for all of them made a checkout's threads queue
-/// for it). A command killed there leaves `.<name>.nv-<pid>-<n>`, which the next restore or sync
-/// of that directory takes for an untracked file and leaves alone.
-fn writing_name(_root: &Path, dest: &Path) -> PathBuf {
+/// A name for a file of the tree while it is made, on the file system the tree is on, so that it
+/// is put in place by a rename. In a workspace it is under `.nv/writing`, in a directory of each
+/// thread's own (one directory for all made a checkout's threads queue for it): never in the
+/// tree, where a kill would leave it to be committed, never as long as a name of the tree can
+/// be, and never over anything (sixth pass: a name beside the file was too long for a name of 245
+/// bytes, was left in the tree by a kill, and wrote over an untracked file of that name). Outside
+/// a workspace, a short name beside the file, made only where nothing is.
+fn writing_name(root: &Path, dest: &Path) -> PathBuf {
   static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-  let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-  let name = dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-  dest.with_file_name(format!(".{name}.nv-{}-{n}", std::process::id()))
+  static THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  thread_local! {
+    static THREAD: u64 = THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+  let pid = std::process::id();
+  let meta = root.join(META);
+  let dir = if meta.is_dir() {
+    let dir = meta.join("writing").join(format!("{pid}-{}", THREAD.with(|t| *t)));
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+  } else {
+    None
+  };
+  loop {
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = match &dir {
+      Some(dir) => dir.join(n.to_string()),
+      None => dest.with_file_name(format!(".nv-{pid}-{n}")),
+    };
+    if std::fs::symlink_metadata(&name).is_err() {
+      return name;
+    }
+  }
 }
 
 fn shared_dirs(files_dir: &Path) -> Result<()> {

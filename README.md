@@ -2186,10 +2186,15 @@ fourth pass's fixes holding, and these, fixed the same way:
 - **Files of the tree were written in place**: killed, a restore or an undo
   left a file half written (a build saw empty files), and an undo finished
   after such a kill took the half file for an edit and named it as kept. A
-  file is written under a name beside it (`.<name>.nv-<pid>-<n>`) and
-  renamed into place; one killed between is left under that name. A
-  checkout of 20,000 files takes the same time as before (5.4 s and 5.5 s,
-  alternating runs on this container). The state an undo records is
+  file is made under `.nv/writing`, in a directory of each thread's own,
+  and renamed into place; a kill leaves nothing in the tree. (The sixth
+  pass found the first way of it, a name beside the file, too long for a
+  name of 245 bytes, left in the tree by a kill and then committed, and
+  written over an untracked file of that name.) Outside a workspace, in a
+  checkout to a new directory before its `.nv` exists, a short name beside
+  the file is used, made only where nothing is. A checkout of 20,000 files
+  takes the same time as before, within what this container varies
+  (5.0–5.8 s for each way, alternating runs). The state an undo records is
   written into its note, so that a run after another kill goes on from it.
 - **`merge_cst.py` took items that only begin or end like a placeholder
   for one** (`TODO: fix the auth bug`, `(urgent) rotate the keys (today)`),
@@ -2197,7 +2202,10 @@ fourth pass's fixes holding, and these, fixed the same way:
 - **The server took a directory of 2^60 files in 3 KB** (shared
   directories), which no client could finish writing: a directory handed
   over may hold 4,194,304 files at most, counted with those handed over
-  before. **A push that set a large directory walked all of it each time,
+  before, and so may all a push sets whole (the sixth pass set one such
+  directory 64 times in one push). A directory handed over before files
+  were counted is counted when it is first built on, and taken to hold
+  links. **A push that set a large directory walked all of it each time,
   for its links and its files**: the walk now goes only where a link is
   below, and not again into a directory found whole and sound. Setting a
   directory of 2,021 trees, each holding a link, takes 1.1 s the first time
@@ -2210,6 +2218,17 @@ fourth pass's fixes holding, and these, fixed the same way:
   makes the branch (or refuses while a file is unmerged); and `merge -m ''`
   that would only move the branch forward is refused, where Git moves the
   files and not the branch (case 51).
+
+A sixth pass (about 10,000 steps, 300 kills and 5,000 requests) found the
+fifth pass's fixes holding but the way files were written, and these,
+fixed the same way: the file bound per push and for directories counted
+before (above); an adopt that asked the repository once for each
+directory it held (1,011 trees: 11.9 s, now 7.4 s); `git push origin <b>`
+where `b` also names a tag or a remote's branch, which Git refuses and nv
+pushed as a new branch; `checkout -b` in a merge with a file unmerged,
+which Git does unless told `-q`; ISO dates Git takes at the edges of its
+years, which nv refused as Git refusing them (now 125); and `- ...`, not
+taken for a placeholder (case 51).
 
 ## Why these choices
 

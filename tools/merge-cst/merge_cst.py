@@ -254,7 +254,8 @@ def placeholder(unit):
                 break
         else:
             break
-    return text.lower().rstrip(".:!") in PLACEHOLDERS
+    # `...` is one of them as it is: its dots are not a trailing stop (sixth pass).
+    return text.lower() in PLACEHOLDERS or text.lower().rstrip(".:!") in PLACEHOLDERS
 
 
 def merge_units(base, ours, theirs):

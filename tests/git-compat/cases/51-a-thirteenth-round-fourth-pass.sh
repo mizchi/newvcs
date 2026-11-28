@@ -65,9 +65,19 @@ echo "--- (fifth pass) checkout -b in a merge that stopped"
 git checkout -q -b clash1 && echo one > a.txt && git commit -qam one && git checkout -q main && echo two > a.txt && git commit -qam two
 git merge -q clash1 >/dev/null 2>&1; echo "exit: $?"
 git checkout -q -b during 2>/dev/null; echo "exit: $?"
+git checkout -b during-loud 2>/dev/null; echo "exit: $?"
+git branch --show-current; git status --short
+git merge --abort 2>/dev/null; echo "abort: $?"
+git checkout -q main; git reset -q --hard; git branch -D during-loud >/dev/null
+git merge -q clash1 >/dev/null 2>&1; echo "exit: $?"
 echo settled > a.txt && git add a.txt
 git checkout -q -b during; echo "exit: $?"
 git branch --show-current; git status --short
 git merge --abort 2>/dev/null; echo "abort: $?"
 git commit -qm settled; git log -1 --format='%s %P' | wc -w
+git checkout -q main
+echo "--- (sixth pass) a push of a name that finds more than one ref"
+git checkout -q -b same && git tag same && echo s >> a.txt && git commit -qam same
+git push -q origin same 2>/dev/null; echo "exit: $?"
+"$REAL_GIT" -C ../origin.git for-each-ref --format='%(refname)' | grep same
 git checkout -q main

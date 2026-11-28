@@ -92,8 +92,12 @@ binary; each item gets a failing test or Git case before its fix.
   ref changed it (the staged copy is kept, and named).
 - [ ] An undo after a kill that was itself killed after it was done, and before it said so: the
   state it kept is named nowhere but in `nv log`.
-- [ ] A file of the tree being written when a command is killed is left as `.<name>.nv-<pid>-<n>`
-  beside it, an untracked file.
+- [ ] A file being written when a command is killed is left under `.nv/writing`, and nothing
+  removes it; in a checkout to a new directory, killed before its `.nv` exists, it is left as
+  `.nv-<pid>-<n>` beside the file.
+- [ ] A list item whose whole text is one of the placeholder words (`- None` in a list of states,
+  `- todo` as a column) is taken for a placeholder, and both sides' edits of it are kept.
+- [ ] `show` of a tag with an empty message prints a blank line Git does not.
 - [ ] `merge -m ''` of a branch that is only ahead is refused (Git moves the files and not the
   branch).
 - [ ] Once, a sync stopped by SIGHUP exited 2 rather than by the signal (nothing outlived it).

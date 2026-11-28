@@ -1316,6 +1316,14 @@ fn push(mut repo: Repo, args: &[&str]) -> Res<i32> {
       );
     }
     [] | ["origin"] => {}
+    // A name that finds more than one ref here is not pushed, as Git will not choose (sixth pass:
+    // a branch with the name of a tag, or named like a remote's, made a branch on origin).
+    ["origin", named] if named == branch && repo.all_named(named).len() > 1 => {
+      return fatal(
+        1,
+        format!("error: src refspec {named} matches more than one\nerror: failed to push some refs to '{}'", origin.display()),
+      );
+    }
     ["origin", named] if named == branch => {}
     _ => return unsupported(format_args!("push {}` (only the current branch, to the branch of its name on origin)", args.join(" "))),
   }
@@ -3706,7 +3714,9 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
   }
   if repo.merging().is_some() && here {
     let unmerged = repo.unmerged();
-    if !unmerged.is_empty() {
+    // Git refuses it while a file is unmerged only when told to be quiet; otherwise it makes the
+    // branch and leaves the files unmerged there (sixth pass).
+    if !unmerged.is_empty() && quiet(args) {
       // Git says which on its output, and that it will not on its errors.
       for path in &unmerged {
         out(&[path.as_slice(), b": needs merge\n"].concat());
@@ -3719,7 +3729,14 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
         return fatal(128, format!("fatal: a branch named '{name}' already exists"));
       }
     }
-    repo.end_merge();
+    // The merge is left behind; what is unmerged stays unmerged.
+    let _ = std::fs::remove_file(repo.meta("git-merge"));
+  } else if !repo.unmerged().is_empty() {
+    // Files left unmerged by a merge that was left behind: no branch is gone to over them.
+    for path in repo.unmerged() {
+      out(&[path.as_slice(), b": needs merge\n"].concat());
+    }
+    return fatal(1, "error: you need to resolve your current index first");
   }
   // Files that differ from the commit come along to wherever HEAD goes, and Git names them.
   let carried = |repo: &mut Repo| -> Res<()> {

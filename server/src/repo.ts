@@ -478,6 +478,50 @@ export class Repo extends DurableObject<Env> {
     }
   }
 
+  /// For each of these directories handed over: how many files it holds, whether a link may be
+  /// below it, and its longest path. One handed over before files were counted is counted now,
+  /// once, from what it was described as, and taken to hold links, as nothing noted them then
+  /// (sixth pass: such a directory counted as none, and bounded nothing built on it). One call for
+  /// all of them: an adopt asked once for each, and paid a round trip each time.
+  sumsOf(ids: Uint8Array[]): Map<string, { files: number; linked: boolean; deepest: number }> {
+    const sql = this.ctx.storage.sql;
+    const out = new Map<string, { files: number; linked: boolean; deepest: number }>();
+    const stack: { id: Uint8Array; children: Uint8Array[] | null }[] = ids.map((id) => ({ id, children: null }));
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      const key = hex(top.id);
+      if (out.has(key)) {
+        stack.pop();
+        continue;
+      }
+      const known = this.sums(top.id);
+      if (known) {
+        out.set(key, { ...known, deepest: this.deepest(top.id) });
+        stack.pop();
+        continue;
+      }
+      // Not a directory handed over at all: nothing to count, and nothing to note of it.
+      if (this.trees([top.id]).size === 0) {
+        out.set(key, { files: 0, linked: true, deepest: 0 });
+        stack.pop();
+        continue;
+      }
+      if (top.children === null) {
+        const rows = sql.exec<{ child: ArrayBuffer; dir: number }>("SELECT child, dir FROM tree_entries WHERE tree = ?", top.id).toArray();
+        top.children = rows.filter((r) => r.dir === 1).map((r) => new Uint8Array(r.child));
+        (top as { files?: number }).files = rows.filter((r) => r.dir !== 1).length;
+        for (const child of top.children) if (!out.has(hex(child))) stack.push({ id: child, children: null });
+        continue;
+      }
+      let files = (top as { files?: number }).files ?? 0;
+      for (const child of top.children) files += out.get(hex(child))?.files ?? 0;
+      sql.exec("INSERT OR REPLACE INTO tree_sums (id, files, linked) VALUES (?, ?, 1)", top.id, files);
+      out.set(key, { files, linked: true, deepest: this.deepest(top.id) });
+      stack.pop();
+    }
+    return out;
+  }
+
   /// How many files a directory handed over holds, and whether a link is below it; `null` for one
   /// handed over before these were counted.
   sums(id: Uint8Array): { files: number; linked: boolean } | null {

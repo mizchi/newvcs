@@ -126,3 +126,42 @@ fn a_refused_commit_stages_nothing() {
   assert_eq!(refused.status.code(), Some(125), "{refused:?}");
   assert_eq!(String::from_utf8_lossy(&sh("$NV git status --short").stdout), " M a.txt\n");
 }
+
+/// A file of the tree is made where no file of the tree can be, and put in place whole: a name as
+/// long as a file system takes is written, and a checkout killed part-way leaves nothing in the
+/// tree to be committed (sixth pass: a name beside the file was too long, and was left behind).
+#[test]
+fn a_file_is_made_out_of_the_tree_and_put_in_place() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("made-out-of-the-tree");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  let long = "n".repeat(255);
+  let made = sh(&format!(
+    "$NV git init -q -b main && echo a > {long} && for k in $(seq 1 30); do head -c 400000 /dev/zero | tr '\\0' a > big$k; done && $NV git add -A && $NV git commit -qm a && $NV git branch o \
+     && echo b > {long} && for k in $(seq 1 30); do head -c 400000 /dev/zero | tr '\\0' b > big$k; done && $NV git commit -qam b && $NV git checkout -q o && cat {long} && $NV git checkout -q main && cat {long}"
+  ));
+  assert!(made.status.success(), "{made:?}");
+  assert_eq!(String::from_utf8_lossy(&made.stdout), "a\nb\n");
+  for round in 0..20 {
+    sh(&format!(
+      "$NV git checkout -q o >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true",
+      2 + round * 3
+    ));
+    let left = sh("ls -a | grep -v '^\\.nv$' | grep '^\\.' | grep -v '^\\.\\.\\?$'; true");
+    assert_eq!(String::from_utf8_lossy(&left.stdout), "", "a killed checkout left this in the tree");
+    sh("$NV git reset -q --hard >/dev/null 2>&1; $NV git checkout -q main >/dev/null 2>&1; $NV git reset -q --hard >/dev/null 2>&1");
+  }
+}

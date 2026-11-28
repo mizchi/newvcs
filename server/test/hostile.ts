@@ -430,6 +430,21 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
       parts++;
     }
     assert.ok(parts < 23, `a directory of 2^${parts} files was taken one level at a time`);
+    // At the bound, handed over; set twice by one push, twice the bound (sixth pass).
+    let full = tree([0o100644, text("f"), blobIdOf(good)]);
+    const levels = [full];
+    for (let k = 0; k < 22; k++) {
+      full = tree([0o40000, text("a"), treeId(full)], [0o40000, text("b"), treeId(full)]);
+      levels.push(full);
+    }
+    assert.equal((await adopt(...levels.reverse())).status, 200);
+    const now = await tip();
+    const twice = commit(now.tip, [
+      { path: text("x1"), entry: { mode: 0o40000, id: treeId(full) } },
+      { path: text("x2"), entry: { mode: 0o40000, id: treeId(full) } },
+    ]);
+    assert.equal((await push("main", twice)).status, 400, "a push setting twice the bound of files was taken");
+    assert.deepEqual(await tip(), now);
   }
 
   // A position is a number written as one.

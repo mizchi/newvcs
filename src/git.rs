@@ -208,8 +208,14 @@ pub fn stamp(date: &str) -> Stamp {
   let wall = days * 86_400 + hour * 3600 + minute * 60 + second;
   let zone = zone.unwrap_or_else(|| local_zone(wall - offset_of(&local_zone(wall))));
   let seconds = wall - offset_of(&zone);
-  if !(1970..=2099).contains(&year) || !in_range(seconds) {
+  // Git judges the year as written; a time it takes that falls outside 1970 to 2099 once its zone
+  // is taken off is not read (sixth pass: Git takes `1970-01-01T00:00:00+01:00`, and writes it
+  // wrapped round).
+  if !(1970..=2099).contains(&year) {
     return Stamp::Refused;
+  }
+  if !in_range(seconds) {
+    return Stamp::NotRead;
   }
   Stamp::Taken(format!("{seconds} {zone}"))
 }
@@ -985,6 +991,8 @@ mod stamp_tests {
       "@999999999 +2400",
       "@100000000 +9999",
       "@4102444800 Z",
+      "1970-01-01T00:00:00+01:00",
+      "2099-12-31T23:59:59-01:00",
     ] {
       assert_eq!(stamp(date), Stamp::NotRead, "{date}");
     }

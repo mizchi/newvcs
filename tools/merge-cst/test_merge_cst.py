@@ -317,7 +317,7 @@ class WhatTheFifthPassFound(unittest.TestCase):
         self.assertNotEqual(code, 0, out)
 
     def test_placeholders_still_filled_by_both(self):
-        for item in ["- TBD", "- (none yet)", "- *(empty)*", "- _None_", "- Todo.", "1. TBD", "- [ ] TODO", "- Coming soon..."]:
+        for item in ["- TBD", "- (none yet)", "- *(empty)*", "- _None_", "- Todo.", "1. TBD", "- [ ] TODO", "- Coming soon...", "- ...", "- (...)"]:
             mark = "1." if item.startswith("1.") else "-"
             code, out = merge("x.md", f"# A\n\n{item}\n", f"# A\n\n{mark} ours\n", f"# A\n\n{mark} theirs\n")
             self.assertEqual(code, 0, f"{item}: {out}")
