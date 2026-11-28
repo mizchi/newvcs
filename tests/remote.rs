@@ -2575,7 +2575,7 @@ fn a_settling_goes_into_the_last_commit_that_changed_the_file() {
 
 /// Two writers on a fresh ref, both made from one Git repository of a six-line `a.txt` and a
 /// `b.txt`, and a way to run a script in either, with what it printed, stderr and all.
-fn two_writers(name: &str) -> (PathBuf, impl Fn(&str, &str) -> (i32, String)) {
+fn two_writers(name: &str) -> (PathBuf, impl Fn(&str, &str) -> (i32, String) + use<>) {
   let server = std::env::var("NV_SERVER").expect("NV_SERVER");
   let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("remote-{name}"));
   let _ = std::fs::remove_dir_all(&root);
@@ -2765,4 +2765,47 @@ fn restore_after_a_push_names_where_the_edit_is_kept() {
   assert_eq!(code, 0, "{said}");
   let id = said.split("kept as ").nth(1).map(str::trim).unwrap_or_else(|| panic!("{said}")).to_string();
   assert_eq!(run("w2", &format!("$NV restore . {id} >/dev/null && cat b.txt")).1, "x\nEDIT\n");
+}
+
+/// What a thirteenth reviewer found of merge drivers under a sync: one that never returns is
+/// stopped with the command and writes nothing after it; one killed by a signal is no result; and
+/// markers a driver leaves are a file to settle, whatever it says.
+#[test]
+fn what_a_thirteenth_reviewer_found_in_drivers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let clash = |name: &str, driver: &str| {
+    let (root, run) = two_writers(name);
+    assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(
+      run("w2", &format!("sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver {driver:?}")).0,
+      0
+    );
+    (root, run)
+  };
+  // Never returns, then writes: stopped with the sync, and with it, its writing.
+  let (root, run) = clash("thirteenth-driver-hangs", "sleep 3; echo LATE > b.txt; cat %B > %A");
+  let (code, said) = run("w2", "NV_TIMEOUT=1 $NV sync .");
+  assert_eq!(code, 124, "{said}");
+  std::thread::sleep(std::time::Duration::from_secs(4));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n");
+  // What it left of its own goes when a driver next runs.
+  assert_eq!(run("w2", "$NV git config merge.x.driver 'cat %B > %A' && $NV sync . >/dev/null && ls .nv | grep -c merge-").1, "0\n");
+
+  // Killed by a signal half way: the sync merges as text.
+  let (root, run) = clash("thirteenth-driver-killed", "echo half > %A; kill -9 $$");
+  let (code, said) = run("w2", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  let text = std::fs::read_to_string(root.join("w2/a.txt")).unwrap();
+  assert!(text.contains("<<<<<<< yours") && text.contains("w1") && !text.contains("half"), "{text}");
+
+  // Exit 0 with markers: a file to settle, and no push until it is.
+  let (_, run) = clash("thirteenth-driver-marks", "printf '<<<<<<< yours\\nA\\n=======\\nB\\n>>>>>>> theirs\\n' > %A");
+  let (code, said) = run("w2", "$NV sync .");
+  assert_eq!(code, 1, "{said}");
+  assert_ne!(run("w2", "$NV push .").0, 0);
 }

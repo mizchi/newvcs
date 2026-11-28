@@ -188,3 +188,32 @@ class Others(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@needs_tree_sitter
+class WhatTheThirteenthRoundFound(unittest.TestCase):
+    """A merge it calls clean reads back as the units it merged, each whole; a unit one side
+    removed and the other changed is a conflict; a side that changed nothing gives the other."""
+
+    def test_a_unit_put_after_one_with_no_line_end_is_not_run_into_it(self):
+        for base, ours, theirs in [
+            ("a = 1\nb = 2\n", "b = 2\n", "# note\nb = 2\n"),
+            ("a = 1\nb = 2\n", "b = 2\n", "c = 3\nb = 2\n"),
+            ("a = 1\nb = 2\n", "b = 2\na = 1\n", "a = 1\nb = 2\nc = 3\n"),
+        ]:
+            code, text = merge("x.py", base, ours, theirs)
+            self.assertEqual(code, 1, f"called clean: {text!r}")
+        code, text = merge("x.md", "# T\n\n- x\n- y\n", "# T\n\n- x\n- y", "# T\n\n- x\n- y\n- z\n")
+        self.assertNotIn("- y- z", text)
+
+    def test_a_list_one_side_removed_and_the_other_changed_is_a_conflict(self):
+        code, text = merge("x.md", "# T\n\n- x\n- y\n", "# T\n\n", "# T\n\n- z\n")
+        self.assertEqual(code, 1)
+        self.assertIn("- z", text)
+
+    def test_a_side_that_changed_nothing_gives_the_other(self):
+        base = "def f():\n    pass\n\ndef g():\n    pass\n"
+        moved = "def g():\n    pass\n\ndef f():\n    pass\n"
+        self.assertEqual(merge("x.py", base, base, moved), (0, moved))
+        self.assertEqual(merge("x.py", base, moved, base), (0, moved))
+        self.assertEqual(merge("x.py", base, moved, moved), (0, moved))

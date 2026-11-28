@@ -271,28 +271,33 @@ def merge_units(base, ours, theirs):
     # of is a unit both changed, unless it is one item of many (a list's): a conflict.
     base_keys = [u.key for u in base]
 
-    def anchor(side, i):
-        while i > 0:
-            i -= 1
-            if side[i].key in b:
-                return side[i].key
-        return None
+    def anchors(side):
+        # For each unit of a side, the last unit of the base before it there: one pass, not one
+        # look back per unit (thirteenth round: 16,000 units put in at one place took 16 s).
+        out, last = [], None
+        for u in side:
+            out.append(last)
+            if u.key in b:
+                last = u.key
+        return out
 
-    def replaced(side, keys):
+    ours_anchors, theirs_anchors = anchors(ours), anchors(theirs)
+
+    def replaced(side, keys, side_anchors):
         put = {}
         for i, u in enumerate(side):
             if u.key not in b:
-                put.setdefault(anchor(side, i), []).append(u.render())
-        out = {}
-        for j, k in enumerate(base_keys):
+                put.setdefault(side_anchors[i], []).append(u.render())
+        out, before = {}, None
+        for k in base_keys:
             if k in keys:
+                before = k
                 continue
-            before = next((base_keys[m] for m in range(j - 1, -1, -1) if base_keys[m] in keys), None)
             if before in put:
                 out[k] = put[before]
         return out
 
-    by_ours, by_theirs = replaced(ours, o), replaced(theirs, t)
+    by_ours, by_theirs = replaced(ours, o, ours_anchors), replaced(theirs, t, theirs_anchors)
     for k, unit in b.items():
         # Blank space between units goes with the unit after it, and moves as they are put in.
         if unit.kind in COLLECTION_ITEMS or not unit.render().strip() or k not in by_ours or k not in by_theirs:
@@ -306,28 +311,55 @@ def merge_units(base, ours, theirs):
     # to where the base had it.
     place = {k: i for i, k in enumerate(base_keys)}
 
-    def after_anchor(side, i, rank):
-        a = anchor(side, i)
+    def after_anchor(side_anchors, i, rank):
+        a = side_anchors[i]
         return (place[a] + 1 if a is not None else 0, rank, i)
 
+    # A unit ours removed is gone only if theirs left it as it was: one theirs changed is a conflict
+    # (thirteenth round: a list ours removed went, with the items theirs put in it).
+    for k in base_keys:
+        if k not in o:
+            merged(k)
     placed = []
     for i, u in enumerate(ours):
         m = merged(u.key)
         if m is not None:
-            placed.append(((place[u.key], 2, i) if u.key in b else after_anchor(ours, i, 0), m))
+            placed.append(((place[u.key], 2, i) if u.key in b else after_anchor(ours_anchors, i, 0), m))
     for i, u in enumerate(theirs):
         if u.key in o or u.key in b:
             # Theirs of a unit ours has too, or one ours removed: merged above, or removed.
             continue
         m = merged(u.key)
         if m is not None:
-            placed.append((after_anchor(theirs, i, 1), m))
+            placed.append((after_anchor(theirs_anchors, i, 1), m))
     # What follows the last unit stays last.
     placed.sort(key=lambda p: (p[1].key == "<tail>", p[0]))
     return [m for _, m in placed]
 
 
+def plain_key(key):
+    """A unit's key without the place among alike siblings that `units` adds to a second one."""
+    head, sep, tail = key.rpartition("#")
+    return head if sep and tail.isdigit() else key
+
+
+def keys_of(us):
+    """The keys of units and of the units within them, in order, blank space and tails left out."""
+    for u in us:
+        if u.key == "<tail>" or not u.render().strip():
+            continue
+        yield plain_key(u.key)
+        if u.parts:
+            yield from keys_of(u.parts)
+
+
 def merge_source(parser, language, base, ours, theirs):
+    # Where one side changed nothing, the other side is the merge, as Git has it (thirteenth round:
+    # a move one side made was undone where the other had not changed the file).
+    if ours == base or ours == theirs:
+        return theirs
+    if theirs == base:
+        return ours
     if language == "lean":
         parts = [lean_units(v) for v in (base, ours, theirs)]
         return "".join(u.render() for u in merge_units(*parts)).encode("utf-8", "surrogateescape")
@@ -335,7 +367,17 @@ def merge_source(parser, language, base, ours, theirs):
     if any(tree.root_node.has_error for tree in trees):
         raise Conflict("a version does not parse")
     parts = [units(v, tree.root_node, language, 0, len(v)) for v, tree in zip((base, ours, theirs), trees)]
-    return "".join(u.render() for u in merge_units(*parts)).encode("utf-8", "surrogateescape")
+    merged = merge_units(*parts)
+    result = "".join(u.render() for u in merged).encode("utf-8", "surrogateescape")
+    # What was merged is what is written only if it reads back as those units, each whole: a unit
+    # put after one that had no line ending of its own runs into it (thirteenth round: `# note`
+    # and `b = 2` became one comment, exit 0). Otherwise it is not this driver's to decide.
+    tree = parser.parse(result)
+    if tree.root_node.has_error:
+        raise Conflict("the merge does not parse")
+    if list(keys_of(units(result, tree.root_node, language, 0, len(result)))) != list(keys_of(merged)):
+        raise Conflict("the merge does not read back as the units merged")
+    return result
 
 
 def fall_back(a, o, b, labels, size):

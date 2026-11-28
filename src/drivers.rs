@@ -51,14 +51,26 @@ pub fn merge_file(root: &Path, path: &[u8], base: &[u8], ours: &[u8], theirs: &[
 /// own is given them (`%X`, `%Y`) to write.
 pub fn merge_file_marked(root: &Path, path: &[u8], base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<(Vec<u8>, bool)> {
   let names = ["base", "yours", "theirs"];
-  let (text, clean) = merge_file(root, path, base, ours, theirs, names)?;
+  let (text, clean) = match merge_file(root, path, base, ours, theirs, names) {
+    // A driver killed by a signal said nothing of the file: merged as text, as one that failed.
+    Err(why) if why.contains(KILLED) => (Vec::new(), false),
+    other => other?,
+  };
   let marked = text.split(|&b| b == b'\n').any(|line| line.starts_with(b"<<<<<<< yours"));
-  if clean || marked {
-    return Ok((text, clean));
+  // Markers are what a sync leaves to settle by, whatever the driver said of them (thirteenth
+  // round: a driver that left them and exited 0 had them committed, and the push refused).
+  if marked {
+    return Ok((text, false));
+  }
+  if clean {
+    return Ok((text, true));
   }
   let union = merge_of(root, path) == Merge::Union;
   Ok(crate::union::merge_text(base, ours, theirs, names[1], names[2], union))
 }
+
+/// What the error of a driver killed by a signal says, for a sync to know it by.
+const KILLED: &str = " died of signal ";
 
 /// A value as Git puts it on a driver's command line: in single quotes, a quote as `'\''`.
 fn quoted(value: &str) -> String {
@@ -70,7 +82,19 @@ fn run(root: &Path, command: &str, path: &[u8], base: &[u8], ours: &[u8], theirs
   static SEQ: AtomicUsize = AtomicUsize::new(0);
   // The three versions, as files in the workspace's own directory, named relative to the
   // workspace, where the command runs: what a driver is handed is nothing of the tree's.
-  let dir = format!(".nv/merge-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+  let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+  let dir = format!(".nv/merge-{}-{seq}", std::process::id());
+  // What a command stopped part-way left of its own, where only one command at a time runs in a
+  // workspace: gone before anything else (thirteenth round: left there for good).
+  if seq == 0 {
+    let own = format!("merge-{}-", std::process::id());
+    for entry in std::fs::read_dir(root.join(".nv")).into_iter().flatten().flatten() {
+      let name = entry.file_name().to_string_lossy().into_owned();
+      if name.starts_with("merge-") && !name.starts_with(&own) {
+        let _ = std::fs::remove_dir_all(entry.path());
+      }
+    }
+  }
   let at = root.join(&dir);
   std::fs::create_dir_all(&at).map_err(|e| format!("cannot make {}: {e}", at.display()))?;
   let done = (|| -> Result<(Vec<u8>, bool)> {
@@ -107,6 +131,11 @@ fn run(root: &Path, command: &str, path: &[u8], base: &[u8], ours: &[u8], theirs
     child.arg("-c").arg(&line).current_dir(root).stdin(std::process::Stdio::null());
     let what = format!("the merge driver for {path_text} (`{command}`)");
     let status = crate::limits::run(&mut child, crate::limits::merge_driver(), &what)?;
+    // Killed by a signal, it said nothing of the file: what it left in %A is not a result, and
+    // Git takes the merge as failed (thirteenth round: a half-written %A was taken as the conflict).
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+      return Err(format!("{what}{KILLED}{signal}: nothing of the merge was taken from it"));
+    }
     let result = std::fs::read(root.join(&a)).map_err(|e| format!("{what} left no result: {e}"))?;
     Ok((result, status.success()))
   })();

@@ -89,21 +89,32 @@ pub fn run(command: &mut std::process::Command, limit: Option<Duration>, what: &
   use std::os::unix::process::CommandExt;
   command.process_group(0);
   let mut child = command.spawn().map_err(|e| format!("cannot start {what}: {e}"))?;
-  let Some(limit) = limit else { return child.wait().map_err(|e| e.to_string()) };
-  let started = Instant::now();
-  loop {
-    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-      return Ok(status);
+  let group = child.id() as i32;
+  RUNNING.lock().unwrap_or_else(|e| e.into_inner()).push(group);
+  let done = (|| {
+    let Some(limit) = limit else { return child.wait().map_err(|e| e.to_string()) };
+    let started = Instant::now();
+    loop {
+      if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        return Ok(status);
+      }
+      if started.elapsed() >= limit {
+        // SAFETY: a signal to the process group the child leads, made for it above.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let _ = child.wait();
+        return Err(format!("{what} did not finish in {} s and was stopped, with what it had started", limit.as_secs()));
+      }
+      std::thread::sleep(Duration::from_millis(5));
     }
-    if started.elapsed() >= limit {
-      // SAFETY: a signal to the process group the child leads, made for it above.
-      unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-      let _ = child.wait();
-      return Err(format!("{what} did not finish in {} s and was stopped, with what it had started", limit.as_secs()));
-    }
-    std::thread::sleep(Duration::from_millis(5));
-  }
+  })();
+  RUNNING.lock().unwrap_or_else(|e| e.into_inner()).retain(|g| *g != group);
+  done
 }
+
+/// The process groups of the children `run` is waiting on: stopped with the command, should the
+/// command's own limit stop it (thirteenth round: a merge driver that never returned went on,
+/// after the sync that started it was stopped, and wrote into the workspace without its lock).
+static RUNNING: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
 /// Give the whole command `command()` to run, then stop it with a message and exit code 124, as
 /// `timeout(1)` does. Called once, at the start of a command.
@@ -116,6 +127,10 @@ pub fn watch_the_clock(what: &str) {
       "nv: `{what}` was still running after {} s and was stopped. What it had done is kept as far as it went, as for any command stopped part-way. (NV_TIMEOUT sets the limit; 0 is none.)",
       limit.as_secs()
     );
+    for group in RUNNING.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+      // SAFETY: a signal to a process group `run` made for a child it has not yet reaped.
+      unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
     std::process::exit(124);
   });
 }
