@@ -178,6 +178,8 @@ by `tools/merge-cst`. 11 acceptance tests. nv at 3c58494 (short `nv help`).
 | nv, a commit of clashed files alone kept (0a48480) | 3 | **105.1, 110.1, 117.1** | 1.45 to 1.70 | 40 to 50 | 3 to 7 | 0 to 1 | **0** |
 | nv, Git's verbs toward the ref (99416be) | 3 | **91.0, 91.1, 103.1** | 1.38 to 1.54 | 37 to 45 | 3 to 6 | 0 | 0 |
 | nv-git: the Git prompt, `git` being nv's (b929317) | 3 | 88.0, 95.0, 101.1 | 1.37 to 1.49 | 40 to 46 | 2 to 5 | 0 | 0 |
+| nv-git, `commit -m -m`, `-F`, `diff <path>` spoken (4bff85f) | 3 | 87.1, 93.2, 96.1 | 1.25 to 1.31 | 35 to 37 | 4 to 6 | 0 | 0 |
+| git, the same hour | 2 | 89.1, 94.1 | 1.24, 1.26 | 34, 34 | 3, 4 | 0 | 0 |
 | supervisor | 1 | 200.2 | 1.89 | 53 | 3 | 0 | 0 |
 | parallel | 1 | 190.3 | 2.55 | 60 | 4 | 3 | 1 |
 
@@ -219,6 +221,14 @@ reference: the longest a developer took was 134 s.
   standard input (6), `diff` of a path named without `--` and `diff --diff-filter=U` (5), and
   `fetch` toward the ref (4, refused by design). The rounds were as quick as nv's (median 95 s,
   Git's 113) at what nv's cost (mean 1.45, nv's 1.47, Git's 1.37).
+- **With those spoken** (4bff85f, Git compatibility case 44), Git commands refused fell from 18
+  in three rounds to 3 (`fetch` twice, by design, and a `pull` without `--rebase`). Three rounds
+  run just after the machine was started again took 119 to 147 s: every workspace's first `lake
+  build` took 40 s instead of 2, the toolchain being read from a cold disk, 150 s of waiting in
+  all that no other round had; their cost (mean 1.40) is the comparable number. Run again once
+  warm, beside two rounds of Git in the same hour: **87 to 96 s against Git's 89 and 94, at a mean
+  of 1.28 against 1.25, 40 model calls a round against 38**. Within what these few rounds can
+  tell apart, a writer that knows Git does as well with nv as with Git, on this task.
 
 ## Counting Git's refusals
 
