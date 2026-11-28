@@ -485,26 +485,44 @@ fn place_one(files_dir: &Path, root: &Path, job: &Job) -> Result<(u64, u128)> {
       let _ = std::fs::remove_file(&dest);
       std::os::unix::fs::symlink(&to, &dest).map_err(|e| fail("link", &dest, e))?;
     }
-  } else if job.direct {
-    std::fs::write(&dest, job.bytes.as_deref().ok_or("a file without content")?.as_slice()).map_err(|e| fail("write", &dest, e))?;
-    if job.entry.mode & 0o111 != 0 {
-      std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
-    }
   } else {
-    let cached = shared_copy(files_dir, &job.entry.id);
-    if let Some(bytes) = &job.bytes {
-      // Written under another name first: a reader never sees half a file.
-      let temp = cached.with_extension(format!("tmp{}-{:?}", std::process::id(), std::thread::current().id()));
-      std::fs::write(&temp, bytes.as_slice()).map_err(|e| fail("write", &temp, e))?;
-      std::fs::rename(&temp, &cached).map_err(|e| fail("write", &cached, e))?;
+    // A file of the tree is made under another name and put in place whole: killed while it is
+    // written, a file is what it was or what it was to be, never half of it (fifth pass: an undo
+    // finished after a kill took a half-written file for an edit, and a build saw empty files).
+    let temp = writing_name(root, &dest);
+    if job.direct {
+      std::fs::write(&temp, job.bytes.as_deref().ok_or("a file without content")?.as_slice()).map_err(|e| fail("write", &temp, e))?;
+    } else {
+      let cached = shared_copy(files_dir, &job.entry.id);
+      if let Some(bytes) = &job.bytes {
+        // Written under another name first: a reader never sees half a file.
+        let made = cached.with_extension(format!("tmp{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::write(&made, bytes.as_slice()).map_err(|e| fail("write", &made, e))?;
+        std::fs::rename(&made, &cached).map_err(|e| fail("write", &cached, e))?;
+      }
+      clone_file(&cached, &temp).map_err(|e| fail("write", &dest, e))?;
     }
-    clone_file(&cached, &dest).map_err(|e| fail("write", &dest, e))?;
     if job.entry.mode & 0o111 != 0 {
-      std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
+      std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).map_err(|e| fail("mark executable", &dest, e))?;
+    }
+    if let Err(e) = std::fs::rename(&temp, &dest) {
+      let _ = std::fs::remove_file(&temp);
+      return Err(fail("write", &dest, e));
     }
   }
   let meta = std::fs::symlink_metadata(&dest).map_err(|e| fail("look at", &dest, e))?;
   Ok((meta.len(), mtime_of(&meta)))
+}
+
+/// A name beside a file of the tree for it while it is made, so that it is put in place by a
+/// rename in its own directory (one directory for all of them made a checkout's threads queue
+/// for it). A command killed there leaves `.<name>.nv-<pid>-<n>`, which the next restore or sync
+/// of that directory takes for an untracked file and leaves alone.
+fn writing_name(_root: &Path, dest: &Path) -> PathBuf {
+  static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  let name = dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+  dest.with_file_name(format!(".{name}.nv-{}-{n}", std::process::id()))
 }
 
 fn shared_dirs(files_dir: &Path) -> Result<()> {
@@ -2038,7 +2056,7 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
     return Err(format!("the name to sign the commit as is empty, once what Git takes out of a name is taken out (for <{email}>)"));
   }
   let when = match from_env("DATE").filter(|date| !date.is_empty()) {
-    Some(date) => crate::git::stamp(&date).ok_or_else(|| {
+    Some(date) => crate::git::stamp(&date).taken().ok_or_else(|| {
       format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601, as Git takes them")
     })?,
     None => {
@@ -2704,6 +2722,15 @@ fn restore_noted(store: &mut Store, ws: &mut Workspace, target: Id, author: &str
       root_of(store, &id)?;
       store.flush()?;
       ws.log("snapshot", &id)?;
+      // The undo goes on from that state now: killed again, the next run starts from it, and
+      // names it (fifth pass: it named the first run's, which did not have the edit).
+      if let Ok(text) = std::fs::read_to_string(undoing(ws)) {
+        let mut fields: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+        if fields.len() >= 3 {
+          fields[2] = hex(&id);
+          crate::write_whole(&undoing(ws), format!("{}\n", fields.join(" ")))?;
+        }
+      }
       done.kept = Some(id);
     }
   }

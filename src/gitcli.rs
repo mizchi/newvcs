@@ -458,7 +458,15 @@ impl Repo {
 
   /// A branch by the shortest name that finds it and nothing else, as Git shortens one.
   fn short_branch(&self, branch: &str) -> String {
-    if self.all_named(branch).len() > 1 { format!("heads/{branch}") } else { branch.to_string() }
+    // Found as the branch and nothing else: not a ref by a full name (`refs/tags/y`), and not the
+    // name of a remote, whose HEAD Git finds by it (fifth pass: `origin`, `refs/tags/y`).
+    let found = self.all_named(branch);
+    let a_remote = !self.store.refs_under(&format!("remotes/{branch}")).is_empty();
+    if found.len() == 1 && found[0].0 == Named::Branch && !branch.starts_with("refs/") && !a_remote {
+      branch.to_string()
+    } else {
+      format!("heads/{branch}")
+    }
   }
 
   /// A commit named the way Git names them: `HEAD`, a branch, a tag, a full id, with `^` and `~N` after.
@@ -696,12 +704,10 @@ fn identity(repo: &Repo, role: &str) -> Res<String> {
   }
   let date = match var("DATE").filter(|date| !date.is_empty()) {
     Some(date) => match crate::git::stamp(&date) {
-      Some(stamp) => stamp,
+      crate::git::Stamp::Taken(stamp) => stamp,
       // What Git refuses is refused as Git refuses it; the rest of what Git reads is not spoken.
-      None if date.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '-') => {
-        return fatal(128, format!("fatal: invalid date format: {date}"));
-      }
-      None => {
+      crate::git::Stamp::Refused => return fatal(128, format!("fatal: invalid date format: {date}")),
+      crate::git::Stamp::NotRead => {
         return unsupported(format_args!("commit with GIT_{role}_DATE={date}` (seconds and a zone, or a date as ISO 8601 writes it)"));
       }
     },
@@ -1958,6 +1964,13 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
   // took them for the merge's result).
   if merging.is_some() && amend {
     return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
+  }
+  // Who makes the commit, and when, is settled before anything is staged: a commit refused for
+  // it leaves the index as it was (fifth pass: `commit -a` refused for an empty name left every
+  // file staged, and the next commit of others published them).
+  identity(&repo, "COMMITTER")?;
+  if !amend {
+    identity(&repo, "AUTHOR")?;
   }
   // With -a every tracked file goes in as it is on disk, which settles the ones a merge left unsettled.
   if all && merging.is_some() {
@@ -3530,7 +3543,13 @@ fn tag(mut repo: Repo, args: &[&str]) -> Res<i32> {
       {
         return unsupported(format_args!("tag -a {name} {named}` (a tag of a tag)"));
       }
-      let mut at = repo.resolve(rest.first().copied().unwrap_or("HEAD"))?;
+      let target = rest.first().copied().unwrap_or("HEAD");
+      let lightweight = !has(args, "-a") && value(args, &["-m"]).is_none();
+      // A tag with no message names what it is given as it is, an annotated tag included (fifth
+      // pass: it named the commit under it).
+      let named_as = repo.resolve_any(target)?;
+      let mut at =
+        if lightweight && matches!(repo.store.kind_of(&named_as)?, Some(Kind::Tag)) { named_as } else { repo.resolve(target)? };
       if repo.store.read_ref(&format!("tags/{name}")).is_some() {
         return fatal(128, format!("fatal: tag '{name}' already exists"));
       }
@@ -3678,9 +3697,29 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
     }
     return Ok(code);
   }
-  // A branch is not gone to, or made, in the middle of a merge.
-  if repo.merging().is_some() {
+  // A branch is not gone to, or made, in the middle of a merge; but `checkout -b <name>` makes one
+  // where HEAD is, as Git does (fifth pass): refused while a file is unmerged, and otherwise the
+  // merge is left behind, what was added staying added.
+  let here = command == "checkout" && value(args, &[create_flag]).is_some() && plain.is_empty();
+  if repo.merging().is_some() && !here {
     return fatal(128, "fatal: cannot switch branch while merging\nConsider \"git merge --quit\" or \"git worktree add\".");
+  }
+  if repo.merging().is_some() && here {
+    let unmerged = repo.unmerged();
+    if !unmerged.is_empty() {
+      // Git says which on its output, and that it will not on its errors.
+      for path in &unmerged {
+        out(&[path.as_slice(), b": needs merge\n"].concat());
+      }
+      return fatal(1, "error: you need to resolve your current index first");
+    }
+    if let Some(name) = value(args, &[create_flag]) {
+      repo.new_ref("heads", name)?;
+      if repo.branch_tip(name).is_some() {
+        return fatal(128, format!("fatal: a branch named '{name}' already exists"));
+      }
+    }
+    repo.end_merge();
   }
   // Files that differ from the commit come along to wherever HEAD goes, and Git names them.
   let carried = |repo: &mut Repo| -> Res<()> {
@@ -3772,6 +3811,13 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
   Ok(0)
 }
 
+/// What `-m` says, every one of them, as Git takes it: each a paragraph, then cleaned (fifth pass:
+/// all but the first were dropped, and nothing was cleaned).
+fn given_message(args: &[&str]) -> Option<String> {
+  let given: Vec<&str> = args.iter().enumerate().filter(|(_, a)| **a == "-m").filter_map(|(i, _)| args.get(i + 1).copied()).collect();
+  (!given.is_empty()).then(|| cleaned(&given.join("\n\n")))
+}
+
 fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if has(args, "--abort") {
     if repo.merging().is_none() {
@@ -3846,6 +3892,11 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
         staged.join(" ")
       ),
     );
+  }
+  // Git moves the files and not the branch for an empty message given to a merge that would
+  // only move it forward: not done here.
+  if ahead.contains(&ours) && !has(args, "--no-ff") && given_message(args).is_some_and(|given| given.is_empty()) {
+    return unsupported("merge -m ''` that only moves the branch forward (Git moves the files and not the branch)");
   }
   if ahead.contains(&ours) && !has(args, "--no-ff") {
     // Nothing of ours that they lack: the branch just moves to where they are. What was staged
@@ -3980,7 +4031,7 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     Some((Named::Branch, _)) => "branch",
     _ => "commit",
   };
-  let message = value(args, &["-m"]).map(str::to_string).or(as_tag).unwrap_or_else(|| format!("Merge {kind} '{name}'{into}"));
+  let message = given_message(args).or(as_tag).unwrap_or_else(|| format!("Merge {kind} '{name}'{into}"));
   if !marked.is_empty() {
     // The merge stops here: what could be merged is in the files and in the index, and the
     // rest is in the files for someone to settle, add and commit.
@@ -4022,7 +4073,8 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     repo.set_staged(&staged)?;
     // The message its commit will carry, should nobody give another: Git notes what conflicted.
     let noted: String = marked.iter().map(|(path, _)| format!("#\t{}\n", String::from_utf8_lossy(path))).collect();
-    crate::write_whole(&repo.meta("git-merge"), format!("{}\n{}\n\n# Conflicts:\n{noted}", hex(&theirs), message.trim_end()))?;
+    let said = if message.is_empty() { String::new() } else { format!("{}\n\n", message.trim_end()) };
+    crate::write_whole(&repo.meta("git-merge"), format!("{}\n{said}# Conflicts:\n{noted}", hex(&theirs)))?;
     repo.set_unmerged(&marked.iter().map(|(path, _)| path.clone()).collect())?;
     println!("Automatic merge failed; fix conflicts and then commit the result.");
     return Ok(1);
@@ -4043,7 +4095,7 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
   }
   // A message given that is nothing once cleaned: the merge is made in the files and the index,
   // and left for a commit to complete, as Git leaves it (fourth pass: it was committed empty).
-  if value(args, &["-m"]).is_some_and(|given| cleaned(given).is_empty()) {
+  if given_message(args).is_some_and(|given| given.is_empty()) {
     let blocking = workspace::blocked(&mut repo.store, &repo.ws, &their_changes)?;
     if !blocking.is_empty() {
       return fatal(

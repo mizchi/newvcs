@@ -100,3 +100,29 @@ fn a_tag_named_like_a_branch_of_origins_is_not_that_branch() {
   let after = sh("cd w && $NV git branch --show-current && $NV git branch && ls");
   assert_eq!(String::from_utf8_lossy(&after.stdout), "main\n* main\na.txt\n");
 }
+
+/// A `commit -a` refused for a date nv does not read stages nothing, as one Git refuses does not
+/// (fifth pass: the files were left staged, and the next commit of others published them).
+#[test]
+fn a_refused_commit_stages_nothing() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("refused-commit-a");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  assert!(sh("$NV git init -q -b main && echo a > a.txt && $NV git add a.txt && $NV git commit -qm a && echo b >> a.txt").status.success());
+  let refused = sh("GIT_AUTHOR_DATE='Tue, 14 Nov 2023 22:13:20 +0100' $NV git commit -qam b");
+  assert_eq!(refused.status.code(), Some(125), "{refused:?}");
+  assert_eq!(String::from_utf8_lossy(&sh("$NV git status --short").stdout), " M a.txt\n");
+}

@@ -88,8 +88,15 @@ binary; each item gets a failing test or Git case before its fix.
 - [ ] While an undo cut short waits to be finished, `git status` says nothing of it.
 - [ ] Seen once, not made again (seed 316): `.nv/settling` named files as held out of the commit
   that already were as HEAD has them, and nothing could complete or undo the stop.
-- [ ] A killed undo or `nv restore` can leave a tracked file empty until it is finished: files of
-  the tree are written in place, not replaced whole.
+- [ ] A push of the workspace's own commit unstages a file staged after that commit, saying the
+  ref changed it (the staged copy is kept, and named).
+- [ ] An undo after a kill that was itself killed after it was done, and before it said so: the
+  state it kept is named nowhere but in `nv log`.
+- [ ] A file of the tree being written when a command is killed is left as `.<name>.nv-<pid>-<n>`
+  beside it, an untracked file.
+- [ ] `merge -m ''` of a branch that is only ahead is refused (Git moves the files and not the
+  branch).
+- [ ] Once, a sync stopped by SIGHUP exited 2 rather than by the signal (nothing outlived it).
 
 ### Server
 

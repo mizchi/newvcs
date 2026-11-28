@@ -80,6 +80,9 @@ export class Repo extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS links_awaited (id BLOB PRIMARY KEY) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS tree_links (tree BLOB NOT NULL, child BLOB NOT NULL, PRIMARY KEY (tree, child)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_sums (id BLOB PRIMARY KEY, files INTEGER NOT NULL, linked INTEGER NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS links_checked (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS trees_whole (id BLOB PRIMARY KEY) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS landed_merged (ref TEXT NOT NULL, sent BLOB NOT NULL, paths TEXT NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
     `);
   }
@@ -421,11 +424,16 @@ export class Repo extends DurableObject<Env> {
   private whole(dirs: Uint8Array[]): void {
     const sql = this.ctx.storage.sql;
     const seen = new Set<string>();
+    const walked: Uint8Array[] = [];
     const todo = [...dirs];
     while (todo.length > 0) {
       const dir = todo.pop()!;
       if (seen.has(hex(dir))) continue;
       seen.add(hex(dir));
+      // Found whole before, it is whole still: what the repository was sent it keeps (fifth pass:
+      // a directory set again unchanged was walked again).
+      if (sql.exec("SELECT 1 FROM trees_whole WHERE id = ?", dir).toArray().length > 0) continue;
+      walked.push(dir);
       for (const row of sql.exec<{ child: ArrayBuffer; dir: number }>("SELECT child, dir FROM tree_entries WHERE tree = ?", dir).toArray()) {
         const child = new Uint8Array(row.child);
         if (row.dir) {
@@ -437,6 +445,7 @@ export class Repo extends DurableObject<Env> {
         }
       }
     }
+    for (const id of walked) sql.exec("INSERT OR IGNORE INTO trees_whole (id) VALUES (?)", id);
   }
 
   /// The longest path below a directory handed over, from its top.
@@ -445,8 +454,15 @@ export class Repo extends DurableObject<Env> {
   }
 
   /// Note what a directory handed over holds, and the longest path below it.
-  describe(id: Uint8Array, entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean; link: boolean }[], deepest: number): void {
+  describe(
+    id: Uint8Array,
+    entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean; link: boolean }[],
+    deepest: number,
+    files: number,
+    linked: boolean,
+  ): void {
     const sql = this.ctx.storage.sql;
+    sql.exec("INSERT OR REPLACE INTO tree_sums (id, files, linked) VALUES (?, ?, ?)", id, files, linked ? 1 : 0);
     for (const e of entries) {
       if (e.link) sql.exec("INSERT OR IGNORE INTO tree_links (tree, child) VALUES (?, ?)", id, e.child);
       // Another repository's commit is neither: nothing below it is this repository's to have.
@@ -462,17 +478,31 @@ export class Repo extends DurableObject<Env> {
     }
   }
 
+  /// How many files a directory handed over holds, and whether a link is below it; `null` for one
+  /// handed over before these were counted.
+  sums(id: Uint8Array): { files: number; linked: boolean } | null {
+    const row = this.ctx.storage.sql.exec<{ files: number; linked: number }>("SELECT files, linked FROM tree_sums WHERE id = ?", id).toArray()[0];
+    return row ? { files: row.files, linked: row.linked === 1 } : null;
+  }
+
   /// The contents of every link below these directories, walked as `whole` walks them: what a
   /// push that sets one of them has to hold to what a link may be, however the content came.
-  linksBelow(dirs: Uint8Array[]): Uint8Array[] {
+  linksBelow(dirs: Uint8Array[]): { links: Uint8Array[]; walked: Uint8Array[] } {
     const sql = this.ctx.storage.sql;
     const seen = new Set<string>();
     const found = new Map<string, Uint8Array>();
+    const walked: Uint8Array[] = [];
     const todo = [...dirs];
     while (todo.length > 0) {
       const dir = todo.pop()!;
       if (seen.has(hex(dir))) continue;
       seen.add(hex(dir));
+      // Nothing to look for below one with no link anywhere in it, nor below one whose links were
+      // found sound when it was set before: a link's content is what its id says (fifth pass: every
+      // tree of a large directory was walked at each push that set it).
+      if (this.sums(dir)?.linked === false) continue;
+      if (sql.exec("SELECT 1 FROM links_checked WHERE id = ?", dir).toArray().length > 0) continue;
+      walked.push(dir);
       for (const row of sql.exec<{ child: ArrayBuffer }>("SELECT child FROM tree_links WHERE tree = ?", dir).toArray()) {
         const child = new Uint8Array(row.child);
         found.set(hex(child), child);
@@ -481,7 +511,12 @@ export class Repo extends DurableObject<Env> {
         todo.push(new Uint8Array(row.child));
       }
     }
-    return [...found.values()];
+    return { links: [...found.values()], walked };
+  }
+
+  /// Note directories whose links below were all found sound.
+  linksSound(dirs: Uint8Array[]): void {
+    for (const id of dirs) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO links_checked (id) VALUES (?)", id);
   }
 
   /// Note that these objects are directories: handed over as trees, and read as trees.

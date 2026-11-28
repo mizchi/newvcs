@@ -2118,12 +2118,13 @@ items `TODO.md` lists, and these, fixed the same way:
   heading, a function's name) edited on one side and taken out on the
   other as taken out and added**, and brought it back; two different edits
   of one list item were both kept. Both are conflicts. Only a list item
-  that holds a place (`(none yet)`, `TBD`, `TODO: ...`, `n/a`, `...`, or
-  any text wholly in brackets or emphasis) may be put in place of by both
-  sides, each with its own items; any other item replaced differently by
-  the two, or taken out by one and replaced by the other, is a conflict.
-  On 800 random merges, 183 are conflicts where 162 were before the third
-  pass.
+  that holds a place (`TBD`, `TODO`, `none yet`, `n/a`, `...`, `empty` and a
+  few more, alone, in brackets or emphasis or not: `(none yet)`, `*(empty)*`)
+  may be put in place of by both sides, each with its own items; any other
+  item replaced differently by the two, or taken out by one and replaced by
+  the other, is a conflict. An item with a list of its own below it holds
+  no place. On 800 random merges, 183 are conflicts where 162 were before
+  the third pass.
 - **`nv git`**: a tag and a branch of one name were the branch, where Git
   takes the tag (and says the name is ambiguous); merges of `tags/<t>`,
   `refs/tags/<t>` and `remotes/origin/<b>` were "Merge commit"; `merge` of a
@@ -2147,10 +2148,9 @@ the third pass's fixes holding, and these, fixed the same way:
 - **An identity variable set to nothing was taken as not set**, where Git
   refuses an empty name and writes an empty address; **a date Git refuses
   was taken** (`0`, `-5`: a commit with a negative date pushed to a Git
-  origin failed `git fsck` there), and a zone out of range was kept. Dates
-  are read as Git reads them: seconds of nine digits or more before 2100,
-  any after `@`, and a zone of under 24 hours and 60 minutes, or this
-  machine's.
+  origin failed `git fsck` there), and a zone out of range was kept. Of a
+  date, nv reads only what it knows Git to read the same way (see the fifth
+  pass below), and refuses with 125 a form it does not read.
 - **An undo finished after a kill wrote over an edit made in between and
   named as kept a state without it**: the edit is recorded first.
 - **`merge_cst.py` compared list items by likeness**, which was slow on
@@ -2163,6 +2163,53 @@ the third pass's fixes holding, and these, fixed the same way:
   message where Git stops; `rev-parse --abbrev-ref HEAD` gave a name that
   finds something else; and `switch` removed a file taken out of the index
   and kept on disk, which Git refuses (case 51).
+
+A fifth pass (about 12,000 steps, 200 kills and 7,000 requests) found the
+fourth pass's fixes holding, and these, fixed the same way:
+
+- **A `git commit -a` refused for who made it, or when, had staged every
+  file first**, and the next commit of other files published them: lines
+  nobody committed reached the ref twice in ten runs. Who makes a commit is
+  settled before anything is staged.
+- **Dates**: one before 1970 was written negative and pushed, and a Git
+  origin's `fsck` refused it; forms Git reads otherwise were taken and
+  written otherwise (`+01:00` after seconds, `-0000`); and forms nv does not
+  read answered with Git's error instead of a refusal. A date is taken only
+  as seconds of nine or ten digits before 2100 (`@` before them, or none),
+  with a zone of under 24 hours and 60 minutes, `+hh:mm` or `+hhmm`, or
+  none, or one out of range (this machine's, as Git has it, except after
+  `@`, where it is not read); or ISO 8601 to the second, from 1970 to 2099,
+  with `Z`, such a zone, or none. Seconds too few or a year out of range are
+  refused as Git refuses them (128); RFC 2822, fractions of a second and
+  every other form are not read (125). On 600 random environments, every
+  one nv takes gives Git's commit, and the rest are refused.
+- **Files of the tree were written in place**: killed, a restore or an undo
+  left a file half written (a build saw empty files), and an undo finished
+  after such a kill took the half file for an edit and named it as kept. A
+  file is written under a name beside it (`.<name>.nv-<pid>-<n>`) and
+  renamed into place; one killed between is left under that name. A
+  checkout of 20,000 files takes the same time as before (5.4 s and 5.5 s,
+  alternating runs on this container). The state an undo records is
+  written into its note, so that a run after another kill goes on from it.
+- **`merge_cst.py` took items that only begin or end like a placeholder
+  for one** (`TODO: fix the auth bug`, `(urgent) rotate the keys (today)`),
+  and an edit was lost: what holds a place is one of a few words, alone.
+- **The server took a directory of 2^60 files in 3 KB** (shared
+  directories), which no client could finish writing: a directory handed
+  over may hold 4,194,304 files at most, counted with those handed over
+  before. **A push that set a large directory walked all of it each time,
+  for its links and its files**: the walk now goes only where a link is
+  below, and not again into a directory found whole and sound. Setting a
+  directory of 2,021 trees, each holding a link, takes 1.1 s the first time
+  on the local runtime, where every repository shares one process and
+  waits; set again, 0.03 s.
+- **`nv git`**: `merge -m x -m y` kept only `x`, and a merge's message was
+  not cleaned; a tag without a message of an annotated tag named the commit
+  under it; `--abbrev-ref` gave `origin` and `refs/tags/y` for branches of
+  those names; `checkout -b` in a merge that stopped was refused, where Git
+  makes the branch (or refuses while a file is unmerged); and `merge -m ''`
+  that would only move the branch forward is refused, where Git moves the
+  files and not the branch (case 51).
 
 ## Why these choices
 

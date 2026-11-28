@@ -409,6 +409,29 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
     }
   }
 
+  // A directory of shared directories names 2^k files in k+1 trees: more than a client could
+  // write is refused when it is handed over (fifth pass: 2^60 files in 3 KB were taken).
+  {
+    let bomb = tree([0o100644, text("f"), blobIdOf(good)]);
+    const chain = [bomb];
+    for (let k = 0; k < 30; k++) {
+      bomb = tree([0o40000, text("a"), treeId(bomb)], [0o40000, text("b"), treeId(bomb)]);
+      chain.push(bomb);
+    }
+    const handed = await adopt(...chain.reverse());
+    assert.equal(handed.status, 400, `a directory of 2^30 files was taken: ${await handed.text()}`);
+    // Handed over a little at a time, the count goes on from what was handed over before.
+    let small = tree([0o100644, text("f"), blobIdOf(good)]);
+    let parts = 0;
+    for (let k = 0; k < 30; k++) {
+      small = tree([0o40000, text("a"), treeId(small)], [0o40000, text("b"), treeId(small)]);
+      const answer = await adopt(small);
+      if (answer.status === 400) break;
+      parts++;
+    }
+    assert.ok(parts < 23, `a directory of 2^${parts} files was taken one level at a time`);
+  }
+
   // A position is a number written as one.
   for (const bad of ["0x1", "1e0", "+1", "%201", "01", "", "-0"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);
   assert.equal((await fetch(`${server}/${repo}/since/main?after=-1`)).status, 200);

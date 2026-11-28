@@ -298,3 +298,26 @@ class WhatTheFourthPassFound(unittest.TestCase):
         code, out = merge("x.md", "# A\n\n" + items("base"), "# A\n\n" + items("ours"), "# A\n\n" + items("theirs"))
         self.assertNotEqual(code, 0)
         self.assertLess(time.monotonic() - started, 5)
+
+
+@needs_tree_sitter
+class WhatTheFifthPassFound(unittest.TestCase):
+    """An item that says something is not a placeholder for reading like one at its ends."""
+
+    def test_items_that_look_like_placeholders_and_say_something(self):
+        for item, ours, theirs in [
+            ("- [ ] TODO: fix the auth bug", "- [x] TODO: fix the auth bug", "- [ ] TODO: fix the auth bug (assigned: bob)"),
+            ("- (urgent) rotate the keys (today)", "- (urgent) rotate the keys (now)", "- (urgent) rotate all keys (today)"),
+            ("- **Important**: back up first, then **migrate**", "- **Important**: back up first", "- **Important**: migrate"),
+            ("- _deprecated_ use v2_", "- _deprecated_ use v3_", "- _deprecated_ use v4_"),
+        ]:
+            code, out = merge("x.md", f"# A\n\n{item}\n- c\n", f"# A\n\n{ours}\n- c\n", f"# A\n\n{theirs}\n- c\n")
+            self.assertNotEqual(code, 0, out)
+        code, out = merge("x.md", "# A\n\n- TODO: fix the auth bug\n- c\n", "# A\n\n- c\n", "# A\n\n- TODO: fix the auth bug in login.py\n- c\n")
+        self.assertNotEqual(code, 0, out)
+
+    def test_placeholders_still_filled_by_both(self):
+        for item in ["- TBD", "- (none yet)", "- *(empty)*", "- _None_", "- Todo.", "1. TBD", "- [ ] TODO", "- Coming soon..."]:
+            mark = "1." if item.startswith("1.") else "-"
+            code, out = merge("x.md", f"# A\n\n{item}\n", f"# A\n\n{mark} ours\n", f"# A\n\n{mark} theirs\n")
+            self.assertEqual(code, 0, f"{item}: {out}")

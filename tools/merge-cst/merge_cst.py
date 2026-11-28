@@ -231,19 +231,30 @@ def units(src, node, language, start, end):
 
 
 # What a list item reads as when it holds a place for items still to come.
-PLACEHOLDERS = {"tbd", "tba", "todo", "none", "none yet", "n/a", "na", "...", "\u2026", "-", "wip", "nothing yet", "coming soon"}
+PLACEHOLDERS = {"tbd", "tba", "todo", "none", "none yet", "n/a", "na", "...", "\u2026", "-", "wip", "nothing yet", "coming soon", "empty"}
 
 
 def placeholder(unit):
-    """Whether a list item only holds a place: `(none yet)`, `TBD`, `TODO: ...`, `n/a`, `...`. Two
-    sides may each put their own items in place of one; an item that says something is changed by
-    whoever replaces it (fourth pass: a likeness of texts was slow, and wrong below its threshold)."""
+    """Whether a list item only holds a place: `(none yet)`, `TBD`, `n/a`, `...`, or one word or a
+    few wholly in brackets or emphasis. Two sides may each put their own items in place of one; an
+    item that says something is changed by whoever replaces it (fourth pass: a likeness of texts
+    was slow, and wrong below its threshold; fifth pass: `TODO: fix the auth bug` and
+    `(urgent) rotate the keys (today)` were taken for placeholders, and an edit was lost)."""
     text = unit.render().strip()
+    if "\n" in text:
+        return False
     text = re.sub(r"^([-*+]|[0-9]+[.)])\s+(\[[ xX]\]\s+)?", "", text).strip()
-    if len(text) >= 2 and text[0] + text[-1] in ("()", "[]", "__", "**", "<>"):
-        return True
-    word = text.lower().rstrip(".:!")
-    return word in PLACEHOLDERS or word.split(":")[0].strip() in PLACEHOLDERS
+    # Brackets and emphasis around it, one pair in another as `*(empty)*`, are taken off: what
+    # is left has to be one of the words that hold a place, not a few words of anything.
+    for _ in range(3):
+        for left, right in (("**", "**"), ("__", "__"), ("(", ")"), ("[", "]"), ("<", ">"), ("*", "*"), ("_", "_")):
+            inner = text[len(left) : len(text) - len(right)]
+            if len(text) > len(left) + len(right) and text.startswith(left) and text.endswith(right) and left not in inner and right not in inner:
+                text = inner.strip()
+                break
+        else:
+            break
+    return text.lower().rstrip(".:!") in PLACEHOLDERS
 
 
 def merge_units(base, ours, theirs):

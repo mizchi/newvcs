@@ -55,6 +55,10 @@ import compiledMerger from "./merger.wasm";
 import { type Attested, type Landed, Repo, type Placed, type Stated, type Step } from "./repo.ts";
 import { decodeTree, KIND_TREE, MODE_DIR, MODE_GITLINK } from "./tree.ts";
 
+/// The most files a directory handed over may hold, all below it counted: more than any client
+/// would write, and few enough that one could (2^22).
+const MAX_FILES = 4_194_304;
+
 export { Repo };
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
@@ -267,7 +271,8 @@ export default {
           // the directory comes into the ref, not where a content comes in, as the same bytes may be
           // any file's (fourth pass: a note of them refused honest files, and missed adoption).
           const dirs = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_DIR ? [c.entry.id] : [])));
-          if (dirs.length > 0) links.push(...(await repo.linksBelow(dirs)));
+          const below = dirs.length > 0 ? await repo.linksBelow(dirs) : { links: [], walked: [] };
+          links.push(...below.links);
           if (links.length > 0) {
             const sent = new Map(contents.map((bytes) => [hex(blobId(bytes)), bytes]));
             const elsewhere = links.filter((id) => !sent.has(hex(id)));
@@ -276,6 +281,12 @@ export default {
               const target = sent.get(hex(id)) ?? stored.get(hex(id));
               if (target && !linkOk(target)) return json({ error: "a link leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
             }
+          }
+          // Their links all sound, the directories walked need not be again.
+          if (below.walked.length > 0) {
+            const sent = new Set(contents.map((bytes) => hex(blobId(bytes))));
+            const known = new Set((await repo.where(below.links)).map((c) => hex(c.id)));
+            if (below.links.every((id) => sent.has(hex(id)) || known.has(hex(id)))) await repo.linksSound(below.walked);
           }
           const result = await repo.push(arg, commits, after, placed);
           if (result.status === "conflict" && attested) {
@@ -300,6 +311,11 @@ export default {
           // No path below these longer than a file system takes, those handed over before
           // included: the longest below each, worked out from the bottom up without recursion.
           const deepest = new Map<string, number>();
+          // And how many files each holds, and whether any link is below it: a directory of shared
+          // directories can name more files than any client could write (fifth pass: 2^60 in 3 KB),
+          // and a push need look for links only where there are some.
+          const fileCount = new Map<string, number>();
+          const linkBelow = new Map<string, boolean>();
           {
             const byId = new Map(trees.map((t) => [hex(t.id), t]));
             const waiting = new Map<string, number>();
@@ -313,12 +329,26 @@ export default {
             while (ready.length > 0) {
               const id = ready.pop()!;
               let longest = 0;
+              let count = 0;
+              let anyLink = false;
               for (const e of byId.get(id)!.entries) {
                 const below = e.mode === MODE_DIR ? 1 + (deepest.get(hex(e.id)) ?? (await repo.deepest(e.id))) : 0;
                 longest = Math.max(longest, e.name.length + below);
+                if (e.mode === MODE_DIR) {
+                  const known = fileCount.has(hex(e.id)) ? { files: fileCount.get(hex(e.id))!, linked: linkBelow.get(hex(e.id))! } : await repo.sums(e.id);
+                  // One handed over before these were counted: its files are not known, and it may hold links.
+                  count += known?.files ?? 0;
+                  anyLink ||= known?.linked ?? true;
+                } else {
+                  count += 1;
+                  anyLink ||= e.mode === MODE_LINK;
+                }
               }
               if (longest > MAX_PATH) return json({ error: "a directory below these has a path longer than a file system takes" }, 400);
+              if (count > MAX_FILES) return json({ error: `a directory below these holds more than ${MAX_FILES} files` }, 400);
               deepest.set(id, longest);
+              fileCount.set(id, count);
+              linkBelow.set(id, anyLink);
               for (const parent of above.get(id) ?? []) {
                 const left = waiting.get(parent)! - 1;
                 waiting.set(parent, left);
@@ -380,7 +410,7 @@ export default {
               gitlink: e.mode === MODE_GITLINK,
               link: e.mode === MODE_LINK,
             }));
-            await repo.describe(t.id, entries, deepest.get(hex(t.id))!);
+            await repo.describe(t.id, entries, deepest.get(hex(t.id))!, fileCount.get(hex(t.id))!, linkBelow.get(hex(t.id))!);
           }
           await repo.markTrees(trees.map((t) => t.id));
           return json({ adopted, missing: missing.map(hex) });
