@@ -81,7 +81,6 @@ fsck --lost-found
 
 # Options that are spoken, with arguments that are not.
 checkout HEAD~1
-commit -m one -m two
 config core.editor vim
 log main side
 

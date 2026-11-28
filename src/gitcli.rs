@@ -676,11 +676,30 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
   ("mv", &[]),
   ("restore", &["--staged", "--"]),
   ("reset", &["-q", "--quiet", "--hard", "--soft", "--mixed", "--"]),
-  ("commit", &["-q", "--quiet", "-a", "--all", "--allow-empty", "--amend", "--no-edit", "-m=", "-am=", "-qm=", "-qam=", "-aqm="]),
+  (
+    "commit",
+    &[
+      "-q",
+      "--quiet",
+      "-a",
+      "--all",
+      "--allow-empty",
+      "--amend",
+      "--no-edit",
+      "-m=",
+      "-am=",
+      "-qm=",
+      "-qam=",
+      "-aqm=",
+      "-F=",
+      "--file=",
+      "--file=*",
+    ],
+  ),
   ("status", &["--porcelain", "--short", "-s"]),
   ("log", &["--oneline", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "-n=", "-n#", "-#"]),
   ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "--"]),
-  ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged", "--"]),
+  ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged", "--diff-filter=*", "--"]),
   ("rev-parse", &["--short", "--abbrev-ref", "--show-toplevel"]),
   ("cat-file", &["-t", "-p", "-e"]),
   ("ls-tree", &["-r", "--name-only"]),
@@ -1667,9 +1686,37 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
       ),
     );
   }
-  if messages.len() > 1 {
-    return unsupported("commit` with more than one -m");
+  // A message from a file, or from standard input with `-`: as it is, but for the blank lines
+  // and comments Git cleans off, as off one given with -m.
+  let from_file = value(args, &["-F", "--file"]).or_else(|| args.iter().find_map(|a| a.strip_prefix("--file=")));
+  if from_file.is_some() && !messages.is_empty() {
+    return fatal(128, "fatal: options '-m' and '-F' cannot be used together");
   }
+  let file_message = match from_file {
+    Some("-") => {
+      let mut text = String::new();
+      std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .map_err(|e| format!("fatal: could not read log from standard input: {e}"))?;
+      Some(text)
+    }
+    Some(file) => {
+      let path = Path::new(file);
+      let path =
+        if path.is_absolute() { path.to_path_buf() } else { repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.prefix)).join(path) };
+      match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(e) => return fatal(128, format!("fatal: could not read log file '{file}': {e}")),
+      }
+    }
+    None => None,
+  };
+  // Each -m a paragraph of its own, as Git puts them.
+  let joined = (messages.len() > 1).then(|| messages.iter().map(|m| m.trim_end()).collect::<Vec<_>>().join("\n\n"));
+  let messages: Vec<&str> = match (&file_message, &joined) {
+    (Some(text), _) => vec![text.as_str()],
+    (None, Some(joined)) => vec![joined.as_str()],
+    (None, None) => messages,
+  };
   if !positional("commit", args).is_empty() {
     return unsupported("commit` of named paths");
   }
@@ -2675,6 +2722,35 @@ fn revisions_and_paths<'a>(repo: &Repo, command: &str, args: &[&'a str]) -> Res<
   Ok((positional(command, &args[..at]), Some(paths)))
 }
 
+/// Names given with no `--`, as Git takes them: those that are revisions first, then those that
+/// are files, each a path; a name that is both, or neither, is Git's error.
+fn revisions_then_paths<'a>(repo: &mut Repo, names: Vec<&'a str>) -> Res<(Vec<&'a str>, Option<Paths>)> {
+  let ambiguous = |name: &str, why: &str| -> Res<(Vec<&'a str>, Option<Paths>)> {
+    fatal(
+      128,
+      format!(
+        "fatal: ambiguous argument '{name}': {why}\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'"
+      ),
+    )
+  };
+  let mut revisions = Vec::new();
+  let mut paths: Paths = Vec::new();
+  for name in names {
+    let file = repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(name))).exists();
+    if paths.is_empty() && repo.resolve(name).is_ok() {
+      if file {
+        return ambiguous(name, "both revision and filename");
+      }
+      revisions.push(name);
+    } else if file {
+      paths.push(repo.rooted(name));
+    } else {
+      return ambiguous(name, "unknown revision or path not in the working tree.");
+    }
+  }
+  Ok((revisions, (!paths.is_empty()).then_some(paths)))
+}
+
 fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
   let cached = has(args, "--cached") || has(args, "--staged");
   let root = |repo: &mut Repo, spec: &str| -> Res<Option<Id>> {
@@ -2682,7 +2758,33 @@ fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
     Ok(root_of(&mut repo.store, &id)?)
   };
   let (revisions, within) = revisions_and_paths(&repo, "diff", args)?;
+  let (revisions, within) = match within {
+    Some(within) => (revisions, Some(within)),
+    None => revisions_then_paths(&mut repo, revisions)?,
+  };
   let within = within.as_deref();
+  // `--diff-filter=<letters>`: only the changes of those kinds. `U`, the files a merge left
+  // unmerged, or a sync left with both versions, is a list of names, not of changes.
+  let filter = args.iter().find_map(|a| a.strip_prefix("--diff-filter="));
+  if let Some(letters) = filter {
+    if letters.is_empty() || !letters.bytes().all(|b| b"ACDMRTU".contains(&b)) {
+      return unsupported(format_args!("diff --diff-filter={letters}` (only the upper-case letters ACDMRTU are spoken)"));
+    }
+    if letters.contains('U') {
+      if letters != "U" || !(has(args, "--name-only") || has(args, "--name-status")) {
+        return unsupported("diff --diff-filter=U` but alone and with --name-only or --name-status");
+      }
+      let mut unmerged: Vec<Vec<u8>> = repo.unmerged().into_iter().collect();
+      unmerged.extend(workspace::unsettled(&repo.ws).into_iter().map(String::into_bytes));
+      unmerged.sort();
+      unmerged.dedup();
+      for path in unmerged.iter().filter(|p| within.is_none_or(|w| is_within(p, w))) {
+        let shown = quoted(path, false);
+        out(&[if has(args, "--name-status") { b"U\t".as_slice() } else { b"" }, &shown, b"\n"].concat());
+      }
+      return Ok(0);
+    }
+  }
   let changes = match revisions[..] {
     [a, b] if !cached => {
       for named in [a, b] {
@@ -2705,6 +2807,10 @@ fn diff_command(mut repo: Repo, args: &[&str]) -> Res<i32> {
     }
     [] => on_disk(&mut repo, cached, within)?,
     _ => return unsupported("diff` with this combination of revisions and paths"),
+  };
+  let changes: Vec<FileChange> = match filter {
+    Some(letters) => changes.into_iter().filter(|c| c.letter().chars().next().is_some_and(|l| letters.contains(l))).collect(),
+    None => changes,
   };
   out(&rendered(args, &changes)?);
   Ok(0)

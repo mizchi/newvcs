@@ -2273,6 +2273,8 @@ fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
   let (code, said) = run("bob", "$NV git pull --rebase");
   assert_eq!(code, 1, "{said}");
   assert!(said.contains("both sides changed the same lines of: list"), "{said}");
+  // The files it left with both versions are what Git's rebase would list as unmerged.
+  assert_eq!(run("bob", "$NV git diff --name-only --diff-filter=U").1, "list\n");
   // Undone as Git's rebase is, to what was there before.
   let (code, said) = run("bob", "$NV git rebase --abort");
   assert_eq!(code, 0, "{said}");

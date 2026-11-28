@@ -43,3 +43,4 @@
 41-staged-files-nobody-walks-to.sh
 42-reset-hard-from-a-directory.sh
 43-merge-drivers.sh
+44-messages-and-diff-names.sh
