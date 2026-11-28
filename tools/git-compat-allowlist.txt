@@ -44,3 +44,4 @@
 42-reset-hard-from-a-directory.sh
 43-merge-drivers.sh
 44-messages-and-diff-names.sh
+45-status-branch-line.sh

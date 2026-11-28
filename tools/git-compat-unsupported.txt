@@ -33,7 +33,6 @@ hash-object a.txt
 bundle create x HEAD
 
 # Commands that are spoken, with an option that is not.
-status --branch
 status -uno
 diff -w
 diff --numstat

@@ -1832,6 +1832,30 @@ pub(crate) fn unheard(ws: &Workspace) -> PathBuf {
   ws.root.join(META).join("pushing")
 }
 
+/// Where a fetch last found the ref: its tip and its position in the ref's history. It is only
+/// something to look at (`origin/<ref>` in `nv git`); what the workspace stands on is `pushed`.
+fn fetched_note(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("fetched")
+}
+
+pub fn set_fetched(ws: &Workspace, tip: Id, seq: u64) -> Result<()> {
+  crate::write_whole(&fetched_note(ws), format!("{} {seq}\n", hex(&tip)))
+}
+
+/// The ref's tip as this workspace last saw it: from its last sync or push, or from a fetch
+/// since, whichever is further along the ref's history.
+pub fn ref_as_seen(ws: &Workspace) -> Option<Id> {
+  let fetched = std::fs::read_to_string(fetched_note(ws)).ok().and_then(|text| {
+    let mut fields = text.split_whitespace();
+    let id = fields.next().and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok())?;
+    Some((id, fields.next()?.parse::<u64>().ok()?))
+  });
+  match fetched {
+    Some((id, seq)) if ws.pushed.is_none() || seq > ws.seq => Some(id),
+    _ => ws.pushed,
+  }
+}
+
 /// The commits a push carried that the workspace has not heard about: `(how many, the last)`.
 pub fn unheard_push(ws: &Workspace) -> Option<(usize, Id)> {
   let text = std::fs::read_to_string(unheard(ws)).ok()?;

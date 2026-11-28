@@ -673,6 +673,62 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   Ok(done)
 }
 
+/// What a fetch found: the ref's tip as the workspace had seen it, the tip now, and how many of
+/// the ref's commits and file contents came.
+#[derive(Debug, Default)]
+pub struct Fetched {
+  pub was: Option<Id>,
+  pub tip: Option<Id>,
+  pub commits: usize,
+  pub contents: usize,
+}
+
+/// Bring the ref's commits since the workspace last saw it into the store, with the contents of
+/// the files they changed that are in view, and note where the ref is. No file is written, and
+/// nothing the workspace stands on moves: a sync is what puts the workspace on that tip.
+pub fn fetch(store: &mut Store, ws: &mut Workspace) -> Result<Fetched> {
+  let (url, name) = remote_of(ws)?;
+  let (url, name) = (url.to_string(), name.to_string());
+  let was = workspace::ref_as_seen(ws);
+  if !find_place(store, ws, &url, &name)? {
+    return Ok(Fetched { was, ..Default::default() });
+  }
+  let (status, answer) = send(http().get(&format!("{url}/since/{name}?after={}", ws.seq)), None)?;
+  if status != 200 {
+    return Err(format!("the server refused to say where the ref is ({status})"));
+  }
+  let answer = json(&answer)?;
+  let tip = Tip { id: id_of(&answer["tip"])?, seq: answer["seq"].as_u64().unwrap_or(0) };
+  let mut done = Fetched { was, tip: Some(tip.id), ..Default::default() };
+  if Some(tip.id) == ws.pushed {
+    return Ok(done);
+  }
+  done.commits = take_commits(store, &url, &answer)?;
+  forward(store, ws.pushed, &tip.id)?;
+  let from = match ws.pushed {
+    Some(id) => root_of(store, &id)?,
+    None => None,
+  };
+  let to = root_of(store, &tip.id)?;
+  let mut wanted: Vec<(Id, Option<Id>)> = Vec::new();
+  // File by file: with no directory kept whole, a directory set whole comes as its files.
+  for (path, entry) in diff_keeping(store, from, to, &Default::default())? {
+    let Some(entry) = entry.filter(|e| e.mode != MODE_GITLINK && !e.is_dir()) else { continue };
+    if in_view(&ws.prefixes, &path, false) && !store.contains(&entry.id) && !wanted.iter().any(|(id, _)| *id == entry.id) {
+      let before = match from {
+        Some(root) => crate::manifest::lookup(store, root, &path)?.filter(|e| !e.is_dir()).map(|e| e.id),
+        None => None,
+      };
+      wanted.push((entry.id, before));
+    }
+  }
+  done.contents = fetch_contents(store, &url, &wanted)?.0;
+  store.flush()?;
+  // Named only once what it names is stored.
+  workspace::set_fetched(ws, tip.id, tip.seq)?;
+  Ok(done)
+}
+
 /// Bring contents from the server into the store: `(id, a version of the same
 /// file this store has, to store it against)`. One request, and one more for
 /// each large one. Returns how many came, and how many of those were large.

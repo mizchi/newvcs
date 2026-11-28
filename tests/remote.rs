@@ -2245,12 +2245,10 @@ fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
   let (code, said) = run("bob", "$NV git push");
   assert_eq!(code, 1, "{said}");
   assert!(said.contains("the push was refused"), "{said}");
-  // A pull that would merge, and a fetch, are not what nv does with a ref: refused, saying what is.
-  for verb in ["pull", "fetch"] {
-    let (code, said) = run("bob", &format!("$NV git {verb}"));
-    assert_eq!(code, 125, "{verb}: {said}");
-    assert!(said.contains("not supported") && said.contains("git pull --rebase"), "{verb}: {said}");
-  }
+  // A pull that would merge is not what nv does with a ref: refused, saying what is.
+  let (code, said) = run("bob", "$NV git pull");
+  assert_eq!(code, 125, "{said}");
+  assert!(said.contains("not supported") && said.contains("git pull --rebase"), "{said}");
   let (code, said) = run("bob", "$NV git pull --rebase");
   assert_eq!(code, 0, "{said}");
   assert!(said.contains("caught up 1 commit"), "{said}");
@@ -2286,6 +2284,82 @@ fn git_verbs_for_the_ref_are_nvs_push_and_sync() {
   assert_eq!(run("bob", "$NV git show --name-only --format= HEAD").1, "list\n");
   let (code, said) = run("bob", "$NV git push");
   assert_eq!(code, 0, "{said}");
+}
+
+/// `git fetch` toward the ref brings the ref's commits into the store and changes no file and
+/// nothing the workspace stands on; `origin/<ref>` names the tip it fetched, for log, show, diff
+/// and status, until a sync or a push sees a newer one.
+#[test]
+fn git_fetch_names_the_refs_tip_without_touching_the_files() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-fetch");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-fetch-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'a\\nb\\nann\\n' > list && $NV git commit -q -am 'Ann lists' && $NV git push -q");
+  // Before any fetch, `origin/main` is the ref as the workspace last saw it.
+  assert_eq!(run("ann", "$NV git log -1 --format=%s origin/main").1, "Ann lists\n");
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "seed\n");
+  let (code, said) = run("bob", "$NV git fetch");
+  assert_eq!(code, 0, "{said}");
+  assert!(said.contains("main") && said.contains("origin/main"), "{said}");
+  // Nothing on disk, and nothing the workspace stands on, moved.
+  assert_eq!(std::fs::read_to_string(root.join("bob/list")).unwrap(), "a\nb\n");
+  assert_eq!(run("bob", "$NV git log --format=%s").1, "seed\n");
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  // What it fetched is there to look at.
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "Ann lists\nseed\n");
+  assert_eq!(run("bob", "$NV git show origin/main:list").1, "a\nb\nann\n");
+  assert_eq!(run("bob", "$NV git diff --name-only HEAD origin/main").1, "list\n");
+  let (_, said) = run("bob", "$NV git status");
+  assert!(said.contains("behind") && said.contains("by 1 commit"), "{said}");
+  run("bob", "printf 'A\\nb\\n' > list && $NV git commit -q -am 'Bob capitalises a'");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main [ahead 1, behind 1]\n");
+  // A second fetch with nothing new says nothing and changes nothing.
+  let (code, said) = run("bob", "$NV git fetch -q origin");
+  assert_eq!((code, said.as_str()), (0, ""));
+  // Options it does not speak, and a ref it does not push to, are refused.
+  for line in ["$NV git fetch --all", "$NV git fetch origin other"] {
+    let (code, said) = run("bob", line);
+    assert_eq!(code, 125, "{line}: {said}");
+  }
+  // A sync takes the newer tip, and a push names it too.
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main [ahead 1]\n");
+  run("bob", "$NV git push -q");
+  assert_eq!(run("bob", "$NV git log --format=%s origin/main").1, "Bob capitalises a\nAnn lists\nseed\n");
+  assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main\n");
 }
 
 /// Where a sync made the commits one, it says so, and not that each will get its version of the

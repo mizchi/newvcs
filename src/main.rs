@@ -104,6 +104,10 @@ nv: an experiment in keeping Git's object ids without Git's storage
         Bring the workspace to the ref's tip, keeping its own work on top. A
         file both changed is merged as text; where the same lines changed it is
         left with both versions between markers, and the exit code is 1
+  nv fetch <dir> [--quiet]
+        Bring the ref's commits since the workspace last looked into the store,
+        and the files they changed; no file on disk changes. `origin/<ref>`
+        names that tip in `nv git` until a sync or a push sees a newer one
   nv fork <dir> <new-dir>
         Clone a workspace copy-on-write, build output included
   nv export <dir> <git-repo> <ref>
@@ -1071,6 +1075,20 @@ fn run(args: &[String]) -> Result<()> {
         std::process::exit(1);
       }
     }
+    "fetch" => {
+      let (mut ws, mut store) = opened(arg(1)?)?;
+      let done = remote::fetch(&mut store, &mut ws)?;
+      let name = ws.remote_ref.clone().unwrap_or_default();
+      let short = |id: &Option<newvcs::Id>| id.map_or("nothing".to_string(), |id| hex(&id)[..12].to_string());
+      if done.tip != done.was && !args.iter().any(|a| a == "--quiet") {
+        let commits = if done.commits == 1 { "1 commit".to_string() } else { format!("{} commits", done.commits) };
+        println!(
+          "fetched {commits} of `{name}`: origin/{name} is at {} (was {}); nothing on disk changed, `nv sync` puts the workspace on it",
+          short(&done.tip),
+          short(&done.was)
+        );
+      }
+    }
     "fork" => {
       workspace::fork(Path::new(arg(1)?), Path::new(arg(2)?))?;
       println!("forked in {:.0} ms", ms(started));
@@ -1256,6 +1274,7 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("remote", 3, 3, &[]),
   ("push", 1, 1, &[]),
   ("sync", 1, 1, &[]),
+  ("fetch", 1, 1, &["--quiet"]),
   ("fork", 2, 2, &[]),
   ("export", 3, 3, &[]),
   ("adopt", 1, 1, &["--undo"]),
@@ -1284,7 +1303,8 @@ Every day, in a workspace <dir>:
   nv pending <dir> [--wait]       the commits made here and not pushed, and what each holds
   nv restore <dir> <state>        go back to a recorded state (`before-sync` undoes a sync)
   nv git <command> [<args>]       Git's everyday commands: log, show, diff, status, add, ...;
-                                  toward the ref, `nv git push` is nv push, `pull --rebase` nv sync
+                                  toward the ref, `nv git push` is nv push, `pull --rebase` nv sync,
+                                  `fetch` nv fetch, which changes no file
 
 `nv help <command>` says all of one command, `nv help all` all of them.";
 
@@ -1510,10 +1530,10 @@ fn main() -> ExitCode {
   }
 }
 
-/// `nv git push` and `nv git pull --rebase` in a workspace that pushes to a ref of nv's (`nv
-/// remote`), with no Git beside it: the ref is where its work goes, not the repository it was
-/// cloned from, and so they are `nv push` and `nv sync`, saying what those say. A pull that would
-/// merge, or a fetch, is not something nv does with a ref: refused, saying what is. `None` for
+/// `nv git push`, `nv git fetch` and `nv git pull --rebase` in a workspace that pushes to a ref of
+/// nv's (`nv remote`), with no Git beside it: the ref is where its work goes, not the repository it
+/// was cloned from, and so they are `nv push`, `nv fetch` and `nv sync`, saying what those say. A
+/// pull that would merge is not something nv does with a ref: refused, saying what is. `None` for
 /// everything else, which `nv git` answers as ever.
 fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, String> {
   let Some(rest) = args.strip_prefix(&["git".to_string()]) else { return Ok(None) };
@@ -1559,7 +1579,7 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
     _ => false,
   };
   let instead = format!(
-    "where the workspace pushes to `{ref_name}` on a server of nv's, `nv git push` is `nv push` and `nv git pull --rebase` is `nv sync`, which puts the commits made here on the ref's tip"
+    "where the workspace pushes to `{ref_name}` on a server of nv's, `nv git push` is `nv push`, `nv git fetch` is `nv fetch` and `nv git pull --rebase` is `nv sync`, which puts the commits made here on the ref's tip"
   );
   if !toward || !flags.is_empty() {
     return Err(format!("`git {} {}` is not supported: {instead}", verb, options.join(" ")));
@@ -1567,6 +1587,13 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
   let dir = root.to_string_lossy().into_owned();
   match verb.as_str() {
     "push" if !plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["push".into(), dir])),
+    "fetch" if !plain.iter().any(|o| rebase(o)) => {
+      let mut nv = vec!["fetch".to_string(), dir];
+      if options.iter().any(|o| quiet(o)) {
+        nv.push("--quiet".into());
+      }
+      Ok(Some(nv))
+    }
     "pull" if plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["sync".into(), dir])),
     "pull" => Err(format!("`git pull` without --rebase is not supported: it would make a merge commit, which nv does not; {instead}")),
     _ => Err(format!("`git {verb}` is not supported: {instead}")),

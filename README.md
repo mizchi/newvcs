@@ -56,6 +56,7 @@ nv log <dir>                               the workspace's operations
 nv remote <dir> <url-of-repository> <ref>  point the workspace at a server: http://host/<owner>/<repo>
 nv push <dir>                              send the commits the ref has not seen, then catch up
 nv sync <dir>                              bring the workspace to the ref's tip, its own work merged on top
+nv fetch <dir> [--quiet]                   bring the ref's commits into the store; no file changes
 nv export <dir> <git-repo> <ref>           write the workspace's commit into a Git repository
 
 nv name <store> /<owner>/<repo> <rev>      name a repository in the store
@@ -66,7 +67,7 @@ nv unlink <dir> <path>                     stop following one
 nv check <dir>                             how the workspace stands with Git and with its watcher
 nv git <command>                           Git's command line (see below); toward the ref a
                                            workspace pushes to, `push` is nv push,
-                                           `pull --rebase` nv sync, and where it stopped
+                                           `fetch` nv fetch, `pull --rebase` nv sync, and where it stopped
                                            `rebase --continue` and `--abort` finish or undo it
 nv help [command | all], nv --version     the everyday commands; one command; all of them
 ```
@@ -107,11 +108,11 @@ against the table before any of it runs:
 | `rm`, `mv` | `rm -r -q -f --cached` (the file stays on disk, where Git then does not track it) |
 | `restore` | `--staged`, paths |
 | `reset` | `--soft` `--mixed` `--hard` `-q`, a revision or paths |
-| `commit` | `-m` `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
-| `status` | the long form, `--porcelain`, `--short` |
+| `commit` | `-m` (more than once, a paragraph each) `-F <file>` (`-` for standard input) `-a` `-q` `--allow-empty` `--amend` `--no-edit` |
+| `status` | the long form, `--porcelain`, `--short`, `-b` (`-sb`) |
 | `log` | `--oneline` `--format=` `--pretty=format:` `--pretty=tformat:` `-n`, a revision; the default format. Placeholders: `%H %h %T %t %P %p %s %b %B %an %ae %at %cn %ce %ct %n %%` |
 | `show` | the same formats, `--name-status` `--name-only` `--stat`, a revision, an annotated tag, or `<rev>:<path>`; a commit kept to paths after `--` |
-| `diff` | patches, `--name-status`, `--name-only`, `--stat`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--` |
+| `diff` | patches, `--name-status`, `--name-only`, `--stat`, `--diff-filter=`: two revisions, one revision against the files (or with `--cached` against the index), the working tree against the index, `--cached`; each kept to paths after `--`, or named without it where Git would take them for paths |
 | `rev-parse` | a revision, `<rev>^{tree}`, `<rev>:<path>`, `--short`, `--abbrev-ref HEAD`, `--show-toplevel` |
 | `cat-file` | `-t` `-p` `-e` for commits, trees, blobs and tags, by revision or `<rev>:<path>` |
 | `ls-tree` | `-r` `--name-only`, a revision or `<rev>:<path>`, one path (`dir/` lists what is in it) |
@@ -617,6 +618,17 @@ message, which keeps the message of the commit it completes, as
 `git rebase --continue` does, and puts those after it on top again.
 Given a message, `nv commit` makes the settling a commit of its own, and
 the commits below it are on the ref without it.
+
+`nv fetch <dir>` (and `nv git fetch` toward the ref) brings the ref's
+commits since the workspace last looked into the store, with the
+contents of the files they changed that are in view, and writes no file:
+what the workspace stands on stays where it was, and only `nv sync` moves
+it. In `nv git`, `origin/<ref>` (and `origin`) is the ref's tip as the
+workspace last saw it, from a sync, a push or a fetch, whichever came
+furthest along the ref; `log`, `show`, `diff` and `status` compare with
+it, as Git's do after `git fetch`. `git rebase origin/<ref>` is not
+spoken: nv puts work on the ref's tip as it is now (`pull --rebase`), not
+on a tip fetched earlier.
 
 A file a sync left with both versions is settled by whoever settles it,
 and the commit that holds the settling says so, as a Git trailer: which

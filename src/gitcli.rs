@@ -396,6 +396,16 @@ impl Repo {
     Ok(hex(&oid))
   }
 
+  /// `origin/<ref>` (or `origin`) where the workspace pushes to a ref of nv's: the ref's tip as
+  /// the workspace last saw it, from a sync, a push or a fetch.
+  fn ref_tip(&self, name: &str) -> Option<Id> {
+    let ref_name = self.ws.remote_ref.as_deref().filter(|_| self.ws.remote.is_some())?;
+    let name = name.strip_prefix("refs/").unwrap_or(name);
+    let name = name.strip_prefix("remotes/").unwrap_or(name);
+    let named = name == "origin" || name == "origin/HEAD" || name.strip_prefix("origin/") == Some(ref_name);
+    if named { crate::workspace::ref_as_seen(&self.ws) } else { None }
+  }
+
   /// A commit named the way Git names them: `HEAD`, a branch, a tag, a full id, with `^` and `~N` after.
   fn resolve(&mut self, spec: &str) -> Res<Id> {
     let id = self.resolve_any(spec)?;
@@ -465,6 +475,8 @@ impl Repo {
       Some(tip)
     } else if let Some(tag) = self.store.read_ref(&format!("tags/{name}")) {
       Some(tag)
+    } else if let Some(tip) = self.ref_tip(name) {
+      Some(tip)
     } else if let Some(remote) = self.store.read_ref(&format!("remotes/{name}")) {
       Some(remote)
     } else if name.len() == 40 {
@@ -696,7 +708,7 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
       "--file=*",
     ],
   ),
-  ("status", &["--porcelain", "--short", "-s"]),
+  ("status", &["--porcelain", "--short", "-s", "-b", "--branch", "-sb", "-bs"]),
   ("log", &["--oneline", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "-n=", "-n#", "-#"]),
   ("show", &["--name-status", "--name-only", "--stat", "--format=*", "--pretty=format:*", "--pretty=tformat:*", "--"]),
   ("diff", &["--name-status", "--name-only", "--stat", "--cached", "--staged", "--diff-filter=*", "--"]),
@@ -1952,7 +1964,11 @@ fn status(mut repo: Repo, args: &[&str]) -> Res<i32> {
       *path = repo.shown(path);
     }
   }
-  if !args.is_empty() {
+  // `-b` by itself is the long format, which says where the branch stands anyway.
+  if args.iter().any(|a| matches!(*a, "--porcelain" | "--short" | "-s" | "-sb" | "-bs")) {
+    if args.iter().any(|a| matches!(*a, "-b" | "--branch" | "-sb" | "-bs")) {
+      out(branch_line(&mut repo)?.as_bytes());
+    }
     for line in &lines {
       let from = line.from.as_ref().map(|f| [quoted(f, true).as_slice(), b" -> "].concat()).unwrap_or_default();
       out(&[[line.staged as u8, line.unstaged as u8, b' '].as_slice(), &from, &quoted(&line.path, true), b"\n"].concat());
@@ -1966,6 +1982,54 @@ fn status(mut repo: Repo, args: &[&str]) -> Res<i32> {
   Ok(0)
 }
 
+/// What the branch publishes to, as Git names it, and how far apart the two are.
+struct Upstream {
+  name: String,
+  /// The server, where it is a ref of nv's.
+  server: Option<String>,
+  ahead: usize,
+  behind: usize,
+}
+
+/// The ref `nv remote` set, as this workspace last saw it, or else the branch it was cloned from.
+fn upstream(repo: &mut Repo) -> Res<Option<Upstream>> {
+  if let (Some(ours), Some(url), Some(name)) = (repo.ws.base, repo.ws.remote.clone(), repo.ws.remote_ref.clone()) {
+    let (ahead, behind) = match crate::workspace::ref_as_seen(&repo.ws) {
+      Some(theirs) => apart(&mut repo.store, ours, theirs)?,
+      None => (crate::workspace::pending(&mut repo.store, &repo.ws)?.len(), 0),
+    };
+    return Ok(Some(Upstream { name: format!("origin/{name}"), server: Some(url), ahead, behind }));
+  }
+  if let (Some(branch), Some(ours)) = (repo.branch(), repo.ws.head)
+    && repo.follows(&branch)
+    && let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{branch}"))
+  {
+    let (ahead, behind) = apart(&mut repo.store, ours, theirs)?;
+    return Ok(Some(Upstream { name: format!("origin/{branch}"), server: None, ahead, behind }));
+  }
+  Ok(None)
+}
+
+/// The first line `git status -b` prints in the short formats.
+fn branch_line(repo: &mut Repo) -> Res<String> {
+  let Some(branch) = repo.branch() else { return Ok("## HEAD (no branch)\n".to_string()) };
+  if repo.ws.head.is_none() {
+    return Ok(format!("## No commits yet on {branch}\n"));
+  }
+  Ok(match upstream(repo)? {
+    None => format!("## {branch}\n"),
+    Some(Upstream { name, ahead, behind, .. }) => {
+      let apart = match (ahead, behind) {
+        (0, 0) => String::new(),
+        (ahead, 0) => format!(" [ahead {ahead}]"),
+        (0, behind) => format!(" [behind {behind}]"),
+        (ahead, behind) => format!(" [ahead {ahead}, behind {behind}]"),
+      };
+      format!("## {branch}...{name}{apart}\n")
+    }
+  })
+}
+
 /// `git status` in full, in Git's words.
 fn long_status(repo: &mut Repo, lines: &[Line], untracked: &[Vec<u8>]) -> Res<String> {
   let mut text = match repo.branch() {
@@ -1976,39 +2040,33 @@ fn long_status(repo: &mut Repo, lines: &[Line], untracked: &[Vec<u8>]) -> Res<St
   if unborn {
     text.push_str("\nNo commits yet\n\n");
   }
-  // Where the branch stands against what it publishes to: the ref `nv remote` set, as this
-  // workspace last saw it, or else the branch it was cloned from.
   let commits = |n: usize| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
-  if let (Some(ours), Some(url), Some(name)) = (repo.ws.base, repo.ws.remote.clone(), repo.ws.remote_ref.clone()) {
-    let theirs = repo.ws.pushed;
-    let (ahead, behind) = match theirs {
-      Some(theirs) => apart(&mut repo.store, ours, theirs)?,
-      None => (crate::workspace::pending(&mut repo.store, &repo.ws)?.len(), 0),
-    };
-    let there = format!("'{name}' at {url}");
-    text.push_str(&match (ahead, behind) {
-      (0, 0) => format!("Your branch is up to date with {there}, as last seen.\n"),
-      (ahead, 0) => format!("Your branch is ahead of {there} by {}, as last seen.\n  (use \"nv push\" to publish your local commits)\n", commits(ahead)),
-      (0, behind) => format!("Your branch is behind {there} by {}, as last seen.\n  (use \"nv sync\" to update your local branch)\n", commits(behind)),
-      (ahead, behind) => format!(
-        "Your branch and {there} have diverged, as last seen,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"nv sync\" to integrate the remote branch with yours)\n"
-      ),
-    });
-    text.push('\n');
-  } else if let (Some(branch), Some(ours)) = (repo.branch(), repo.ws.head)
-    && repo.follows(&branch)
-    && let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{branch}"))
-  {
-    let (ahead, behind) = apart(&mut repo.store, ours, theirs)?;
-    text.push_str(&match (ahead, behind) {
-      (0, 0) => format!("Your branch is up to date with 'origin/{branch}'.\n"),
-      (ahead, 0) => format!("Your branch is ahead of 'origin/{branch}' by {}.\n  (use \"git push\" to publish your local commits)\n", commits(ahead)),
-      (0, behind) => format!("Your branch is behind 'origin/{branch}' by {}, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n", commits(behind)),
-      (ahead, behind) => format!(
-        "Your branch and 'origin/{branch}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"git pull\" if you want to integrate the remote branch with yours)\n"
-      ),
-    });
-    text.push('\n');
+  match upstream(repo)? {
+    Some(Upstream { ahead, behind, server: Some(url), name }) => {
+      let name = name.strip_prefix("origin/").unwrap_or(&name);
+      let there = format!("'{name}' at {url}");
+      text.push_str(&match (ahead, behind) {
+        (0, 0) => format!("Your branch is up to date with {there}, as last seen.\n"),
+        (ahead, 0) => format!("Your branch is ahead of {there} by {}, as last seen.\n  (use \"nv push\" to publish your local commits)\n", commits(ahead)),
+        (0, behind) => format!("Your branch is behind {there} by {}, as last seen.\n  (use \"nv sync\" to update your local branch)\n", commits(behind)),
+        (ahead, behind) => format!(
+          "Your branch and {there} have diverged, as last seen,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"nv sync\" to integrate the remote branch with yours)\n"
+        ),
+      });
+      text.push('\n');
+    }
+    Some(Upstream { ahead, behind, server: None, name }) => {
+      text.push_str(&match (ahead, behind) {
+        (0, 0) => format!("Your branch is up to date with '{name}'.\n"),
+        (ahead, 0) => format!("Your branch is ahead of '{name}' by {}.\n  (use \"git push\" to publish your local commits)\n", commits(ahead)),
+        (0, behind) => format!("Your branch is behind '{name}' by {}, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n", commits(behind)),
+        (ahead, behind) => format!(
+          "Your branch and '{name}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"git pull\" if you want to integrate the remote branch with yours)\n"
+        ),
+      });
+      text.push('\n');
+    }
+    None => {}
   }
   let label = |what: char| match what {
     'A' => "new file:   ",
@@ -3756,7 +3814,7 @@ mod tests {
     for refused in [
       "rebase main",
       "frobnicate",
-      "status --branch",
+      "status --ignored",
       "log --graph",
       "log --formatted",
       "log -n",
