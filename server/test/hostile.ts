@@ -354,6 +354,8 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
     ["two authors", text("author t <t@example.com> 1 +0000\nauthor t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
     ["no email", text("author R\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
     ["no end", text("author t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000")],
+    // Past what a time_t holds, which Git's fsck calls an overflow (third pass).
+    ["a date past a time_t", text("author t <t@example.com> 9223372036854775808 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n")],
   ] as [string, Uint8Array][]) {
     assert.equal((await push("main", withRest(said), good)).status, 400, `a commit whose header has ${what} was taken`);
   }
@@ -373,6 +375,21 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
   const handed = await fetch(`${server}/${repo}/fetch/objects`, { method: "POST", body: hex(blobIdOf(empty)) + "\n" });
   assert.equal(handed.status, 200, await handed.clone().text());
   assert.equal((await fetch(`${server}/${repo}/objects/${hex(blobIdOf(empty))}`)).status, 200);
+
+  // A link's content that comes by itself, after a directory holding the link was handed over
+  // without it, is checked as one in a push is (third pass: it was taken, and the ref left unsyncable).
+  const tipThen = await tip();
+  for (const [what, target] of [["5,000 bytes", text("y".repeat(5000))], ["a NUL", bytes(0x63, 0, 0x64)], ["nothing", text("")]] as [string, Uint8Array][]) {
+    const holding = tree([0o120000, text("l"), blobIdOf(target)]);
+    // Refused at once where the content is here already; otherwise, when it comes.
+    if ((await adopt(holding)).status === 200) {
+      const put = await fetch(`${server}/${repo}/objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target });
+      assert.equal(put.status, 400, `a link's content of ${what} was taken by itself`);
+    }
+    const set = await push("main", commit(tipThen.tip, [{ path: text("v"), entry: { mode: 0o40000, id: treeId(holding) } }]));
+    assert.notEqual(set.status, 200, `a directory with a link to ${what} was set`);
+  }
+  assert.deepEqual(await tip(), tipThen);
 
   // A position is a number written as one.
   for (const bad of ["0x1", "1e0", "+1", "%201", "01", "", "-0"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);

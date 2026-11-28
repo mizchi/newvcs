@@ -51,11 +51,29 @@ binary; each item gets a failing test or Git case before its fix.
   three pushes at once.
 - [ ] The empty tree by its id, or as the tree of a commit of no files, in `rev-parse`, `ls-tree`,
   `show` and `diff` (only `cat-file` knows it).
-- [ ] `branch -d` of a branch merged into its upstream and not into HEAD; `checkout <b>` where `b`
+- [ ] `checkout <b>` where `b`
   is origin's branch and also a path (Git refuses it as ambiguous); `reset <b> <path>` where `b`
   is a branch and a file; `merge -m` that fast-forwards does not say the message was ignored; a
   branch made from another of origin's branches (`-b x origin/y`) follows nothing.
 - [ ] `NV_*` limits given a value that is not a number are taken as not given.
+
+### From the third pass
+
+- [ ] `merge_cst.py` can run a comment into the statement before it (`print(x)# comment`): the
+  read-back takes it, as the comment is still a unit of its own (1 of 2,800 random merges).
+- [ ] Seen in a random tester, not made again: `git log HEAD` answered "blob is not in the store"
+  right after a `git pull --rebase` that went through, in a workspace with no fork; and after a
+  pull that finished a killed one, `origin/main` stayed on an older tip (5 times in 4 runs).
+- [ ] `git pull --rebase` with a new file staged went ahead once after a push whose answer was
+  lost (nothing was written).
+- [ ] The state that keeps what a push's catching-up unstaged is refused by `nv restore <id>`
+  ("from before this workspace last caught up"); only `nv checkout` gets it back, and nothing
+  says so.
+- [ ] Several pushes at once, each within the union bound, to different repositories, hold an
+  unrelated repository's reads for 2–2.7 s on the local runtime (5 at once).
+- [ ] A header with two spaces before the date is refused where Git 2.43 takes it (Git never
+  writes one); 8 union merges in 1,100 random cases are refused where Git merges by union.
+- [ ] `merge origin` and other revisions nv does not look for are refused naming `rev-parse`.
 
 ### Server
 

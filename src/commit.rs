@@ -89,7 +89,8 @@ pub fn header_as_git_takes(rest: &[u8]) -> bool {
     }
     let Some(p) = p[at + 1..].strip_prefix(b" ") else { return false };
     let digits = p.iter().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 || (p[0] == b'0' && digits > 1) || std::str::from_utf8(&p[..digits]).ok().and_then(|d| d.parse::<u64>().ok()).is_none() {
+    // At most what a 64-bit time_t holds: past it, Git's fsck finds the date overflows.
+    if digits == 0 || (p[0] == b'0' && digits > 1) || std::str::from_utf8(&p[..digits]).ok().and_then(|d| d.parse::<i64>().ok()).is_none() {
       return false;
     }
     let Some(tz) = p[digits..].strip_prefix(b" ") else { return false };
@@ -230,6 +231,7 @@ mod tests {
   #[test]
   fn a_header_is_held_to_what_git_takes_where_a_server_hands_it_over() {
     assert!(header_as_git_takes(TEST_REST));
+    assert!(header_as_git_takes(b"author a <a@b> 9223372036854775807 +0000\ncommitter a <a@b> 1 +0000\n\nm\n"));
     assert!(header_as_git_takes(b"author  <a@b> 0 +0000\ncommitter c <c@d> 1700000000 -0500\nencoding latin1\n\nm\n"));
     for rest in [
       &b"author a <a@b> 1 +0000\n\nm\n"[..],
@@ -237,6 +239,9 @@ mod tests {
       b"author a <a@b> x +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
       b"author a <a@b> 01 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
       b"author a <a@b> 99999999999999999999999 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      // Past what a time_t holds, which Git's fsck calls an overflow (third pass).
+      b"author a <a@b> 9223372036854775808 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
+      b"author a <a@b> 18446744073709551615 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",
       b"author a <a@b> 1 +00\ncommitter a <a@b> 1 +0000\n\nm\n",
       b"author a <a@b> 1 +0000\r\ncommitter a <a@b> 1 +0000\n\nm\n",
       b"author a <a@b> 1 +0000\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n",

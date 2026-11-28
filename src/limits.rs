@@ -92,6 +92,7 @@ pub fn run(command: &mut std::process::Command, limit: Option<Duration>, what: &
   // this process when its parent ends, and is stopped with the rest (second pass: a driver's
   // `setsid` child wrote into the workspace after the sync had stopped it).
   adopt_orphans();
+  stop_with_this_process();
   let before = children();
   let mut child = command.spawn().map_err(|e| format!("cannot start {what}: {e}"))?;
   let group = child.id() as i32;
@@ -114,7 +115,66 @@ pub fn run(command: &mut std::process::Command, limit: Option<Duration>, what: &
     }
   })();
   RUNNING.lock().unwrap_or_else(|e| e.into_inner()).retain(|(g, _)| *g != group);
+  // Stopped meanwhile: nothing goes on from what the child left, while the signal's thread ends
+  // the process.
+  while STOPPING.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+    std::thread::sleep(Duration::from_millis(50));
+  }
   done
+}
+
+/// The signal that is stopping this process, once one has come.
+static STOPPING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Where the handler says a signal came, for the thread that acts on it.
+static SIGNALLED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_stop(signal: libc::c_int) {
+  STOPPING.store(signal, std::sync::atomic::Ordering::SeqCst);
+  let fd = SIGNALLED.load(std::sync::atomic::Ordering::SeqCst);
+  let byte = signal as u8;
+  // SAFETY: write(2) is async-signal-safe, of one byte from the stack to a pipe made for it.
+  unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+}
+
+/// Stopped by a signal (SIGTERM from `timeout(1)` or a supervisor, SIGINT from a Ctrl-C, SIGHUP),
+/// this process stops what `run` started first, and then itself as the signal would have: a driver
+/// is in a process group of its own, which a Ctrl-C does not reach (third pass: a driver went on and
+/// wrote into the workspace after nv had been stopped, as Git's never does).
+fn stop_with_this_process() {
+  static ONCE: std::sync::Once = std::sync::Once::new();
+  ONCE.call_once(|| {
+    let mut fds = [0; 2];
+    // SAFETY: a pipe into an array of two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+      return;
+    }
+    SIGNALLED.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+    let reading = fds[0];
+    std::thread::spawn(move || {
+      let mut byte = 0u8;
+      // SAFETY: a read of one byte into a byte on this stack, from the pipe made above.
+      while unsafe { libc::read(reading, (&mut byte as *mut u8).cast(), 1) } != 1 {}
+      let signal = STOPPING.load(std::sync::atomic::Ordering::SeqCst);
+      let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+      for (group, _) in &running {
+        // SAFETY: a signal to a process group `run` made for a child it has not yet reaped.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+      }
+      if let Some((_, before)) = running.first() {
+        stop_new_children(before);
+      }
+      // SAFETY: the signal's own handling put back, and the signal raised again, to end as it would have.
+      unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+      }
+      std::process::exit(128 + signal);
+    });
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+      // SAFETY: a handler that only stores a number and writes a byte, both async-signal-safe.
+      unsafe { libc::signal(signal, on_stop as *const () as libc::sighandler_t) };
+    }
+  });
 }
 
 /// Have orphans of this process's descendants come back to it (Linux), so that a limit reached can

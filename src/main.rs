@@ -1596,7 +1596,7 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
   // The rebase a pull with --rebase began, where its settling waits: finished by committing the
   // settling, under the message of the commit it completes, or undone as the sync is undone.
   if verb == "rebase" {
-    let waiting = workspace::settles_into(&root).is_some() || !workspace::unsettled(&ws).is_empty();
+    let waiting = workspace::settles_into(&root).is_some() || !workspace::unsettled(&ws).is_empty() || workspace::undoing(&ws).exists();
     let dir = root.to_string_lossy().into_owned();
     return match options.iter().map(String::as_str).collect::<Vec<_>>()[..] {
       // What was added completes the commit, as Git's index does: not whatever else the

@@ -2873,3 +2873,138 @@ fn what_a_second_pass_found_with_many_writers_stays_fixed() {
   let (_, shown) = run("w2", &format!("$NV since . {kept}"));
   assert!(shown.contains("a.txt"), "{shown}");
 }
+
+#[test]
+fn what_a_third_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let killed = |undo: &str, pause: u32| {
+    format!(
+      "$NV {undo} >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true"
+    )
+  };
+  let undos = ["git rebase --abort", "restore . before-sync"];
+  // An undo at a stopped pull, killed while it writes files, then gone on from with Git's verbs:
+  // the other writer's committed lines stay on the ref, and the undo run again finishes it.
+  let files = "a.txt b.txt c.txt d.txt e.txt g.txt";
+  for round in 0..12u32 {
+    let undo = undos[round as usize % 2];
+    let (_, run) = two_writers(&format!("third-pass-killed-undo-{round}"));
+    assert_eq!(
+      run(
+        "w1",
+        &format!("for f in c d e g; do echo base > $f.txt; done && $NV git add {files} && $NV git commit -qm files && $NV git push -q")
+      )
+      .0,
+      0
+    );
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", &format!("for f in {files}; do echo W1-$f >> $f; done && $NV git commit -qam w1 && $NV git push -q")).0, 0);
+    assert_eq!(run("w2", &format!("for f in {files}; do echo W2-$f >> $f; done && $NV git commit -qam w2")).0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase >/dev/null").0, 1);
+    assert_eq!(run("w2", &format!("sed -i '/^[<=>]\\{{7\\}}/d' {files} && $NV git add {files}")).0, 0);
+    run("w2", &killed(undo, 1 + round % 9));
+    // Going on as the refusals say, settling and committing whatever is left, and pushing.
+    run(
+      "w2",
+      &format!(
+        "sed -i '/^[<=>]\\{{7\\}}/d' {files}; $NV git add {files}; $NV git commit -qm again || $NV git rebase --continue; $NV git push -q"
+      ),
+    );
+    assert_eq!(run("w1", "$NV sync . >/dev/null").0, 0);
+    let (_, missing) = run("w1", &format!("for f in {files}; do grep -qx W1-$f $f || echo W1-$f; done"));
+    assert_eq!(missing, "", "{undo} killed at {} ms: w1's committed lines gone from the ref", 1 + round % 9);
+    // Run again, the undo finishes: the files, HEAD and the index are as before the pull.
+    let (code, said) = run("w2", &format!("$NV {undo}"));
+    let (_, status) = run("w2", "$NV git status --porcelain");
+    let (_, head) = run("w2", "$NV git show HEAD:a.txt");
+    if code == 0 {
+      assert_eq!(status, "", "{undo} killed at {} ms, then run again: {said}", 1 + round % 9);
+      assert!(head.contains("W2-a.txt") && !head.contains("W1-a.txt"), "{head}");
+    } else {
+      // Or the kill came before it began, or after it was done, and what followed went on from there.
+      assert!(
+        said.contains("no catching-up to undo")
+          || said.contains("`git rebase` is not supported")
+          || said.contains("since it last caught up"),
+        "{said}"
+      );
+    }
+  }
+  // A staged path the ref did not touch, and more staged at the stop: the undo, killed and run
+  // again, gives back the index of before the pull.
+  for round in 0..12u32 {
+    let undo = undos[round as usize % 2];
+    let (_, run) = two_writers(&format!("third-pass-killed-undo-index-{round}"));
+    assert_eq!(run("w1", "echo W1a >> a.txt && $NV git commit -qam w1a && $NV git push -q").0, 0);
+    assert_eq!(
+      run("w2", "echo W2a >> a.txt && $NV git commit -qam w2a && echo STAGED >> b.txt && $NV git add b.txt && echo UNSTAGED >> b.txt").0,
+      0
+    );
+    let before = run("w2", "$NV git status --porcelain && $NV git diff --cached").1;
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 1);
+    assert_eq!(
+      run("w2", "sed -i '/^[<=>]\\{7\\}/d' a.txt && $NV git add a.txt && echo MORE >> b.txt && $NV git add b.txt && echo n > n.txt && $NV git add n.txt").0,
+      0
+    );
+    run("w2", &killed(undo, 1 + round % 9));
+    let (code, said) = run("w2", &format!("$NV {undo}"));
+    let after = run("w2", "$NV git status --porcelain && $NV git diff --cached").1;
+    // Refused only as an undo already done is refused (a second one would go back past it).
+    assert!(
+      code == 0
+        || said.contains("no catching-up to undo")
+        || said.contains("`git rebase` is not supported")
+        || said.contains("since it last caught up"),
+      "{undo} killed at {} ms, run again: {said}",
+      1 + round % 9
+    );
+    assert_eq!(after, before, "{undo} killed at {} ms, run again: {said}", 1 + round % 9);
+  }
+}
+
+/// What the thirteenth round's third pass found of drivers: one is stopped with nv, however nv is
+/// stopped.
+#[test]
+fn a_driver_is_stopped_when_nv_is() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  for signal in ["TERM", "INT", "HUP"] {
+    let (root, run) = two_writers(&format!("third-pass-driver-{signal}"));
+    assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+    assert_eq!(
+      run(
+        "w2",
+        "sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver 'sleep 2; echo LATE > b.txt; cat %B > %A'"
+      )
+      .0,
+      0
+    );
+    let (code, said) = run("w2", &format!("timeout -s {signal} 1 $NV sync ."));
+    assert_ne!(code, 0, "{said}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n", "stopped by SIG{signal}");
+  }
+  // A Ctrl-C goes to nv's process group, and not to the driver's: the driver is stopped all the same.
+  let (root, run) = two_writers("third-pass-driver-ctrl-c");
+  assert_eq!(run("w1", "echo 'a.txt merge=x' > .gitattributes && $NV commit . rules >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+  assert_eq!(run("w1", "sed -i 's/^1$/w1/' a.txt && $NV commit . w1 >/dev/null && $NV push . >/dev/null").0, 0);
+  assert_eq!(
+    run(
+      "w2",
+      "sed -i 's/^1$/w2/' a.txt && $NV commit . w2 >/dev/null && $NV git config merge.x.driver 'sleep 2; echo LATE > b.txt; cat %B > %A'"
+    )
+    .0,
+    0
+  );
+  run("w2", "setsid sh -c 'echo $$ > ../pg; exec $NV sync . >/dev/null 2>&1' & sleep 1; kill -INT -$(cat ../pg); true");
+  std::thread::sleep(std::time::Duration::from_secs(3));
+  assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n", "Ctrl-C");
+}

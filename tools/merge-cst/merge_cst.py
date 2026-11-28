@@ -26,6 +26,7 @@ change to a unit the other moved, can be wrong together though each was right. W
 run on what a sync made (`auto` in nv.toml) and a commit is made only of a state they pass on,
 what this driver gets wrong is caught there.
 """
+import difflib
 import os
 import shutil
 import subprocess
@@ -229,6 +230,19 @@ def units(src, node, language, start, end):
     return out
 
 
+def edited(unit, put):
+    """Whether one of the texts `put` in a unit's place reads as that unit edited: most of its text
+    is still there."""
+    if not put:
+        return False
+    was = unit.render().strip()
+    for text in put[:64]:
+        matcher = difflib.SequenceMatcher(None, was, text.strip(), autojunk=False)
+        if matcher.real_quick_ratio() >= 0.6 and matcher.quick_ratio() >= 0.6 and matcher.ratio() >= 0.6:
+            return True
+    return False
+
+
 def merge_units(base, ours, theirs):
     """Three-way merge of sibling units, by key."""
     b = {u.key: u for u in base}
@@ -300,10 +314,20 @@ def merge_units(base, ours, theirs):
     by_ours, by_theirs = replaced(ours, o, ours_anchors), replaced(theirs, t, theirs_anchors)
     for k, unit in b.items():
         # Blank space between units goes with the unit after it, and moves as they are put in.
-        if unit.kind in COLLECTION_ITEMS or not unit.render().strip() or k not in by_ours or k not in by_theirs:
+        if k in o or k in t or not unit.render().strip():
             continue
-        if by_ours[k] != by_theirs[k]:
-            raise Conflict(f"both replaced {k}")
+        # Taken out on both sides, it is known by its text: one side that put something else in
+        # its place changed that text, and the other took it out or changed it otherwise (third
+        # pass: a list item, a heading or a function's name that one side edited came back when
+        # the other had removed it, and two edits of one list item were both kept).
+        put_ours, put_theirs = by_ours.get(k), by_theirs.get(k)
+        if put_ours == put_theirs:
+            continue
+        # An item of many alike (a list's) may be put in place of by both, each with its own (a
+        # placeholder both replace): only an item put in that reads as this one edited is an edit.
+        if unit.kind in COLLECTION_ITEMS and not (edited(unit, put_ours) or edited(unit, put_theirs)):
+            continue
+        raise Conflict(f"both replaced {k}, or one removed what the other changed")
 
     # Every unit in the order of the base: a unit of the base where it was, one put in after the
     # unit of the base it follows on its side (its anchor), ours before theirs where both put

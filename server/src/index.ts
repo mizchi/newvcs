@@ -453,6 +453,14 @@ export default {
           await env.OBJECTS.put(arriving, request.body.pipeThrough(hashing).pipeThrough(new FixedLengthStream(length)));
           try {
             if (hex(hasher.digest()) !== arg) return json({ error: "the bytes do not hash to that id" }, 400);
+            // The content of a link in a directory handed over earlier is checked as it comes, by
+            // whichever way it comes (third pass: by itself, it was taken unchecked).
+            if ((await repo.notedLinks([id])).size > 0) {
+              const held = length <= 1024 ? await env.OBJECTS.get(arriving) : null;
+              if (!held || !linkOk(new Uint8Array(await held.arrayBuffer()))) {
+                return json({ error: "a link below a directory leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
+              }
+            }
             // Stored once: if it is there already, these bytes are the same bytes.
             if (!(await env.OBJECTS.head(key))) {
               const checked = await env.OBJECTS.get(arriving);

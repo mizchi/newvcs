@@ -1883,8 +1883,20 @@ pub fn interrupted(ws: &Workspace) -> Result<()> {
       "a sync was cut short while it was writing files here: `nv sync <dir>` finishes it, and nothing is recorded until then".to_string(),
     );
   }
+  if undoing(ws).exists() {
+    return Err(UNDO_CUT_SHORT.to_string());
+  }
   Ok(())
 }
+
+/// The note an undo of a catching-up leaves from before it writes the first file until it is
+/// done: killed in between, its files are half the state gone back to and half the stop's, and
+/// recorded or committed as they are they would take back another writer's work (third pass).
+pub fn undoing(ws: &Workspace) -> PathBuf {
+  ws.root.join(META).join("undoing")
+}
+
+pub const UNDO_CUT_SHORT: &str = "an undo of the last catching-up was cut short while it was writing files here: `nv restore <dir> before-sync` (or `git rebase --abort`) finishes it, and nothing is recorded or committed until then";
 
 /// The rules of what is left out that are not files of the tree, and so are never reported: the
 /// workspace's `.nv/exclude`, and Git's `info/exclude` where Git shares the directory. Their
@@ -2020,6 +2032,11 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
       "nobody to sign the commit as: set `user.name` and `user.email` in your Git configuration, or for this workspace with `nv git config user.name <name>` and `nv git config user.email <address>`, or in GIT_{role}_NAME and GIT_{role}_EMAIL"
     ));
   };
+  // Cleaned as Git cleans them, so that no header is made that a server refuses (third pass).
+  let (name, email) = (crate::git::ident_part(&name), crate::git::ident_part(&email));
+  if name.is_empty() {
+    return Err(format!("the name to sign the commit as is empty, once what Git takes out of a name is taken out (for <{email}>)"));
+  }
   let when = match from_env("DATE") {
     Some(date) => crate::git::stamp(&date)
       .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
@@ -2514,6 +2531,14 @@ pub fn restore_to(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
 
 /// `restore_to` without asking whether the state knows of what the ref has.
 fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &str, look: Look) -> Result<Restored> {
+  restore_noted(store, ws, target, author, look, None)
+}
+
+/// `restore_across`; `undo`, for the undo of a catching-up: a note of it is left before the first
+/// file is written, and where one is left already, the files are half written and not looked at:
+/// what was recorded when that undo began is what it goes on from.
+fn restore_noted(store: &mut Store, ws: &mut Workspace, target: Id, author: &str, look: Look, undo: Option<&str>) -> Result<Restored> {
+  let resuming = undo.is_some() && undoing(ws).exists();
   let before = ws.head;
   if look == Look::Recorded {
     let root = |store: &mut Store, id: Option<Id>| id.map_or(Ok(None), |id| root_of(store, &id));
@@ -2521,12 +2546,28 @@ fn restore_across(store: &mut Store, ws: &mut Workspace, target: Id, author: &st
     let differing: Vec<Vec<u8>> = crate::manifest::diff(store, from, to)?.into_iter().map(|(path, _)| path).collect();
     ws.note(&differing)?;
   }
-  let (_, looked) = snapshot_looking(store, ws, author, look)?;
+  let looked = if resuming { Looked::default() } else { snapshot_looking(store, ws, author, look)?.1 };
+  // The state the undo goes from, in the note: resumed, it writes all of what differs from there
+  // again, and puts it in the index, wherever the kill came (the workspace may already say it is
+  // at the state gone back to, with the index not yet).
+  if let Some(note) = undo.filter(|_| !resuming) {
+    store.flush()?;
+    let from = ws.head.map_or("-".to_string(), |id| hex(&id));
+    crate::write_whole(&undoing(ws), format!("{} {from}\n", note.trim_end()))?;
+  }
+  let went_from = if resuming {
+    std::fs::read_to_string(undoing(ws))
+      .ok()
+      .and_then(|text| text.split_whitespace().nth(2).and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok()))
+      .filter(|id| store.get(id).is_ok_and(|bytes| bytes.is_some()))
+  } else {
+    None
+  };
   // What was on disk and not committed, recorded now or already (a push records it too): the
   // state left behind, by its id (thirteenth round).
   let _ = before;
-  let kept = ws.head.filter(|head| Some(*head) != ws.base && *head != target);
-  let from = match ws.head {
+  let kept = went_from.or(ws.head).filter(|head| Some(*head) != ws.base && *head != target);
+  let from = match went_from.or(ws.head) {
     Some(head) => root_of(store, &head)?,
     None => None,
   };
@@ -2765,15 +2806,24 @@ pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, 
   let head = was.head.ok_or("before it caught up, this workspace had no commit to go back to")?;
   // Commits made since, or another branch gone to, are not part of that catching-up, and undoing
   // it would drop them without a word.
-  if let Some(left) = Standing::left_at(ws)
+  // An undo cut short is finished, wherever it had got to.
+  let resuming = undoing(ws).exists();
+  if !resuming
+    && let Some(left) = Standing::left_at(ws)
     && ws.base != Some(left)
   {
     return Err(
       "this workspace has committed, or moved to other commits, since it last caught up: undoing that catching-up now would drop what was done since.\nTo set this workspace's unpushed work aside instead: nv restore <dir> pushed".to_string(),
     );
   }
-  let based = ws.base;
-  let done = restore_across(store, ws, head, author, look)?;
+  // Where the workspace stood at the stop, for the branch to be taken back from: kept in the note,
+  // as a kill may come after the workspace says it is back.
+  let based = match std::fs::read_to_string(undoing(ws)) {
+    Ok(text) => text.split_whitespace().nth(1).and_then(unhex).and_then(|bytes| Id::try_from(bytes).ok()),
+    Err(_) => ws.base,
+  };
+  let note = format!("{} {}\n", hex(&head), based.map_or("-".to_string(), |id| hex(&id)));
+  let done = restore_noted(store, ws, head, author, look, Some(&note))?;
   (ws.base, ws.pushed, ws.seq) = (was.base, was.pushed, was.seq);
   ws.save()?;
   take_branch_along(store, ws, based)?;
@@ -2789,6 +2839,7 @@ pub fn restore_before_sync(store: &mut Store, ws: &mut Workspace, author: &str, 
       let _ = std::fs::remove_file(&staged);
     }
   }
+  let _ = std::fs::remove_file(undoing(ws));
   Ok(done)
 }
 

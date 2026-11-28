@@ -2086,6 +2086,51 @@ What the second pass found, fixed the same way:
   `tags/<t>` and `remotes/<r>/<b>` were not read; and a tree or a file named
   where a commit is meant read as a damaged store (case 49).
 
+A third pass, given the build with those fixes (about 13,500 steps, 700
+kills and 12,000 requests), found every second-pass fix holding but the
+items `TODO.md` lists, and these, fixed the same way:
+
+- **An undo at a stopped pull, killed while it wrote files, left the
+  workspace half undone**, still at the stop: going on from there with
+  Git's verbs (add, commit, push) took the other writer's committed lines
+  off the ref, 17 times in 27; and an undo run again after a later kill
+  refused, leaving the stop's index on the commit gone back to. An undo now
+  notes where it goes, from where, and from which commit the branch is to
+  be taken back, before the first file is written; while the note is
+  there, nothing records, commits or pushes, and the undo run again
+  finishes the work from what was recorded, not from the half-written
+  files (as an arrival cut short is finished). An edit made to the files
+  between the kill and that second run is written over, as it is when an
+  arrival is finished.
+- **A driver went on after nv was stopped** by SIGTERM, SIGINT or SIGHUP
+  (as `timeout(1)`, a supervisor or a Ctrl-C stops it), and wrote into the
+  workspace without its lock: what nv started is stopped first, then nv
+  ends as the signal would have ended it.
+- **The server took a link's content sent by itself** (`PUT
+  /objects/<id>`) after a directory holding that link had been handed over
+  without it, and the ref was again one nobody could sync; **dates past a
+  64-bit `time_t`** got past the check of headers. **`nv commit` and `nv
+  git commit` wrote a name or an address as the environment gave it**
+  (`A <b>`, a line end), which the server then refused, so the writer's own
+  commit could not be pushed: both are cleaned as Git cleans them.
+- **`merge_cst.py` read a unit whose own text names it (a list item, a
+  heading, a function's name) edited on one side and taken out on the
+  other as taken out and added**, and brought it back; two different edits
+  of one list item were both kept. Both are conflicts. A list item both
+  sides put their own items in place of (a placeholder such as `(none
+  yet)`) still merges; it counts as edited when an item put in its place
+  has most of its text. On 800 random merges, 177 are conflicts where 162
+  were.
+- **`nv git`**: a tag and a branch of one name were the branch, where Git
+  takes the tag (and says the name is ambiguous); merges of `tags/<t>`,
+  `refs/tags/<t>` and `remotes/origin/<b>` were "Merge commit"; `merge` of a
+  revision nv does not look for answered with Git's error, not a refusal;
+  `branch -d` deleted a branch merged to HEAD and not to the branch it
+  follows, which Git refuses (and refused one merged to that branch and not
+  to HEAD, which Git deletes); `switch` went over a file staged as new and
+  gone from disk that the branch gone to has; and `show` of a file by its
+  id read it as a damaged commit (case 50).
+
 ## Why these choices
 
 Measured on real histories before any of this was written (the tools are
@@ -2116,7 +2161,7 @@ was meant, as one killed at any moment does.
 | A lock another nv command holds (the workspace, the store, a commit still being made beside Git) | 60 s | `NV_LOCK_TIMEOUT` | exit 2, naming the lock; the command does not go ahead without it |
 | A server: making the connection / a request with no byte moving | 10 s / 60 s | `NV_HTTP_TIMEOUT` | the request fails, and the command with it |
 | A commit Git makes for `nv commit` beside it, its hooks included | 300 s | `NV_GIT_TIMEOUT` | Git and everything it started are stopped; Git's index is as it was |
-| A merge driver on one file | 120 s | `NV_MERGE_DRIVER_TIMEOUT` | the driver and everything it started, in its process group or a session of its own, are stopped; nothing of the merge is taken from it |
+| A merge driver on one file | 120 s | `NV_MERGE_DRIVER_TIMEOUT` | the driver and everything it started, in its process group or a session of its own, are stopped; nothing of the merge is taken from it. The same is done when nv itself is stopped by SIGTERM, SIGINT or SIGHUP, before nv ends |
 | One command, all of it | 1,800 s | `NV_TIMEOUT` | exit 124, as `timeout(1)` gives |
 
 A watcher (`nv watch <dir>`) is no command but a process that stays, and

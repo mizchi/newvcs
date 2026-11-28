@@ -72,6 +72,14 @@ pub fn config_value(root: &Path, section: &str, key: &str) -> Option<String> {
   })
 }
 
+/// A name or an address as Git puts it in a commit (`strbuf_addstr_without_crud`): what Git calls
+/// crud taken off both ends, and `<`, `>` and line ends taken out, so that what the environment or
+/// the configuration says can never make a header Git's fsck, or a server, refuses (third pass).
+pub fn ident_part(text: &str) -> String {
+  let crud = |c: char| c as u32 <= 32 || matches!(c, ',' | ':' | ';' | '<' | '>' | '"' | '\\' | '\'');
+  text.trim_matches(crud).chars().filter(|c| !matches!(c, '\n' | '<' | '>')).collect()
+}
+
 /// A date as a commit carries it, `<seconds> <+hhmm>`, from the forms of
 /// `GIT_AUTHOR_DATE` that are spoken: that one, with or without `@` before
 /// it, and `YYYY-MM-DD HH:MM:SS +hh:mm` with `T` for the space, `Z` for the
@@ -813,4 +821,19 @@ pub fn export(store: &mut Store, id: &Id, repo: &Path, refname: &str) -> Result<
     return Err(format!("git could not set {refname} to {}", hex(&oid)));
   }
   Ok((oid, written))
+}
+
+#[cfg(test)]
+mod ident_tests {
+  use super::ident_part;
+
+  #[test]
+  fn names_and_addresses_are_cleaned_as_git_cleans_them() {
+    assert_eq!(ident_part("A <b>"), "A b");
+    assert_eq!(ident_part("A>"), "A");
+    assert_eq!(ident_part("<a@b>"), "a@b");
+    assert_eq!(ident_part(" A\nB, "), "AB");
+    assert_eq!(ident_part("\"a@b\";"), "a@b");
+    assert_eq!(ident_part("J. R. Writer."), "J. R. Writer.");
+  }
 }

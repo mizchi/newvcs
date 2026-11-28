@@ -232,3 +232,36 @@ class WhatTheSecondPassFound(unittest.TestCase):
         base = "def a := 1"
         code, text = merge("x.lean", base, base + "\ndef c := 3", base + "\ndef d := 4")
         self.assertNotIn("3def", text)
+
+
+@needs_tree_sitter
+class TakenOutAndChanged(unittest.TestCase):
+    """Third pass: a unit known by its own text or name that one side takes out and the other
+    edits in that text reads as taken out on both sides and put back by one. It is a conflict, as
+    in Git, and so are two different edits of one list item."""
+
+    def conflicts(self, path, base, ours, theirs):
+        code, out = merge(path, base, ours, theirs)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("<<<<<<<", out)
+
+    def test_a_list_item_taken_out_and_reworded(self):
+        self.conflicts("x.md", "# Todo\n\n- a\n- drop the old API\n- c\n", "# Todo\n\n- a\n- c\n", "# Todo\n\n- a\n- drop the old API (v1 only)\n- c\n")
+
+    def test_one_list_item_changed_two_ways(self):
+        self.conflicts("x.md", "# Plan\n\n- Deadline: May 1\n- c\n", "# Plan\n\n- Deadline: May 8\n- c\n", "# Plan\n\n- Deadline: April 20\n- c\n")
+
+    def test_a_function_taken_out_and_renamed(self):
+        base = 'import os\n\ndef wipe():\n    os.remove("/tmp/x")\n\ndef keep():\n    pass\n'
+        self.conflicts("x.py", base, "import os\n\ndef keep():\n    pass\n", base.replace("def wipe()", "def wipe_tmp()"))
+
+    def test_a_section_taken_out_and_its_heading_changed(self):
+        base = "# T\n\n## Old\n\nsecret plan\n\n## Keep\n\nk\n"
+        self.conflicts("x.md", base, "# T\n\n## Keep\n\nk\n", base.replace("## Old", "## Renamed"))
+        self.conflicts("x.md", base, "# T\n\n## Keep\n\nk\n", base.replace("## Old", "### Old"))
+
+    def test_items_put_in_by_both_still_merge(self):
+        base = "# Todo\n\n- a\n- c\n"
+        code, out = merge("x.md", base, "# Todo\n\n- a\n- b1\n- c\n", "# Todo\n\n- a\n- c\n- d\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, "# Todo\n\n- a\n- b1\n- c\n- d\n")

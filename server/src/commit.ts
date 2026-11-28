@@ -133,7 +133,7 @@ export function headerAsGitTakes(rest: Uint8Array): boolean {
   if (end < 0 && rest[rest.length - 1] !== 10) return false;
   const header = new TextDecoder("latin1").decode(rest.subarray(0, end < 0 ? rest.length : end));
   const lines = header.replace(/\n$/, "").split("\n");
-  const ident = (line: string | undefined, field: string) => line !== undefined && line.startsWith(field) && /^[^<>\n]*[ ]<[^<>\n]*> (0|[1-9][0-9]*) [+-][0-9]{4}$/.test(line.slice(field.length)) && !line.slice(field.length).startsWith("<") && BigInt(line.slice(field.length).split(" ").at(-2)!) <= 18446744073709551615n;
+  const ident = (line: string | undefined, field: string) => line !== undefined && line.startsWith(field) && /^[^<>\n]*[ ]<[^<>\n]*> (0|[1-9][0-9]*) [+-][0-9]{4}$/.test(line.slice(field.length)) && !line.slice(field.length).startsWith("<") && BigInt(line.slice(field.length).split(" ").at(-2)!) <= 9223372036854775807n; // a 64-bit time_t, as Git's fsck has it
   return ident(lines[0], "author ") && ident(lines[1], "committer ") && !lines.slice(2).some((l) => l.startsWith("author ") || l.startsWith("committer "));
 }
 

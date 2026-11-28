@@ -100,3 +100,6 @@ log -1 refs/remotes/origin/HEAD
 show -s HEAD^{tree}
 diff HEAD^{tree}
 log -1 HEAD^{tree}
+merge origin
+merge FETCH_HEAD
+merge ORIG_HEAD
