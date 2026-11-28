@@ -1,5 +1,54 @@
 # TODO
 
+## From the thirteenth round
+
+Found by the thirteenth round of independent review and not fixed yet (the rest is fixed and
+listed in the README under "The thirteenth round"). The reproductions are scripts against the
+binary; each item gets a failing test or Git case before its fix.
+
+### Differs from Git (`nv git`)
+
+- [ ] A failed `merge` (exit 2 both sides) where a file was staged as new and then deleted: Git
+  writes it back from the index, nv leaves it deleted.
+- [ ] `pull --no-rebase` conflict markers end `>>>>>>> origin/main` where Git writes the fetched
+  commit's id.
+- [ ] A `pull` refused for a conflict that is not between lines has already fetched (Git fetches
+  too, but the refusal should change nothing).
+- [ ] `show dev` where `dev` is a tracked file and a branch: Git refuses it as ambiguous.
+- [ ] A branch deleted and made again (`branch -D main; switch -c main`) still follows origin.
+- [ ] Output: `switch -c`/`checkout -b` print `M`/`D` lines Git does not; `status` inside an
+  untracked directory prints an empty name for `./`; `commit` with nothing to commit from a
+  subdirectory names paths from the top and adds `git pull`'s hint on a diverged branch; `rm a a`
+  says `rm 'a'` twice; `add` with no paths writes to stdout.
+- [ ] Exit codes where several things are wrong at once: an empty message with nothing to
+  commit, `--diff-filter=Z` with paths and no `--`, `rev-parse nosuch^{tree}`, `pull` printing
+  "Updating" before its error, `merge --ff-only` of a diverged branch over edits, `add` of a
+  staged file under a newly ignored directory.
+- [ ] "Auto-merging" and "CONFLICT" lines C-quote paths Git prints as they are.
+- [ ] A killed merge driver: `nv git merge` exits 128 where Git exits 2.
+- [ ] Speed, on 5,000 files and 43 commits: a full `log` 16 times Git's, `ls-tree -r` 8 times, a
+  diff of two revisions and `show --stat` 4 times, `fsck` 3.6 times, `switch` and `reset --hard`
+  twice.
+
+### Merge drivers
+
+- [ ] Where Git defines a driver or an attribute that nv does not read: `include.path` in the
+  user's configuration, `GIT_CONFIG_COUNT`/`KEY`/`VALUE`, `~/.config/git/attributes`, and beside
+  Git, `.git/info/attributes`.
+- [ ] Macros are read for `merge` only: `text`, `eol` and `binary` by way of a macro are not.
+- [ ] A driver that replaces `%A` with a link is read through (as Git does).
+- [ ] `merge_cst.py`: a unit one side moved to another section and the other changed (8 of 1,600
+  random merges).
+
+### Server
+
+- [ ] On a ref whose first commit has no parent, the rules a union push states at its base are
+  believed though the ref's history shows there were none.
+- [ ] Ref names Git cannot hold (`a/`, `/a`, `a//b`, `.a`, `a..b`, `main.lock`, `-x`) are taken,
+  and `x/` is `x`, `p//q` is `p/q`.
+- [ ] Two union merges Git would make that the server refuses: a macro on a line that ends in
+  CRLF, and `[attr]` defined again in a subdirectory.
+
 ## From the twelfth round
 
 Found by the twelfth round of independent review and not fixed yet (the rest of what it found is

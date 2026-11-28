@@ -88,3 +88,11 @@ log main side
 show HEAD -- '*.txt'
 diff HEAD~1 HEAD -- ':(exclude)a.txt'
 show HEAD -- :/a.txt
+# The thirteenth round: revisions nv does not look for, refused where Git's error said they were nothing.
+diff HEAD@{0}
+diff HEAD^@
+diff :/one
+show HEAD^!
+diff HEAD^0
+rev-parse origin
+log -1 refs/remotes/origin/HEAD

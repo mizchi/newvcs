@@ -635,11 +635,19 @@ spoken: nv puts work on the ref's tip as it is now (`pull --rebase`), not
 on a tip fetched earlier.
 
 A `git pull --rebase` that left files with both versions says what comes
-next in Git's verbs: `git add` them and `git rebase --continue`, which is
-`nv commit <dir>` with no message, or `git commit -m <message>`, which
-completes the commit the settling goes into under that message, wherever
-it is among the commits not pushed, as Git's `commit` at a rebase stopped
-at that commit does.
+next in Git's verbs: `git add` them and `git rebase --continue`, or
+`git commit -m <message>`, which completes the commit the settling goes
+into under that message, wherever it is among the commits not pushed, as
+Git's `commit` at a rebase stopped at that commit does. Either commits
+what was added, as Git's index has it: the settled files and whatever
+else was added, not files that are only on disk. Until that commit is
+made, no sync or push goes ahead, whether the markers are still in the
+files or were edited out and not committed (`git rebase --abort`, which is
+`nv restore <dir> before-sync`, undoes the pull, its staging included).
+Anything staged with `git add` before a `git pull --rebase` makes it
+refuse, as Git's does; `nv sync` refuses only where the ref changed a
+staged path, whose staged copy would not have what the ref brings, and a
+push that landed and caught up unstages such a path and says so.
 
 A file a sync left with both versions is settled by whoever settles it,
 and the commit that holds the settling says so, as a Git trailer: which
@@ -1026,7 +1034,13 @@ before:
   directory moving above or below the path, and a ref that began before
   the server indexed every change to every path (one row per path a commit
   changes, beside the row it had). A merged push writes the bucket twice:
-  the contents it brought, then the merged ones.
+  the contents it brought, then the merged ones. A file over 256 KiB is
+  not merged here: the push is refused and its writer's sync merges it, so
+  that no push holds the server for longer than a moment. Where pushes
+  arrive at once, a merge made on a tip that moved is made again, up to
+  sixteen times. Macros of `.gitattributes` (`[attr]m merge=union`) are
+  read as Git reads them, here and in a sync: set, a macro says what its
+  attributes say; defined anywhere but the top file, it is not one.
 - **What a workspace pushed is its own work, not a change of someone
   else's.** A file committed, edited again and then pushed stays as
   edited, the edit an unpublished change on the commit; a file committed
@@ -1958,6 +1972,78 @@ timings: on a generated tree of 20,000 files, under other load, `nv git
 status` took 1.3 to 1.75 times `git status`, where on oxc it is ahead, and
 a history with one commit of 20,000 files makes every full `nv git log`
 take 33 ms against Git's 2.1.
+
+**The thirteenth round** was given the build that added Git's verbs toward
+a server's ref (`fetch`, `pull --rebase`, `rebase --continue`), commits put
+on the tip one by one and settled into the writer's own commit, merge
+drivers and `tools/merge-cst`. Four reviewers: one with the server's
+address alone (about 20,000 requests); three writing random testers with
+an oracle of their own: three to six writers on one ref through `nv git`,
+with kills and answers dropped after the server acted (3,340 steps, 108
+kills, 133 answers lost); `nv git` against real Git in a twin directory
+(17,686 steps); and drivers, against Git merging the same histories and
+against properties `merge_cst.py` must keep (4,720 twin merges, 571
+syncs, 3,200 random merges of its own). What they found, each fixed with
+a test or a Git case that failed first, most severe first:
+
+- **A file staged before `git pull --rebase` kept its staged copy through
+  the pull, and the next commit took the other writer's line back out of
+  the ref.** The pull is refused as Git refuses it; `nv sync` refuses
+  where the ref changed a staged path. At a pull that stopped, a file
+  settled and added but not committed let a second pull or a push go
+  through, dropping the writer's commit or landing it without its change;
+  undoing the pull kept what was added during it staged, and a plain commit
+  then committed the other writer's line as this writer's change. Nothing
+  moves now until the commit is completed or the pull undone, and undoing
+  it gives back the index as it was.
+- **A commit's header was taken as any bytes.** A `parent` line there gave
+  every client's Git history a parent the ref did not have (a merge on a
+  ref of one line, or a parent nobody had), and an empty one made the ref
+  impossible to export. Both sides hold it to an author line first and no
+  `tree`, `parent` or NUL in the header.
+- **A link to 5,000 bytes, to a NUL or to nothing, was taken**, and no
+  client could sync the ref, or push the fix, again. **An empty file
+  could not be fetched by itself**, so a sync of a ref holding one failed
+  for everyone.
+- **`merge_cst.py` called merges clean that were not.** A unit put after
+  one with no line end of its own ran into it (`# note` and `b = 2` became
+  one comment); a list one side removed went with the items the other put
+  in it. A clean result now has to read back as the units merged. Of the
+  reviewer's 1,600 random merges, 128 broke a property before and 8 do now,
+  all of them a unit moved between sections; 16,000 units put in at one
+  place take 0.3 s where they took 16.
+- **`.gitattributes` macros were not read**, so the server merged by union
+  a path Git gives a driver. **The server's union merge had no bound**: one
+  push of 200,000 reordered lines held it for seconds and the watchdog
+  restarted it; and a dozen union pushes at once had half refused.
+- **A merge driver that never returned went on after `NV_TIMEOUT` stopped
+  the sync**, and wrote into the workspace without its lock. One killed by
+  a signal had its half-written result taken as the conflict; one that
+  exited 0 and left markers had them committed. A file name with a newline
+  broke the notes of what a sync left unsettled, and a push went through
+  with the markers on disk.
+- **`git fetch` left `log origin/<ref>` unable to name the commits it
+  brought**, and after a push never heard back left origin behind the tip.
+  `nv restore` over an edit a push had recorded did not say where it was
+  kept. A union push sent again was not told what was merged; `after` took
+  `0x1` and an empty value.
+- **`nv git` beside Git**: `merge origin/dev` made another commit than Git
+  ("Merge remote-tracking branch"); annotated tags with a blank message or
+  runs of empty lines were other objects; `pull` on a branch that follows
+  nothing merged anyway; `checkout <branch>` of a branch only origin has
+  was taken for a path; the empty tree was unknown; and revisions nv does
+  not look for (`HEAD@{0}`, `HEAD^@`, `:/text`, `origin`) were answered with
+  Git's error for a name that is nothing, not refused (case 48).
+
+Not fixed, and in `TODO.md`: the rest of what the Git reviewer found of
+output and exit codes, a failed `merge` that leaves a staged file deleted
+where Git writes it back, places Git defines a driver that nv does not read
+(`include.path`, `GIT_CONFIG_COUNT`, `~/.config/git/attributes`), a ref
+whose first commit has no rules taking the rules a union push states, ref
+names Git cannot hold, and the reviewer's timings: on 5,000 files and 43
+commits, a full `nv git log` takes 16 times Git's, `ls-tree -r` 8 times
+and a diff of two revisions 4 times (`status`, `add`, `commit` and `fetch`
+are at parity or ahead).
 
 ## Why these choices
 

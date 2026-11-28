@@ -465,7 +465,7 @@ impl Repo {
     let cut = spec.find(['^', '~']).unwrap_or(spec.len());
     let (name, mut steps) = spec.split_at(cut);
     let full = name.strip_prefix("refs/heads/").or_else(|| name.strip_prefix("heads/"));
-    let mut at = if name == "HEAD" || name == "@" {
+    let at = if name == "HEAD" || name == "@" {
       self.ws.head
     } else if let Some(tip) = full.and_then(|branch| self.branch_tip(branch)) {
       Some(tip)
@@ -477,7 +477,7 @@ impl Repo {
       Some(tag)
     } else if let Some(tip) = self.ref_tip(name) {
       Some(tip)
-    } else if let Some(remote) = self.store.read_ref(&format!("remotes/{name}")) {
+    } else if let Some(remote) = self.store.read_ref(&format!("remotes/{}", name.strip_prefix("refs/remotes/").unwrap_or(name))) {
       Some(remote)
     } else if name.len() == 40 {
       unhex(name).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|oid| self.store.of_git(&oid))
@@ -486,12 +486,26 @@ impl Repo {
       match self.store.of_git_beginning(&name.to_ascii_lowercase())[..] {
         [one] => Some(one),
         [] => None,
-        _ => return fatal(128, format!("error: short object ID {name} is ambiguous\nfatal: ambiguous argument '{name}': unknown revision or path not in the working tree.")),
+        _ => {
+          return fatal(
+            128,
+            format!(
+              "error: short object ID {name} is ambiguous\nfatal: ambiguous argument '{name}': unknown revision or path not in the working tree."
+            ),
+          );
+        }
       }
     } else {
       None
+    };
+    // What Git would find and nv does not look for is refused, not answered as Git's error for a
+    // name that is nothing (thirteenth round): a remote by itself (its HEAD), a ref by a full name
+    // under `refs/` nv keeps no other way, and steps other than `^`, `~` and their counts.
+    let spoken_steps = steps.bytes().all(|b| b == b'^' || b == b'~' || b.is_ascii_digit());
+    if !spoken_steps || (at.is_none() && (name == "origin" || name.starts_with("origin/HEAD") || name.starts_with("refs/"))) {
+      return unsupported(format_args!("rev-parse {spec}` (a revision nv does not look for this way)"));
     }
-    .ok_or_else(unknown)?;
+    let mut at = at.ok_or_else(unknown)?;
     if peeled || !steps.is_empty() {
       at = crate::git::peel(&mut self.store, at)?;
     }
@@ -1165,6 +1179,16 @@ fn cloned(root: &Path, origin: &Path) -> Res<i32> {
 }
 
 fn pull(mut repo: Repo, args: &[&str]) -> Res<i32> {
+  // A branch that follows nothing is not pulled into (thirteenth round: it was merged with the
+  // branch of its name on origin, a commit Git would not make).
+  if let Some(branch) = repo.branch().filter(|b| !repo.follows(b)) {
+    return fatal(
+      1,
+      format!(
+        "There is no tracking information for the current branch.\nPlease specify which branch you want to merge with.\nSee git-pull(1) for details.\n\n    git pull <remote> <branch>\n\nIf you wish to set tracking information for this branch you can do so with:\n\n    git branch --set-upstream-to=origin/<branch> {branch}\n"
+      ),
+    );
+  }
   fetch(&mut repo)?;
   let Some(branch) = repo.branch() else { return fatal(1, "You are not currently on a branch.") };
   let Some(theirs) = repo.store.read_ref(&format!("remotes/origin/{branch}")) else {
@@ -2901,6 +2925,13 @@ fn revisions_then_paths<'a>(repo: &mut Repo, names: Vec<&'a str>) -> Res<(Vec<&'
   let mut paths: Paths = Vec::new();
   for name in names {
     let file = repo.ws.root.join(std::ffi::OsStr::from_bytes(&repo.rooted(name))).exists();
+    // A revision nv does not speak is refused, not taken for a path that is not there.
+    if !file
+      && let Err(refusal) = repo.resolve(name)
+      && refusal.code == UNSUPPORTED
+    {
+      return Err(refusal);
+    }
     if paths.is_empty() && repo.resolve(name).is_ok() {
       if file {
         return ambiguous(name, "both revision and filename");
@@ -3191,6 +3222,22 @@ fn cat_file(mut repo: Repo, args: &[&str]) -> Res<i32> {
     "-e" if spec.len() == 40 && spec.bytes().all(|b| b.is_ascii_hexdigit()) => Fail { code: 1, message: String::new() },
     _ => Fail { code: 128, message: format!("fatal: Not a valid object name {spec}") },
   };
+  // The empty tree is an object Git always has, though nothing stores it: the tree of a commit of
+  // no files, and known by its id (thirteenth round).
+  const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  let empty = match spec.strip_suffix("^{tree}") {
+    Some(commit) => {
+      let commit = repo.resolve(commit)?;
+      root_of(&mut repo.store, &commit)?.is_none()
+    }
+    None => spec.eq_ignore_ascii_case(EMPTY_TREE),
+  };
+  if empty {
+    if *mode == "-t" {
+      println!("tree");
+    }
+    return Ok(0);
+  }
   // A commit by name, a tree as `<commit>^{tree}`, or any object by its full Git id.
   let id = if let Some(commit) = spec.strip_suffix("^{tree}") {
     let commit = repo.resolve(commit)?;
@@ -3359,7 +3406,11 @@ fn tag(mut repo: Repo, args: &[&str]) -> Res<i32> {
       // With a message it is an object of its own, naming the commit.
       match value(args, &["-m"]) {
         Some(message) => {
-          let rest = format!("type commit\ntag {name}\ntagger {}\n\n{}\n", identity(&repo, "COMMITTER")?, message.trim_end());
+          // Cleaned up as a commit's is, and nothing at all where that leaves nothing (thirteenth
+          // round: a blank message or runs of empty lines made another tag object than Git's).
+          let message = cleaned(message);
+          let message = if message.is_empty() { String::new() } else { format!("{message}\n") };
+          let rest = format!("type commit\ntag {name}\ntagger {}\n\n{message}", identity(&repo, "COMMITTER")?);
           at = crate::git::put_tag(&mut repo.store, &at, rest.as_bytes())?;
           repo.store.flush()?;
         }
@@ -3387,8 +3438,16 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
     }
   };
   // Files put back as the index has them: after `--`, or, for `checkout`, when what is named is no branch.
+  // A name only origin has a branch of, and no file has, is that branch, made here (thirteenth round).
+  let only_origins = |repo: &Repo, name: &str| {
+    repo.store.read_ref(&format!("remotes/origin/{name}")).is_some() && std::fs::symlink_metadata(repo.ws.root.join(name)).is_err()
+  };
   let paths_meant = has(args, "--")
-    || (command == "checkout" && !plain.is_empty() && value(args, &[create_flag]).is_none() && repo.resolve_any(plain[0]).is_err());
+    || (command == "checkout"
+      && !plain.is_empty()
+      && value(args, &[create_flag]).is_none()
+      && repo.resolve_any(plain[0]).is_err()
+      && !(plain.len() == 1 && only_origins(&repo, plain[0])));
   if has(args, "--") && args.iter().position(|a| *a == "--").is_some_and(|at| positional(command, &args[..at]).len() == 1) {
     return unsupported(format_args!("{command} <revision> -- <paths>` (files as another commit has them)"));
   }
@@ -3675,7 +3734,11 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
     Some(_) => Some(format!("Merge tag '{name}'{into}")),
     None => None,
   };
-  let message = value(args, &["-m"]).map(str::to_string).or(as_tag).unwrap_or_else(|| format!("Merge branch '{name}'{into}"));
+  // A branch of origin's, as fetched, is a remote-tracking branch in Git's words (thirteenth round).
+  let remote_tracking = name.strip_prefix("origin/").is_some_and(|b| repo.store.read_ref(&format!("remotes/origin/{b}")).is_some())
+    && repo.branch_tip(name).is_none();
+  let kind = if remote_tracking { "remote-tracking branch" } else { "branch" };
+  let message = value(args, &["-m"]).map(str::to_string).or(as_tag).unwrap_or_else(|| format!("Merge {kind} '{name}'{into}"));
   if !marked.is_empty() {
     // The merge stops here: what could be merged is in the files and in the index, and the
     // rest is in the files for someone to settle, add and commit.
