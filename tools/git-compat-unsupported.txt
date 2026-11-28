@@ -46,6 +46,7 @@ log --author=someone
 commit --fixup HEAD
 commit -S -m signed
 commit --no-verify -m skip
+commit -qS -m signed, a letter not spoken in a cluster
 add -p
 add -u
 add -f a.txt

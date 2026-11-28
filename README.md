@@ -98,7 +98,10 @@ against nv.
 
 What is spoken is one table in `src/gitcli.rs`, each command with the
 options it takes (`nv git --spoken` prints it). An invocation is checked
-against the table before any of it runs:
+against the table before any of it runs; short options run together
+(`-qa`, `-qaF <file>`, `-m<text>`) are taken apart first, as Git's parser
+takes them, and a cluster with a letter the table does not have is
+refused as it was written:
 
 | Command | Options |
 | --- | --- |

@@ -761,6 +761,81 @@ fn permitted(command: &str, args: &[&str]) -> Res<()> {
   Ok(())
 }
 
+/// Short options run together (`-qa`, `-qaF <file>`, `-m<text>`) as the options they are, as Git's
+/// parser takes them: each letter one the command takes by itself, the last perhaps one that takes
+/// a value, from the rest of the word or else from the next. A word the table has as it is stays
+/// as it is, and so does one with a letter the command does not take: refused as it was written.
+fn unbundled(command: &str, args: &[&str]) -> Vec<String> {
+  let Some((_, options)) = SPOKEN.iter().find(|(name, _)| *name == command) else {
+    return args.iter().map(|a| a.to_string()).collect();
+  };
+  let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+  let as_written = |arg: &str| {
+    options.iter().find(|option| {
+      if let Some(prefix) = option.strip_suffix('*') {
+        arg.starts_with(prefix)
+      } else if let Some(prefix) = option.strip_suffix('#') {
+        arg.strip_prefix(prefix).is_some_and(digits)
+      } else {
+        option.strip_suffix('=').unwrap_or(option) == arg
+      }
+    })
+  };
+  let mut out = Vec::with_capacity(args.len());
+  let mut it = args.iter();
+  while let Some(&arg) = it.next() {
+    if arg == "--" {
+      out.push(arg.to_string());
+      out.extend(it.map(|a| a.to_string()));
+      break;
+    }
+    let takes_value = |option: &&&str| option.ends_with('=');
+    if let Some(option) = as_written(arg) {
+      out.push(arg.to_string());
+      if takes_value(&option)
+        && let Some(value) = it.next()
+      {
+        out.push(value.to_string());
+      }
+      continue;
+    }
+    let Some(letters) = arg.strip_prefix('-').filter(|l| l.len() > 1 && !l.starts_with('-')) else {
+      out.push(arg.to_string());
+      continue;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut wants_next = false;
+    let mut whole = true;
+    for (at, letter) in letters.char_indices() {
+      let flag = format!("-{letter}");
+      if options.contains(&flag.as_str()) {
+        parts.push(flag);
+      } else if options.iter().any(|o| o.strip_suffix('=') == Some(flag.as_str())) {
+        let rest = &letters[at + letter.len_utf8()..];
+        parts.push(flag);
+        if rest.is_empty() {
+          wants_next = true;
+        } else {
+          parts.push(rest.to_string());
+        }
+        break;
+      } else {
+        whole = false;
+        break;
+      }
+    }
+    if !whole {
+      out.push(arg.to_string());
+      continue;
+    }
+    out.extend(parts);
+    if wants_next && let Some(value) = it.next() {
+      out.push(value.to_string());
+    }
+  }
+  out
+}
+
 pub fn run(args: &[String]) -> i32 {
   let mut args = args;
   let mut at = PathBuf::from(".");
@@ -813,6 +888,8 @@ pub fn run(args: &[String]) -> i32 {
       }
     }
   }
+  let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+  let rest = unbundled(command, &rest);
   let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
   let open = || Repo::open(&at);
   let result = permitted(command, &rest).and_then(|()| match command.as_str() {
@@ -3787,6 +3864,21 @@ mod tests {
     let mut words = line.split(' ');
     let command = words.next().unwrap();
     permitted(command, &words.collect::<Vec<_>>()).map_err(|fail| fail.code)
+  }
+
+  #[test]
+  fn short_options_run_together_are_taken_apart() {
+    let split = |command: &str, line: &str| unbundled(command, &line.split(' ').collect::<Vec<_>>()).join(" ");
+    assert_eq!(split("commit", "-qa -F -"), "-q -a -F -");
+    assert_eq!(split("commit", "-qaF file"), "-q -a -F file");
+    assert_eq!(split("commit", "-qmtext"), "-q -m text");
+    // As the table has it, and the value after an option that takes one, stay as written.
+    assert_eq!(split("commit", "-qam -qa"), "-qam -qa");
+    assert_eq!(split("commit", "-m -qa"), "-m -qa");
+    assert_eq!(split("log", "-n3 -5 -10"), "-n3 -5 -10");
+    // A letter the command does not take leaves the word whole, to be refused as it was written.
+    assert_eq!(split("commit", "-qS -m x"), "-qS -m x");
+    assert_eq!(split("rm", "-rq -- -qa"), "-r -q -- -qa");
   }
 
   #[test]
