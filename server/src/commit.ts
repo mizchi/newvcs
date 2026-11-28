@@ -57,6 +57,9 @@ export function decode(bytes: Uint8Array): Commit {
   };
   const parents = Array.from({ length: u32() }, () => take(32));
   const rest = take(u32());
+  // Git's commit is the tree, the parents, and then these bytes: a `parent` line among them would
+  // be a parent every client's Git history has and the ref does not (thirteenth round).
+  if (!restOk(rest)) throw new Error("what a commit says of who made it and why is not a commit's header and message");
   const changes: Change[] = [];
   for (let n = u32(); n > 0; n--) {
     const path = take(u32());
@@ -97,6 +100,31 @@ export function decode(bytes: Uint8Array): Commit {
     }
   }
   return { parents, rest, changes };
+}
+
+/// What follows a commit's tree and parents in Git's commit (`commit::rest_ok` on the other side):
+/// an author line first, and in the header, up to the first empty line, no `tree` or `parent` line
+/// and no NUL. What else Git's header may hold (a committer, an encoding, a signature) is kept.
+export function restOk(rest: Uint8Array): boolean {
+  let end = rest.length;
+  for (let i = 0; i + 1 < rest.length; i++) {
+    if (rest[i] === 10 && rest[i + 1] === 10) {
+      end = i;
+      break;
+    }
+  }
+  const header = rest.subarray(0, end);
+  if (header.includes(0)) return false;
+  const lines = new TextDecoder("latin1").decode(header).split("\n");
+  return lines[0]!.startsWith("author ") && !lines.some((line) => line.startsWith("tree ") || line.startsWith("parent "));
+}
+
+export const MODE_LINK = 0o120000;
+
+/// Whether a link's content is somewhere a file system can make a link lead (`manifest::link_ok`
+/// on the other side): not nothing, no NUL, and no longer than a path may be.
+export function linkOk(target: Uint8Array): boolean {
+  return target.length > 0 && target.length <= MAX_PATH && !target.includes(0);
 }
 
 /// A file, one that can be run, a link, a directory, another repository's commit.

@@ -51,9 +51,64 @@ pub fn is_union(attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -
   merge_of(attributes, path) == Merge::Union
 }
 
+/// What a line sets an attribute to: set, `-`, `!`, or a value.
+#[derive(Clone)]
+enum State {
+  Set,
+  Unset,
+  Unspecified,
+  Value(String),
+}
+
+impl State {
+  fn of(state: &StateRef<'_>) -> State {
+    match state {
+      StateRef::Set => State::Set,
+      StateRef::Unset => State::Unset,
+      StateRef::Unspecified => State::Unspecified,
+      StateRef::Value(value) => State::Value(value.as_bstr().to_str_lossy().into_owned()),
+    }
+  }
+}
+
+/// What one attribute, as stated, says of `merge`, where it says anything: a macro set says what
+/// its own attributes say, in their order, as Git expands it where it is set and only then.
+fn merge_said(name: &str, state: &State, macros: &[(String, Vec<(String, State)>)], depth: usize) -> Option<Merge> {
+  match (name, state) {
+    ("merge", State::Value(value)) => Some(match value.as_str() {
+      "union" => Merge::Union,
+      "text" => Merge::Text,
+      "binary" => Merge::Binary,
+      name => Merge::Driver(name.to_string()),
+    }),
+    ("merge", State::Unset) => Some(Merge::Binary),
+    ("merge", _) => Some(Merge::Text),
+    (name, State::Set) if depth < 8 => match macros.iter().rev().find(|(m, _)| m == name) {
+      Some((_, said)) => said.iter().fold(None, |merge, (n, s)| merge_said(n, s, macros, depth + 1).or(merge)),
+      // `binary` is Git's own macro: `-diff -merge -text`.
+      None if name == "binary" => Some(Merge::Binary),
+      None => None,
+    },
+    _ => None,
+  }
+}
+
+/// The macros the top `.gitattributes` defines (`[attr]<name> <attributes>`): Git takes them from
+/// there and from no other file of the tree.
+fn macros_of(top: &[u8]) -> Vec<(String, Vec<(String, State)>)> {
+  let mut out = Vec::new();
+  for (kind, assignments, _) in gix_attributes::parse(top).flatten() {
+    let gix_attributes::parse::Kind::Macro(name) = kind else { continue };
+    let said = assignments.flatten().map(|a| (a.name.as_str().to_string(), State::of(&a.state))).collect();
+    out.push((name.as_str().to_string(), said));
+  }
+  out
+}
+
 /// The `merge` attribute of a path, as `is_union` reads it.
 pub fn merge_of(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8]) -> Merge {
   let mut ends: Vec<usize> = path.iter().enumerate().filter(|(_, b)| **b == b'/').map(|(at, _)| at).collect();
+  let macros = macros_of(&attributes(b"").unwrap_or_default());
   loop {
     let (dir, relative) = match ends.pop() {
       Some(end) => (&path[..end], &path[end + 1..]),
@@ -65,19 +120,8 @@ pub fn merge_of(mut attributes: impl FnMut(&[u8]) -> Option<Vec<u8>>, path: &[u8
       let gix_attributes::parse::Kind::Pattern(pattern) = kind else { continue };
       let mut merge = None;
       for assignment in assignments.flatten() {
-        match (assignment.name.as_str(), assignment.state) {
-          ("merge", StateRef::Value(value)) => {
-            merge = Some(match value.as_bstr().to_str_lossy().as_ref() {
-              "union" => Merge::Union,
-              "text" => Merge::Text,
-              "binary" => Merge::Binary,
-              name => Merge::Driver(name.to_string()),
-            })
-          }
-          ("merge", StateRef::Set) => merge = Some(Merge::Text),
-          ("merge", StateRef::Unset) | ("binary", StateRef::Set) => merge = Some(Merge::Binary),
-          ("merge", _) => merge = Some(Merge::Text),
-          _ => {}
+        if let Some(said) = merge_said(assignment.name.as_str(), &State::of(&assignment.state), &macros, 0) {
+          merge = Some(said);
         }
       }
       let Some(merge) = merge else { continue };
@@ -120,6 +164,29 @@ mod tests {
     assert!(is_union(files, b"sub/b.txt"), "a rule about something else does not decide");
     assert!(!is_union(files, b"plain"));
     assert_eq!(attribute_dirs(b"a/b/c"), vec![&b""[..], b"a", b"a/b"]);
+  }
+
+  /// As `git check-attr merge` answers for the same files (thirteenth round: macros were not
+  /// read, and the server merged by union a path Git gives a driver).
+  #[test]
+  fn a_macro_set_says_what_its_attributes_say() {
+    let files = |dir: &[u8]| {
+      match dir {
+      b"" => Some(
+        b"[attr]m merge=x\n[attr]n -merge\n[attr]both m n\n*.txt merge=union\nf.txt m\ng.txt n\nh.txt both\ni.txt m merge=union\nj.txt merge=y m\nk.txt -m\n".to_vec(),
+      ),
+      b"sub" => Some(b"[attr]m merge=z\nl.txt m\n".to_vec()),
+      _ => None,
+    }
+    };
+    let of = |path: &[u8]| merge_of(files, path);
+    assert_eq!(of(b"f.txt"), Merge::Driver("x".into()));
+    assert_eq!(of(b"g.txt"), Merge::Binary);
+    assert_eq!(of(b"h.txt"), Merge::Binary);
+    assert_eq!(of(b"i.txt"), Merge::Union);
+    assert_eq!(of(b"j.txt"), Merge::Driver("x".into()));
+    assert_eq!(of(b"k.txt"), Merge::Union, "a macro unset is not expanded");
+    assert_eq!(of(b"sub/l.txt"), Merge::Driver("x".into()), "a macro is defined at the top only");
   }
 
   #[test]

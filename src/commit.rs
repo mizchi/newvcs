@@ -47,6 +47,17 @@ impl<'a> Cursor<'a> {
   }
 }
 
+/// What follows a commit's tree and parents in Git's commit (`restOk` on the server): an author
+/// line first, and in the header, up to the first empty line, no `tree` or `parent` line and no
+/// NUL. What else Git's header may hold (a committer, an encoding, a signature) is kept.
+pub fn rest_ok(rest: &[u8]) -> bool {
+  let end = rest.windows(2).position(|pair| pair == b"\n\n").unwrap_or(rest.len());
+  let header = &rest[..end];
+  header.starts_with(b"author ")
+    && !header.contains(&0)
+    && !header.split(|&b| b == b'\n').any(|line| line.starts_with(b"tree ") || line.starts_with(b"parent "))
+}
+
 impl Commit {
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
@@ -80,6 +91,11 @@ impl Commit {
     }
     let len = c.u32()?;
     let rest = c.take(len)?.to_vec();
+    // Git's commit is the tree, the parents, and then these bytes: a `parent` line among them would
+    // be a parent of the Git commit that the ref does not have (thirteenth round).
+    if !rest_ok(&rest) {
+      return Err("what a commit says of who made it and why is not a commit's header and message".to_string());
+    }
     let mut changes = Vec::new();
     for _ in 0..c.u32()? {
       let len = c.u32()?;
@@ -165,6 +181,26 @@ pub fn root_of(store: &mut Store, id: &Id) -> Result<Option<Id>> {
 
 #[cfg(test)]
 mod tests {
+  const TEST_REST: &[u8] = b"author a <a@example.com> 1 +0000\ncommitter a <a@example.com> 1 +0000\n\nm\n";
+
+  /// Thirteenth round: what follows a commit's tree and parents in Git's commit was taken as any
+  /// bytes, and a `parent` line there gave every client a parent the ref did not have.
+  #[test]
+  fn a_commit_whose_header_is_not_one_is_refused() {
+    let with = |rest: &[u8]| Commit { parents: vec![], rest: rest.to_vec(), changes: vec![] }.encode();
+    for rest in [
+      &b"parent 0123456789012345678901234567890123456789\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nm\n"[..],
+      b"author a <a> 1 +0000\nparent 0123456789012345678901234567890123456789\ncommitter a <a> 1 +0000\n\nm\n",
+      b"author a <a> 1 +0000\ntree 0123456789012345678901234567890123456789\n\nm\n",
+      b"",
+      b"committer a <a> 1 +0000\n\nm\n",
+      b"author a\0 <a> 1 +0000\ncommitter a <a> 1 +0000\n\nm\n",
+    ] {
+      assert!(Commit::decode(&with(rest)).is_err(), "{}", String::from_utf8_lossy(rest));
+    }
+    // A message may say anything, a `parent` line included; and Git's other headers stay.
+    assert!(Commit::decode(&with(b"author a <a> 1 +0000\ncommitter a <a> 1 +0000\nencoding latin1\n\nparent of x\n")).is_ok());
+  }
   use super::*;
 
   /// Twelfth round: a commit that set `l` as a link and `l/x` as a file was served, and a client
@@ -173,7 +209,7 @@ mod tests {
   #[test]
   fn a_commit_that_sets_a_file_and_something_below_it_is_refused() {
     let set = |path: &[u8], mode: u32| (path.to_vec(), Some(Entry { mode, id: [1; 32] }));
-    let commit = |changes: Vec<Change>| Commit { parents: vec![], rest: b"r".to_vec(), changes }.encode();
+    let commit = |changes: Vec<Change>| Commit { parents: vec![], rest: TEST_REST.to_vec(), changes }.encode();
     for (first, mode) in [(&b"l"[..], 0o120000), (b"a", 0o100644), (b"s", 0o160000)] {
       let below = [first, b"/x"].concat();
       assert!(Commit::decode(&commit(vec![set(first, mode), set(&below, 0o100644)])).is_err(), "{:?}", String::from_utf8_lossy(first));
@@ -193,7 +229,7 @@ mod tests {
   #[test]
   fn a_commit_that_names_a_path_no_tree_may_have_is_refused() {
     let with = |path: &[u8], mode: u32| {
-      Commit { parents: vec![], rest: b"r".to_vec(), changes: vec![(path.to_vec(), Some(Entry { mode, id: [1; 32] }))] }.encode()
+      Commit { parents: vec![], rest: TEST_REST.to_vec(), changes: vec![(path.to_vec(), Some(Entry { mode, id: [1; 32] }))] }.encode()
     };
     for path in [
       &b""[..],
@@ -230,7 +266,7 @@ mod tests {
       assert!(Commit::decode(&with(path, mode)).is_ok(), "{:?} was refused", String::from_utf8_lossy(path));
     }
     // One path, said twice.
-    let twice = Commit { parents: vec![], rest: b"r".to_vec(), changes: vec![(b"a".to_vec(), None), (b"a".to_vec(), None)] }.encode();
+    let twice = Commit { parents: vec![], rest: TEST_REST.to_vec(), changes: vec![(b"a".to_vec(), None), (b"a".to_vec(), None)] }.encode();
     assert!(Commit::decode(&twice).is_err());
   }
 
@@ -263,11 +299,12 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
     let mut store = Store::create(&dir).unwrap();
     let file = |n: u8| Some(Entry { mode: 0o100644, id: [n; 32] });
-    let first = Commit { parents: vec![], rest: b"1".to_vec(), changes: vec![(b"a".to_vec(), file(1)), (b"d/b".to_vec(), file(2))] }
+    let first = Commit { parents: vec![], rest: TEST_REST.to_vec(), changes: vec![(b"a".to_vec(), file(1)), (b"d/b".to_vec(), file(2))] }
       .store(&mut store)
       .unwrap();
-    let second = Commit { parents: vec![first], rest: b"2".to_vec(), changes: vec![(b"a".to_vec(), None)] }.store(&mut store).unwrap();
-    let third = Commit { parents: vec![second], rest: b"3".to_vec(), changes: vec![(b"d/b".to_vec(), None)] }.store(&mut store).unwrap();
+    let second = Commit { parents: vec![first], rest: TEST_REST.to_vec(), changes: vec![(b"a".to_vec(), None)] }.store(&mut store).unwrap();
+    let third =
+      Commit { parents: vec![second], rest: TEST_REST.to_vec(), changes: vec![(b"d/b".to_vec(), None)] }.store(&mut store).unwrap();
     // Asked for the newest first: the two before it are derived on the way.
     assert_eq!(root_of(&mut store, &third).unwrap(), None);
     let root = root_of(&mut store, &second).unwrap().unwrap();

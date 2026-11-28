@@ -78,6 +78,7 @@ export class Repo extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS live_by_path ON live (ref, path);
       CREATE TABLE IF NOT EXISTS path_index (ref TEXT NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, mode INTEGER, id BLOB, PRIMARY KEY (ref, path, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS landed_merged (ref TEXT NOT NULL, sent BLOB NOT NULL, paths TEXT NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
     `);
   }
 
@@ -169,7 +170,17 @@ export class Repo extends DurableObject<Env> {
         // A chain with no parent was put on the tip as from the ref's start, as the first time.
         const base = parent ? sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, parent).toArray()[0]?.seq : 0;
         const behind = before.moved && base !== undefined ? Math.max(0, seq - chain.length - base) : 0;
-        return { status: before.moved ? "rebased" : "updated", commit: hex(landed), commits: ids.map((r) => hex(new Uint8Array(r.id))), seq, behind, since: since() };
+        // And what the server merged of it, as it was told the first time (thirteenth round).
+        const merged = sql.exec<{ paths: string }>("SELECT paths FROM landed_merged WHERE ref = ? AND sent = ?", ref, sent).toArray()[0];
+        return {
+          status: before.moved ? "rebased" : "updated",
+          commit: hex(landed),
+          commits: ids.map((r) => hex(new Uint8Array(r.id))),
+          seq,
+          behind,
+          since: since(),
+          ...(merged ? { merged: JSON.parse(merged.paths) as string[] } : {}),
+        };
       }
 
       const parent = first.parents[0] ?? null;
@@ -363,6 +374,9 @@ export class Repo extends DurableObject<Env> {
       const base = sql.exec<{ seq: number }>("SELECT seq FROM history WHERE ref = ? AND id = ?", ref, commits[0]!.parents[0]!).toArray()[0]!.seq;
       sql.exec("DELETE FROM divergent WHERE ref = ? AND id = ?", ref, sent);
       const result = this.accept(ref, at, commits[0]!.parents[0] ?? null, remade, (i) => merged[i]!, new Uint8Array(at.tip), "rebased", at.seq - base, sent, () => (after === null ? [] : this.steps(ref, after)));
+      if (result.status === "rebased" || result.status === "updated") {
+        sql.exec("INSERT OR REPLACE INTO landed_merged (ref, sent, paths) VALUES (?, ?, ?)", ref, sent, JSON.stringify(unionPaths));
+      }
       return result;
     });
   }

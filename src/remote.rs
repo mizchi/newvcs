@@ -1157,6 +1157,22 @@ fn arrive_from(
   let (fetched, large) = fetch_contents(store, url, &wanted)?;
   done.contents_fetched += fetched;
   done.large_fetched += large;
+  // A link is made to lead where its content says: one no file system can make (thirteenth round:
+  // a 5,000-byte target left the workspace half way) is refused before anything is written.
+  for (path, entry) in &theirs {
+    let Some(link) = entry.filter(|e| e.mode == 0o120000) else { continue };
+    if !in_view(&ws.prefixes, path, false) {
+      continue;
+    }
+    if let Some(target) = store.get(&link.id)?
+      && !crate::manifest::link_ok(&target)
+    {
+      return Err(format!(
+        "the ref has `{}` as a link to somewhere no file system can make a link lead (nothing, a NUL, or more than 1,024 bytes). Nothing was touched.",
+        String::from_utf8_lossy(path)
+      ));
+    }
+  }
 
   // One file, three ways. `Ok(None)`: not text, not to be merged.
   let content = |store: &mut Store, entry: Option<Entry>| -> Result<std::sync::Arc<Vec<u8>>> {
@@ -1563,7 +1579,17 @@ fn arrive_from(
             prev = id;
           }
           // The same files as the one commit, or not at all.
-          let one = Commit { parents: vec![tip], rest: Vec::new(), changes: published.clone() }.store(store)?;
+          let one = Commit {
+            parents: vec![tip],
+            rest: b"author nv <nv> 0 +0000
+committer nv <nv> 0 +0000
+
+compared
+"
+            .to_vec(),
+            changes: published.clone(),
+          }
+          .store(store)?;
           if root(store, Some(prev))? != root(store, Some(one))? || made.is_empty() {
             return Ok(None);
           }

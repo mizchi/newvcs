@@ -48,7 +48,7 @@
 // of them. What a repository may read is what its table says it was given:
 // knowing an id is not having the content.
 
-import { decode, encode, hex, idOf, MAX_PATH, refOk, unhex } from "./commit.ts";
+import { decode, encode, hex, idOf, linkOk, MAX_PATH, MODE_LINK, refOk, unhex } from "./commit.ts";
 import { blobHasher, blobId, hash, objectId } from "./hash.ts";
 import { merging } from "./merger.ts";
 import compiledMerger from "./merger.wasm";
@@ -119,11 +119,18 @@ function statement(bytes: Uint8Array): Attested | null {
   return ok ? { union: v.union.map((u) => ({ path: u.path, base: u.base })), attributes: v.attributes.map((a) => ({ path: a.path, entry: a.entry })) } : null;
 }
 
+/// How large a file the server merges by union, and how often it makes a merge again where the
+/// ref moved while it was made.
+const MERGE_LIMIT = 256 * 1024;
+const MERGE_ATTEMPTS = 16;
+
 /// The contents of these placed ids, from the bucket.
 async function read(env: Env, placed: Placed[]): Promise<Map<string, Uint8Array>> {
   const out = new Map<string, Uint8Array>();
   await Promise.all(
     placed.map(async (c) => {
+      // Nothing to read of an empty content: a range of no bytes is one the bucket refuses.
+      if (c.length === 0) return void out.set(hex(c.id), new Uint8Array());
       const object = c.pack
         ? await env.OBJECTS.get(`packs/${hex(c.pack)}`, { range: { offset: c.at, length: c.length } })
         : await env.OBJECTS.get(`objects/${hex(c.id)}`);
@@ -137,11 +144,18 @@ async function read(env: Env, placed: Placed[]): Promise<Map<string, Uint8Array>
 /// A push refused for clashing only on paths `.gitattributes` merges by union, merged here as a
 /// sync would merge it: each such path of each commit of the chain, on what the one before it
 /// became, the first on the ref's tip; and landed. `null` where it cannot be: the push stays
-/// refused, and its writer syncs. Made again if the ref moved meanwhile, a few times.
+/// refused, and its writer syncs. Made again if the ref moved meanwhile: as often as other writers'
+/// pushes landing at the same moment take for it to land, within a bound (thirteenth round: with a
+/// dozen at once, three tries refused half of them).
 async function mergeOnServer(env: Env, repo: DurableObjectStub<Repo>, ref: string, chain: Uint8Array[], attested: Attested, after: number | null): Promise<Landed | null> {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < MERGE_ATTEMPTS; attempt++) {
+    if (attempt > 0) await new Promise((done) => setTimeout(done, Math.random() * 5 * attempt));
     const plan = await repo.unionPlan(ref, chain, attested);
     if ("why" in plan) return null;
+    // A merge here is the list a sync would make, and costs the server what it costs: a file too
+    // large to merge in a moment is the writer's to merge, by a sync (thirteenth round: one push of
+    // 200,000 reordered lines held the server for seconds).
+    if (plan.contents.some((c) => c.length > MERGE_LIMIT)) return null;
     const bytes = await read(env, plan.contents);
     const of = (id: string) => bytes.get(id)!;
     const rules = new Map(plan.attributes.map((a) => [a.dir, of(a.id)]));
@@ -205,7 +219,10 @@ export default {
     // The generated binding type does not name the class behind it.
     const repos = env.REPO as unknown as DurableObjectNamespace<Repo>;
     const repo = repos.get(repos.idFromName(name));
-    const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : null;
+    // Written as a number is written, and nothing else (thirteenth round: `0x1`, `1e0` and an empty one were taken).
+    const said = url.searchParams.get("after");
+    if (said !== null && !/^(-1|0|[1-9][0-9]{0,15})$/.test(said)) return json({ error: "`after` is a position in a ref's history: a whole number, -1 or more" }, 400);
+    const after = said !== null ? Number(said) : null;
     // A position in a ref's history; -1 is before its first commit, which is at 0.
     if (after !== null && !(Number.isSafeInteger(after) && after >= -1)) return json({ error: "`after` is a position in a ref's history: a whole number, -1 or more" }, 400);
     const body = async () => new Uint8Array(await request.arrayBuffer());
@@ -236,6 +253,18 @@ export default {
             const packId = hash(pack);
             contents.forEach((bytes, i) => placed.push({ id: blobId(bytes), pack: packId, at: at[i]!, length: bytes.length }));
             await env.OBJECTS.put(`packs/${hex(packId)}`, pack);
+          }
+          // A link is written where its content says it leads, by every client that syncs: a target
+          // no file system takes would leave the ref one nobody can sync (thirteenth round).
+          const links = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_LINK ? [c.entry.id] : [])));
+          if (links.length > 0) {
+            const sent = new Map(contents.map((bytes) => [hex(blobId(bytes)), bytes]));
+            const elsewhere = links.filter((id) => !sent.has(hex(id)));
+            const stored = elsewhere.length > 0 ? await read(env, await repo.where(elsewhere)) : new Map<string, Uint8Array>();
+            for (const id of links) {
+              const target = sent.get(hex(id)) ?? stored.get(hex(id));
+              if (target && !linkOk(target)) return json({ error: "a link leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
+            }
           }
           const result = await repo.push(arg, commits, after, placed);
           if (result.status === "conflict" && attested) {
@@ -368,6 +397,8 @@ export default {
           const read = await Promise.all(
             [...packs].map(async ([pack, wanted]) => {
               const only = wanted.length === 1 ? wanted[0]! : null;
+              // An empty content alone: a range of no bytes is one the bucket refuses (thirteenth round).
+              if (only && only.length === 0) return [only.id, new Uint8Array()];
               const object = await env.OBJECTS.get(`packs/${pack}`, only ? { range: { offset: only.at, length: only.length } } : {});
               if (!object) throw new Error(`pack ${pack} is not in the bucket`);
               const bytes = new Uint8Array(await object.arrayBuffer());
@@ -413,6 +444,7 @@ export default {
         }
         const [placed] = await repo.where([id]);
         if (!placed) return json({ error: "no such object" }, 404);
+        if (placed.length === 0) return new Response(new Uint8Array());
         const object = placed.pack
           ? await env.OBJECTS.get(`packs/${hex(placed.pack)}`, { range: { offset: placed.at, length: placed.length } })
           : await env.OBJECTS.get(key);

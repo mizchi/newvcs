@@ -326,5 +326,48 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
   const landed = (await said.json()) as { status: string; merged?: string[] };
   assert.equal(said.status, 200, JSON.stringify(landed));
   assert.deepEqual(landed.merged, ["list"]);
+  // Sent again, it is told what it was told: merged, and what (thirteenth round).
+  said = await pushStated(stated([["list", start]], [[".gitattributes", rules]]), mine, m.bytes, start.bytes, rules.bytes);
+  const again = (await said.json()) as { status: string; merged?: string[]; commit?: string };
+  assert.deepEqual([again.merged, again.commit], [["list"], (landed as { commit?: string }).commit]);
+}
+
+// ---------------------------------------------------------------- the thirteenth round
+{
+  // What follows a commit's tree and parents in Git's commit is its author, committer and message:
+  // a `parent` or `tree` line there would give every client a Git history it cannot walk.
+  const tipNow = await tip();
+  const withRest = (said: Uint8Array) =>
+    encode({ parents: [Uint8Array.from(tipNow.tip.match(/../g)!.map((b) => parseInt(b, 16)))], rest: said, changes: [{ path: text("r.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }] });
+  for (const [what, said] of [
+    ["a parent line", text(`parent ${"ab".repeat(20)}\nauthor t <t@example.com> 1 +0000\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["a parent line after the author", text(`author t <t@example.com> 1 +0000\nparent ${"ab".repeat(20)}\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["a tree line", text(`author t <t@example.com> 1 +0000\ntree ${"ab".repeat(20)}\ncommitter t <t@example.com> 1 +0000\n\nm\n`)],
+    ["nothing", text("")],
+    ["no author", text("committer t <t@example.com> 1 +0000\n\nm\n")],
+    ["a NUL in the header", text("author t <t@example.com> 1 +0000\ncommitter t\0 <t@example.com> 1 +0000\n\nm\n")],
+  ] as [string, Uint8Array][]) {
+    assert.equal((await push("main", withRest(said), good)).status, 400, `a commit whose header has ${what} was taken`);
+  }
+  assert.deepEqual(await tip(), tipNow);
+
+  // A link is written where the link's content says it leads: nothing a file system cannot write.
+  for (const [what, target] of [["5,000 bytes", text("x".repeat(5000))], ["a NUL", bytes(0x61, 0, 0x62)], ["nothing", text("")]] as [string, Uint8Array][]) {
+    const refused = await push("main", commit(tipNow.tip, [{ path: text("l"), entry: { mode: 0o120000, id: blobIdOf(target) } }]), target);
+    assert.equal(refused.status, 400, `a link to ${what} was taken`);
+  }
+  assert.deepEqual(await tip(), tipNow);
+
+  // An empty file is a content like any other, asked for alone.
+  const empty = text("");
+  const landed = await push("main", commit(tipNow.tip, [{ path: text("empty.txt"), entry: { mode: 0o100644, id: blobIdOf(empty) } }]), empty);
+  assert.equal(landed.status, 200, await landed.text());
+  const handed = await fetch(`${server}/${repo}/fetch/objects`, { method: "POST", body: hex(blobIdOf(empty)) + "\n" });
+  assert.equal(handed.status, 200, await handed.clone().text());
+  assert.equal((await fetch(`${server}/${repo}/objects/${hex(blobIdOf(empty))}`)).status, 200);
+
+  // A position is a number written as one.
+  for (const bad of ["0x1", "1e0", "+1", "%201", "01", "", "-0"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);
+  assert.equal((await fetch(`${server}/${repo}/since/main?after=-1`)).status, 200);
 }
 console.log("ok");
