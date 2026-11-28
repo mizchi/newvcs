@@ -265,3 +265,36 @@ class TakenOutAndChanged(unittest.TestCase):
         code, out = merge("x.md", base, "# Todo\n\n- a\n- b1\n- c\n", "# Todo\n\n- a\n- c\n- d\n")
         self.assertEqual(code, 0, out)
         self.assertEqual(out, "# Todo\n\n- a\n- b1\n- c\n- d\n")
+
+
+@needs_tree_sitter
+class WhatTheFourthPassFound(unittest.TestCase):
+    """An item that says something is changed by whoever replaces it, however little of it stays;
+    only one that holds a place is filled by both. And a list both sides rewrite stays fast."""
+
+    def conflicts(self, base, ours, theirs):
+        code, out = merge("x.md", base, ours, theirs)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("<<<<<<<", out)
+
+    def test_an_item_taken_out_and_changed_into_little_of_itself(self):
+        self.conflicts("# A\n\n- yes\n- c\n", "# A\n\n- c\n", "# A\n\n- no\n- c\n")
+        self.conflicts("# A\n\n- [ ] ship\n- c\n", "# A\n\n- c\n", "# A\n\n- [x] ship it (done, see #12)\n- c\n")
+
+    def test_one_item_changed_two_ways_into_little_of_itself(self):
+        self.conflicts("# A\n\n- v1\n- c\n", "# A\n\n- version 2.0\n- c\n", "# A\n\n- release 3\n- c\n")
+        self.conflicts("# A\n\n- 1\n- c\n", "# A\n\n- 22\n- c\n", "# A\n\n- 333\n- c\n")
+
+    def test_a_placeholder_filled_by_both(self):
+        code, out = merge("x.md", "# A\n\n- TBD\n- c\n", "# A\n\n- TBD: auth\n- c\n", "# A\n\n- TBD: db\n- c\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out, "# A\n\n- TBD: auth\n- TBD: db\n- c\n")
+
+    def test_a_list_both_rewrite_is_quick(self):
+        import time
+
+        items = lambda tag: "".join(f"- item {i} {tag} " + "word " * 80 + "\n" for i in range(100))
+        started = time.monotonic()
+        code, out = merge("x.md", "# A\n\n" + items("base"), "# A\n\n" + items("ours"), "# A\n\n" + items("theirs"))
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 5)

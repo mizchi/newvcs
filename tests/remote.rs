@@ -3008,3 +3008,51 @@ fn a_driver_is_stopped_when_nv_is() {
   std::thread::sleep(std::time::Duration::from_secs(3));
   assert_eq!(std::fs::read_to_string(root.join("w2/b.txt")).unwrap(), "x\n", "Ctrl-C");
 }
+
+/// What the thirteenth round's fourth pass found with several writers: an edit made between a
+/// killed undo and the undo run again is kept, and the state named as kept has it.
+#[test]
+fn what_a_fourth_pass_found_with_many_writers_stays_fixed() {
+  if std::env::var("NV_SERVER").is_err() {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  }
+  let files = "a.txt b.txt c.txt d.txt e.txt g.txt";
+  let mut noted = 0;
+  for round in 0..24u32 {
+    let (root, run) = two_writers(&format!("fourth-pass-edit-after-kill-{round}"));
+    assert_eq!(
+      run(
+        "w1",
+        &format!("for f in c d e g; do echo base > $f.txt; done && $NV git add {files} && $NV git commit -qm files && $NV git push -q")
+      )
+      .0,
+      0
+    );
+    assert_eq!(run("w2", "$NV sync . >/dev/null").0, 0);
+    assert_eq!(run("w1", &format!("for f in {files}; do echo W1-$f >> $f; done && $NV git commit -qam w1 && $NV git push -q")).0, 0);
+    assert_eq!(run("w2", &format!("for f in {files}; do echo W2-$f >> $f; done && $NV git commit -qam w2")).0, 0);
+    assert_eq!(run("w2", "$NV git pull --rebase >/dev/null").0, 1);
+    assert_eq!(run("w2", &format!("sed -i '/^[<=>]\\{{7\\}}/d' {files} && $NV git add {files}")).0, 0);
+    let pause = 2 + round % 7;
+    run(
+      "w2",
+      &format!(
+        "$NV git rebase --abort >/dev/null 2>&1 & p=$!; perl -e 'select(undef,undef,undef,{pause}/1000)'; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; true"
+      ),
+    );
+    if !root.join("w2/.nv/undoing").exists() {
+      continue;
+    }
+    noted += 1;
+    run("w2", "echo EDITED-AFTER-THE-KILL >> a.txt");
+    let (code, said) = run("w2", "$NV git rebase --abort");
+    assert_eq!(code, 0, "{said}");
+    let kept = said.split("kept as ").nth(1).map(|t| t.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap().to_string());
+    let kept = kept.unwrap_or_else(|| panic!("an edit written over, and nothing named as kept: {said}"));
+    let (code, out) = run("w2", &format!("$NV checkout .nv/store {kept} ../kept >/dev/null && cat ../kept/a.txt"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("EDITED-AFTER-THE-KILL"), "the state named as kept lacks the edit: {out}");
+  }
+  eprintln!("{noted} of 24 kills left an undo cut short");
+}

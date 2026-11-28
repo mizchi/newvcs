@@ -67,3 +67,36 @@ fn fsck_finds_an_object_that_is_not_what_its_name_says() {
   std::fs::write(&segment, &original).unwrap();
   assert!(git(&["fsck"]).status.success());
 }
+
+/// A tag of the name of a branch only origin has: Git checks the tag out with no branch, which nv
+/// does not do, and `switch` says a branch is expected (fourth pass: nv made the branch).
+#[test]
+fn a_tag_named_like_a_branch_of_origins_is_not_that_branch() {
+  let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tag-like-origin");
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).unwrap();
+  let sh = |script: &str| {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).current_dir(&dir).env("NV", env!("CARGO_BIN_EXE_nv"));
+    for (key, value) in [
+      ("GIT_AUTHOR_NAME", "a"),
+      ("GIT_AUTHOR_EMAIL", "a@example.com"),
+      ("GIT_COMMITTER_NAME", "c"),
+      ("GIT_COMMITTER_EMAIL", "c@example.com"),
+    ] {
+      command.env(key, value);
+    }
+    common::bounded(&mut command)
+  };
+  let setup = "git init -q --bare -b main o.git && git clone -q o.git s 2>/dev/null && cd s && echo a > a.txt && git add a.txt && git commit -qm a \
+    && git push -q origin main 2>/dev/null && git checkout -q -b dev && echo d > d.txt && git add d.txt && git commit -qm d && git push -q origin dev 2>/dev/null \
+    && cd .. && $NV git clone -q o.git w && cd w && $NV git tag dev main";
+  assert!(sh(setup).status.success());
+  let checkout = sh("cd w && $NV git checkout -q dev");
+  assert_eq!(checkout.status.code(), Some(125), "{checkout:?}");
+  let switch = sh("cd w && $NV git switch -q dev");
+  assert_eq!(switch.status.code(), Some(128), "{switch:?}");
+  assert!(String::from_utf8_lossy(&switch.stderr).contains("a branch is expected, got tag 'dev'"), "{switch:?}");
+  let after = sh("cd w && $NV git branch --show-current && $NV git branch && ls");
+  assert_eq!(String::from_utf8_lossy(&after.stdout), "main\n* main\na.txt\n");
+}

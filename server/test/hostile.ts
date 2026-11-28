@@ -376,20 +376,38 @@ for (const [link, dir] of [["ss", "\u00df"], ["s", "\u017f"], ["fi", "\ufb01"], 
   assert.equal(handed.status, 200, await handed.clone().text());
   assert.equal((await fetch(`${server}/${repo}/objects/${hex(blobIdOf(empty))}`)).status, 200);
 
-  // A link's content that comes by itself, after a directory holding the link was handed over
-  // without it, is checked as one in a push is (third pass: it was taken, and the ref left unsyncable).
-  const tipThen = await tip();
+  // A link below a directory is held to what a link may be when the directory is set, however its
+  // content came: by itself, in a push, or from another repository (third and fourth pass). And a
+  // directory holding such a link handed over does not make that content any less a file's.
   for (const [what, target] of [["5,000 bytes", text("y".repeat(5000))], ["a NUL", bytes(0x63, 0, 0x64)], ["nothing", text("")]] as [string, Uint8Array][]) {
-    const holding = tree([0o120000, text("l"), blobIdOf(target)]);
-    // Refused at once where the content is here already; otherwise, when it comes.
-    if ((await adopt(holding)).status === 200) {
-      const put = await fetch(`${server}/${repo}/objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target });
-      assert.equal(put.status, 400, `a link's content of ${what} was taken by itself`);
+    for (const how of ["put", "push", "adopted"]) {
+      const here = `t/hostile-link-${how}-${what.length}-${stamp}`;
+      const to = (path: string, init?: RequestInit) => fetch(`${server}/${here}/${path}`, init);
+      const first = await to("push/main", { method: "POST", body: frame(commit(null, [{ path: text("a.txt"), entry: { mode: 0o100644, id: blobIdOf(good) } }]), good) });
+      assert.equal(first.status, 200, await first.text());
+      const start = ((await (await to("refs/main")).json()) as { tip: string }).tip;
+      const holding = tree([0o120000, text("l"), blobIdOf(target)]);
+      assert.equal((await to("adopt/trees", { method: "POST", body: frame(holding) })).status, 200);
+      // The same bytes as a file of its own, as an honest writer has them.
+      const file = commit(start, [{ path: text("f.bin"), entry: { mode: 0o100644, id: blobIdOf(target) } }]);
+      if (how === "put") {
+        assert.equal((await to(`objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target })).status, 204, `${what} by itself`);
+        assert.equal((await to("push/main", { method: "POST", body: frame(file) })).status, 200, `a file of ${what}, after a link to it was handed over`);
+      } else if (how === "push") {
+        assert.equal((await to("push/main", { method: "POST", body: frame(file, target) })).status, 200, `a file of ${what}, after a link to it was handed over`);
+      } else {
+        const source = `t/hostile-link-source-${what.length}-${stamp}`;
+        assert.equal((await fetch(`${server}/${source}/objects/${hex(blobIdOf(target))}`, { method: "PUT", body: target })).status, 204);
+        const asFile = tree([0o100644, text("x"), blobIdOf(target)]);
+        assert.equal((await fetch(`${server}/${source}/adopt/trees`, { method: "POST", body: frame(asFile) })).status, 200);
+        assert.equal((await to(`adopt/trees?from=/${source}`, { method: "POST", body: frame(asFile) })).status, 200);
+      }
+      const now = ((await (await to("refs/main")).json()) as { tip: string }).tip;
+      const set = await to("push/main", { method: "POST", body: frame(commit(now, [{ path: text("v"), entry: { mode: 0o40000, id: treeId(holding) } }])) });
+      assert.notEqual(set.status, 200, `a directory with a link to ${what}, its content come by ${how}, was set`);
+      assert.equal(((await (await to("refs/main")).json()) as { tip: string }).tip, now);
     }
-    const set = await push("main", commit(tipThen.tip, [{ path: text("v"), entry: { mode: 0o40000, id: treeId(holding) } }]));
-    assert.notEqual(set.status, 200, `a directory with a link to ${what} was set`);
   }
-  assert.deepEqual(await tip(), tipThen);
 
   // A position is a number written as one.
   for (const bad of ["0x1", "1e0", "+1", "%201", "01", "", "-0"]) assert.equal((await fetch(`${server}/${repo}/since/main?after=${bad}`)).status, 400, `after=${bad}`);

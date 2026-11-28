@@ -75,6 +75,22 @@ binary; each item gets a failing test or Git case before its fix.
   writes one); 8 union merges in 1,100 random cases are refused where Git merges by union.
 - [ ] `merge origin` and other revisions nv does not look for are refused naming `rev-parse`.
 
+### From the fourth pass
+
+- [ ] `switch` and `checkout` against what the index holds: where the index already has what the
+  target has (`-AAA`, `-ABA`, `AA-B`, `AB-B`, `ABBB`, `ABCB`, as HEAD/index/disk/target), nv refuses
+  where Git switches; with a file staged as the target has it and the disk as HEAD (`ABAB`), nv
+  writes the target's over the disk where Git keeps it; a file deleted on disk that HEAD and the
+  target have (`-A-A`) is written back.
+- [ ] `git branch <new>` on a branch whose name is also a tag's: Git fails ("ambiguous object
+  name"), nv makes the branch. `diff` of an ambiguous name warns three times; a ref whose name is
+  the start of an object's id is taken without Git's warning.
+- [ ] While an undo cut short waits to be finished, `git status` says nothing of it.
+- [ ] Seen once, not made again (seed 316): `.nv/settling` named files as held out of the commit
+  that already were as HEAD has them, and nothing could complete or undo the stop.
+- [ ] A killed undo or `nv restore` can leave a tracked file empty until it is finished: files of
+  the tree are written in place, not replaced whole.
+
 ### Server
 
 - [ ] On a ref whose first commit has no parent, the rules a union push states at its base are

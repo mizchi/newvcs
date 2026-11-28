@@ -79,6 +79,7 @@ export class Repo extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS path_index (ref TEXT NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, mode INTEGER, id BLOB, PRIMARY KEY (ref, path, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS indexed (ref TEXT PRIMARY KEY, since INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS links_awaited (id BLOB PRIMARY KEY) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS tree_links (tree BLOB NOT NULL, child BLOB NOT NULL, PRIMARY KEY (tree, child)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS landed_merged (ref TEXT NOT NULL, sent BLOB NOT NULL, paths TEXT NOT NULL, PRIMARY KEY (ref, sent)) WITHOUT ROWID;
     `);
   }
@@ -444,9 +445,10 @@ export class Repo extends DurableObject<Env> {
   }
 
   /// Note what a directory handed over holds, and the longest path below it.
-  describe(id: Uint8Array, entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean }[], deepest: number): void {
+  describe(id: Uint8Array, entries: { name: string; child: Uint8Array; dir: boolean; gitlink: boolean; link: boolean }[], deepest: number): void {
     const sql = this.ctx.storage.sql;
     for (const e of entries) {
+      if (e.link) sql.exec("INSERT OR IGNORE INTO tree_links (tree, child) VALUES (?, ?)", id, e.child);
       // Another repository's commit is neither: nothing below it is this repository's to have.
       sql.exec("INSERT OR IGNORE INTO tree_entries (tree, name, child, dir) VALUES (?, ?, ?, ?)", id, e.name, e.child, e.gitlink ? 2 : e.dir ? 1 : 0);
     }
@@ -460,16 +462,26 @@ export class Repo extends DurableObject<Env> {
     }
   }
 
-  /// Note contents a directory handed over holds as links, not sent yet: checked when they come.
-  noteLinks(ids: Uint8Array[]): void {
-    for (const id of ids) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO links_awaited (id) VALUES (?)", id);
-  }
-
-  /// Of these ids, those noted as links still to come.
-  notedLinks(ids: Uint8Array[]): Set<string> {
-    const found = new Set<string>();
-    for (const id of ids) if (this.ctx.storage.sql.exec("SELECT 1 FROM links_awaited WHERE id = ?", id).toArray().length > 0) found.add(hex(id));
-    return found;
+  /// The contents of every link below these directories, walked as `whole` walks them: what a
+  /// push that sets one of them has to hold to what a link may be, however the content came.
+  linksBelow(dirs: Uint8Array[]): Uint8Array[] {
+    const sql = this.ctx.storage.sql;
+    const seen = new Set<string>();
+    const found = new Map<string, Uint8Array>();
+    const todo = [...dirs];
+    while (todo.length > 0) {
+      const dir = todo.pop()!;
+      if (seen.has(hex(dir))) continue;
+      seen.add(hex(dir));
+      for (const row of sql.exec<{ child: ArrayBuffer }>("SELECT child FROM tree_links WHERE tree = ?", dir).toArray()) {
+        const child = new Uint8Array(row.child);
+        found.set(hex(child), child);
+      }
+      for (const row of sql.exec<{ child: ArrayBuffer }>("SELECT child FROM tree_entries WHERE tree = ? AND dir = 1", dir).toArray()) {
+        todo.push(new Uint8Array(row.child));
+      }
+    }
+    return [...found.values()];
   }
 
   /// Note that these objects are directories: handed over as trees, and read as trees.

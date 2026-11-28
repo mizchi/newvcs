@@ -418,6 +418,15 @@ impl Repo {
   /// branch and a branch of a remote's (third pass: a tag and a branch of one name was the
   /// branch). Where more than one is found, Git's warning says so, and the first is taken.
   fn named(&self, name: &str) -> Option<(Named, Id)> {
+    let found = self.all_named(name);
+    if found.len() > 1 {
+      eprintln!("warning: refname '{name}' is ambiguous.");
+    }
+    found.into_iter().next()
+  }
+
+  /// Every ref a name is found as, in Git's order.
+  fn all_named(&self, name: &str) -> Vec<(Named, Id)> {
     let remote = |rest: &str| {
       let rest = rest.to_string();
       self.ref_tip(&rest).or_else(|| self.store.read_ref(&format!("remotes/{rest}"))).map(|tip| (Named::Remote, tip))
@@ -434,9 +443,9 @@ impl Repo {
       }
     };
     if let Some(rest) = name.strip_prefix("refs/") {
-      return of_kind(rest);
+      return of_kind(rest).into_iter().collect();
     }
-    let found: Vec<(Named, Id)> = [
+    [
       of_kind(name),
       self.store.read_ref(&format!("tags/{name}")).map(|tip| (Named::Tag, tip)),
       self.branch_tip(name).map(|tip| (Named::Branch, tip)),
@@ -444,11 +453,12 @@ impl Repo {
     ]
     .into_iter()
     .flatten()
-    .collect();
-    if found.len() > 1 {
-      eprintln!("warning: refname '{name}' is ambiguous.");
-    }
-    found.into_iter().next()
+    .collect()
+  }
+
+  /// A branch by the shortest name that finds it and nothing else, as Git shortens one.
+  fn short_branch(&self, branch: &str) -> String {
+    if self.all_named(branch).len() > 1 { format!("heads/{branch}") } else { branch.to_string() }
   }
 
   /// A commit named the way Git names them: `HEAD`, a branch, a tag, a full id, with `^` and `~N` after.
@@ -673,7 +683,7 @@ fn kind_name(entry: &Entry) -> &'static str {
 
 /// `author`/`committer` identity and date: from the environment, then from `git config`.
 fn identity(repo: &Repo, role: &str) -> Res<String> {
-  let var = |name: &str| std::env::var(format!("GIT_{role}_{name}")).ok().filter(|v| !v.is_empty());
+  let var = |name: &str| crate::git::ident_env(role, name);
   // The workspace's own setting, then the user's Git configuration, as Git itself would look.
   let set = |key: &str| repo.config(&format!("user.{key}")).or_else(|| crate::git::config_value(&repo.ws.root, "user", key));
   let (name, email) = (var("NAME").or_else(|| set("name")), var("EMAIL").or_else(|| set("email")));
@@ -684,9 +694,13 @@ fn identity(repo: &Repo, role: &str) -> Res<String> {
   if name.is_empty() {
     return fatal(128, format!("fatal: empty ident name (for <{email}>) not allowed"));
   }
-  let date = match var("DATE") {
+  let date = match var("DATE").filter(|date| !date.is_empty()) {
     Some(date) => match crate::git::stamp(&date) {
       Some(stamp) => stamp,
+      // What Git refuses is refused as Git refuses it; the rest of what Git reads is not spoken.
+      None if date.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '-') => {
+        return fatal(128, format!("fatal: invalid date format: {date}"));
+      }
       None => {
         return unsupported(format_args!("commit with GIT_{role}_DATE={date}` (seconds and a zone, or a date as ISO 8601 writes it)"));
       }
@@ -2344,7 +2358,8 @@ fn rev_parse(mut repo: Repo, args: &[&str]) -> Res<i32> {
     ["--show-toplevel"] => println!("{}", std::fs::canonicalize(&repo.ws.root).map_err(|e| e.to_string())?.display()),
     ["--abbrev-ref", "HEAD"] => match (repo.ws.head, repo.branch()) {
       (None, _) => return fatal(128, "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."),
-      (_, Some(name)) => println!("{name}"),
+      // Shortened as Git shortens it: by a name that finds the branch and nothing else (fourth pass).
+      (_, Some(name)) => println!("{}", repo.short_branch(&name)),
       (_, None) => println!("HEAD"),
     },
     ["--short", spec] => {
@@ -3585,6 +3600,26 @@ fn staged_in_the_way(repo: &mut Repo, target: Id) -> Res<Vec<String>> {
   Ok(in_the_way)
 }
 
+/// Files taken out of the index and still on disk, so untracked, that the commit gone to has not:
+/// moving would remove them, and Git will not (fourth pass: nv removed them).
+fn untracked_removed(repo: &mut Repo, target: Id) -> Res<Vec<String>> {
+  let to = root_of(&mut repo.store, &target)?;
+  let mut removed = Vec::new();
+  for (path, entry) in repo.staged() {
+    if entry.is_some() || std::fs::symlink_metadata(repo.ws.root.join(std::ffi::OsStr::from_bytes(&path))).is_err() {
+      continue;
+    }
+    let theirs = match to {
+      Some(root) => crate::manifest::lookup(&mut repo.store, root, &path)?,
+      None => None,
+    };
+    if theirs.is_none() {
+      removed.push(String::from_utf8_lossy(&path).into_owned());
+    }
+  }
+  Ok(removed)
+}
+
 /// `workspace::switch`, refused first where the index is in the way, as Git refuses it.
 fn switch_checked(repo: &mut Repo, target: Id) -> Res<()> {
   let in_the_way = staged_in_the_way(repo, target)?;
@@ -3594,6 +3629,16 @@ fn switch_checked(repo: &mut Repo, target: Id) -> Res<()> {
       format!(
         "error: Your local changes to the following files would be overwritten by checkout:\n\t{}\nPlease commit your changes or stash them before you switch branches.\nAborting",
         in_the_way.join("\n\t")
+      ),
+    );
+  }
+  let removed = untracked_removed(repo, target)?;
+  if !removed.is_empty() {
+    return fatal(
+      1,
+      format!(
+        "error: The following untracked working tree files would be removed by checkout:\n\t{}\nPlease move or remove them before you switch branches.\nAborting",
+        removed.join("\n\t")
       ),
     );
   }
@@ -3686,6 +3731,14 @@ fn checkout(mut repo: Repo, args: &[&str], create_flag: &str, command: &str) -> 
     return Ok(0);
   }
   let [name] = plain[..] else { return unsupported(format_args!("{command} {}", args.join(" "))) };
+  // A tag of that name, with no branch of it here, is the tag to Git, not origin's branch: `switch`
+  // wants a branch, and `checkout` would leave HEAD on none (fourth pass).
+  if repo.branch_tip(name).is_none() && repo.store.read_ref(&format!("tags/{name}")).is_some() {
+    if command == "switch" {
+      return fatal(128, format!("fatal: a branch is expected, got tag '{name}'"));
+    }
+    return unsupported(format_args!("{command} {name}` (a tag: HEAD on no branch)"));
+  }
   // Only a branch: a commit would leave HEAD on none.
   // A branch only the remote has is made here, following it, as Git does.
   if repo.branch_tip(name).is_none()
@@ -3987,6 +4040,30 @@ fn merge(mut repo: Repo, args: &[&str]) -> Res<i32> {
         in_the_way.join("\n\t")
       ),
     );
+  }
+  // A message given that is nothing once cleaned: the merge is made in the files and the index,
+  // and left for a commit to complete, as Git leaves it (fourth pass: it was committed empty).
+  if value(args, &["-m"]).is_some_and(|given| cleaned(given).is_empty()) {
+    let blocking = workspace::blocked(&mut repo.store, &repo.ws, &their_changes)?;
+    if !blocking.is_empty() {
+      return fatal(
+        1,
+        format!("error: The following untracked working tree files would be overwritten by merge:\n\t{}\nAborting", blocking.join("\n\t")),
+      );
+    }
+    say_merged();
+    let mut staged = repo.staged();
+    for (path, entry) in &their_changes {
+      if entry.is_none() {
+        workspace::unplace(&repo.ws.root, path);
+      }
+      staged.insert(path.clone(), *entry);
+    }
+    let placed: Vec<(Vec<u8>, Entry)> = their_changes.iter().filter_map(|(path, entry)| Some((path.clone(), (*entry)?))).collect();
+    workspace::write_entries(&mut repo.store, &repo.ws, &placed)?;
+    repo.set_staged(&staged)?;
+    crate::write_whole(&repo.meta("git-merge"), format!("{}\n\n", hex(&theirs)))?;
+    return fatal(1, "error: Empty commit message.\nNot committing merge; use 'git commit' to complete the merge.");
   }
   if let Err(refusal) = workspace::apply_changes(&mut repo.store, &repo.ws, &their_changes) {
     return fatal(1, format!("error: {refusal}\nAborting"));

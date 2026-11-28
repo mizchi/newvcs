@@ -263,11 +263,11 @@ export default {
           // A link is written where its content says it leads, by every client that syncs: a target
           // no file system takes would leave the ref one nobody can sync (thirteenth round).
           const links = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_LINK ? [c.entry.id] : [])));
-          // And contents a directory handed over earlier holds as links.
-          const noted = await repo.notedLinks(contents.map((bytes) => blobId(bytes)));
-          if (contents.some((bytes) => noted.has(hex(blobId(bytes))) && !linkOk(bytes))) {
-            return json({ error: "a link below a directory leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
-          }
+          // And the links below a directory set whole, however their contents came: checked where
+          // the directory comes into the ref, not where a content comes in, as the same bytes may be
+          // any file's (fourth pass: a note of them refused honest files, and missed adoption).
+          const dirs = commits.flatMap((bytes) => decode(bytes).changes.flatMap((c) => (c.entry?.mode === MODE_DIR ? [c.entry.id] : [])));
+          if (dirs.length > 0) links.push(...(await repo.linksBelow(dirs)));
           if (links.length > 0) {
             const sent = new Map(contents.map((bytes) => [hex(blobId(bytes)), bytes]));
             const elsewhere = links.filter((id) => !sent.has(hex(id)));
@@ -361,9 +361,7 @@ export default {
             const taken = new Set(theirs.map((c) => hex(c.id)));
             missing = missing.filter((id) => !taken.has(hex(id)));
           }
-          // Those whose content is still to come are checked when it does.
-          const awaited = new Set(missing.map(hex));
-          await repo.noteLinks(linkIds.filter((id) => awaited.has(hex(id))));
+          // Those whose content is still to come are checked when a push sets a directory holding them.
           const known = await has(trees.map((t) => t.id));
           const fresh = trees.filter((t) => !known.has(hex(t.id)));
           if (fresh.length > 0) {
@@ -375,7 +373,13 @@ export default {
           // Each of them a directory from now on, with what it holds and how deep it goes.
           const names = new TextDecoder();
           for (const t of trees) {
-            const entries = t.entries.map((e) => ({ name: names.decode(e.name), child: e.id, dir: e.mode === MODE_DIR, gitlink: e.mode === MODE_GITLINK }));
+            const entries = t.entries.map((e) => ({
+              name: names.decode(e.name),
+              child: e.id,
+              dir: e.mode === MODE_DIR,
+              gitlink: e.mode === MODE_GITLINK,
+              link: e.mode === MODE_LINK,
+            }));
             await repo.describe(t.id, entries, deepest.get(hex(t.id))!);
           }
           await repo.markTrees(trees.map((t) => t.id));
@@ -453,14 +457,6 @@ export default {
           await env.OBJECTS.put(arriving, request.body.pipeThrough(hashing).pipeThrough(new FixedLengthStream(length)));
           try {
             if (hex(hasher.digest()) !== arg) return json({ error: "the bytes do not hash to that id" }, 400);
-            // The content of a link in a directory handed over earlier is checked as it comes, by
-            // whichever way it comes (third pass: by itself, it was taken unchecked).
-            if ((await repo.notedLinks([id])).size > 0) {
-              const held = length <= 1024 ? await env.OBJECTS.get(arriving) : null;
-              if (!held || !linkOk(new Uint8Array(await held.arrayBuffer()))) {
-                return json({ error: "a link below a directory leads nowhere a file system can write: nothing, a NUL, or more than 1,024 bytes" }, 400);
-              }
-            }
             // Stored once: if it is there already, these bytes are the same bytes.
             if (!(await env.OBJECTS.head(key))) {
               const checked = await env.OBJECTS.get(arriving);

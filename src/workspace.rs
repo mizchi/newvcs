@@ -2023,7 +2023,7 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
   let config = std::fs::read_to_string(ws.root.join(".nv").join("git-config")).unwrap_or_default();
   let own =
     |key: &str| config.lines().rev().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))).map(str::to_string);
-  let from_env = |key: &str| std::env::var(format!("GIT_{role}_{key}")).ok().filter(|v| !v.is_empty());
+  let from_env = |key: &str| crate::git::ident_env(role, key);
   let name = from_env("NAME").or_else(|| own("user.name")).or_else(|| crate::git::config_value(&ws.root, "user", "name"));
   let email = from_env("EMAIL").or_else(|| own("user.email")).or_else(|| crate::git::config_value(&ws.root, "user", "email"));
   // A commit is published under somebody's name. Git refuses to make one up, and so does this.
@@ -2037,19 +2037,13 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
   if name.is_empty() {
     return Err(format!("the name to sign the commit as is empty, once what Git takes out of a name is taken out (for <{email}>)"));
   }
-  let when = match from_env("DATE") {
-    Some(date) => crate::git::stamp(&date)
-      .ok_or_else(|| format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601"))?,
+  let when = match from_env("DATE").filter(|date| !date.is_empty()) {
+    Some(date) => crate::git::stamp(&date).ok_or_else(|| {
+      format!("GIT_{role}_DATE={date} is not a date nv reads: seconds and a zone (`1700000000 +0900`), or ISO 8601, as Git takes them")
+    })?,
     None => {
       let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-      // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
-      let east = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        let at: libc::time_t = now as libc::time_t;
-        libc::localtime_r(&at, &mut tm);
-        tm.tm_gmtoff
-      };
-      format!("{now} {}{:02}{:02}", if east < 0 { '-' } else { '+' }, east.abs() / 3600, east.abs() % 3600 / 60)
+      format!("{now} {}", crate::git::local_zone(now))
     }
   };
   Ok(format!("{name} <{email}> {when}"))
@@ -2679,6 +2673,39 @@ fn restore_noted(store: &mut Store, ws: &mut Workspace, target: Id, author: &str
       "these are not recorded (nv does not track them, or may not read them), and stand where the state restored has something else: {}\nMove them away and restore again. Nothing was written; what was on disk and could be recorded, is.",
       blocking.join(", ")
     ));
+  }
+  // An undo finished from what was recorded writes over what is on disk without looking at it
+  // first. A file there that is neither what the undo went from nor what it goes to was edited
+  // after the undo was cut short: recorded first, on what it went from, and named as kept (fourth
+  // pass: the second run said it kept what was on disk, of a state without the edit).
+  if resuming {
+    let mut edited: Vec<(Vec<u8>, Option<Entry>)> = Vec::new();
+    for (path, entry) in &changes {
+      let full = ws.root.join(to_path(path));
+      let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+      if !meta.is_file() && !meta.file_type().is_symlink() {
+        continue;
+      }
+      let Ok((mode, bytes)) = read_content(&full, &meta) else { continue };
+      let id = object_id(Kind::Blob, &bytes);
+      let had = match from {
+        Some(root) => crate::manifest::lookup(store, root, path)?,
+        None => None,
+      };
+      let is = |e: &Option<Entry>| e.is_some_and(|e| e.mode == mode && e.id == id);
+      if !is(&had) && !is(entry) {
+        let id = store.put(Kind::Blob, &bytes, had.map(|e| e.id))?;
+        edited.push((path.clone(), Some(Entry { mode, id })));
+      }
+    }
+    if let (false, Some(went)) = (edited.is_empty(), went_from.or(ws.head)) {
+      let rest = rest_of(author, "what was on disk, edited after an undo was cut short, before the undo was finished");
+      let id = Commit { parents: vec![went], rest, changes: edited }.store(store)?;
+      root_of(store, &id)?;
+      store.flush()?;
+      ws.log("snapshot", &id)?;
+      done.kept = Some(id);
+    }
   }
   // The rules of what is left out, when a restore changes them, change which files there are to
   // record: the next command that trusts reported writes is told, and looks at everything.

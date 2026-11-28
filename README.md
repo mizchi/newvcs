@@ -1145,7 +1145,7 @@ its own (14,716 contents, 1.1 s) and then linked into another:
 | --- | ---: |
 | `nv link` of the 14,716 files, most of it writing them | 2.8 s |
 | Stored by the link, and by publishing it | 464 + 530 bytes |
-| `nv push` of the link | 833 ms |
+| `nv push` of the link | 833 ms (measured before the server walked a directory set whole for its links as well, in the thirteenth round's fourth pass) |
 | File contents sent in that push | 1 (`nv.links`) |
 | Contents the other repository's table was asked for and gave | 13,693 |
 | `nv sync` into a store that had never seen oxc | 3.8 s, 14,717 files |
@@ -2099,9 +2099,10 @@ items `TODO.md` lists, and these, fixed the same way:
   be taken back, before the first file is written; while the note is
   there, nothing records, commits or pushes, and the undo run again
   finishes the work from what was recorded, not from the half-written
-  files (as an arrival cut short is finished). An edit made to the files
-  between the kill and that second run is written over, as it is when an
-  arrival is finished.
+  files (as an arrival cut short is finished). A file edited between the
+  kill and that second run, so that it is neither what the undo went from
+  nor what it goes to, is recorded before it is written over, and the state
+  that holds it is the one named as kept.
 - **A driver went on after nv was stopped** by SIGTERM, SIGINT or SIGHUP
   (as `timeout(1)`, a supervisor or a Ctrl-C stops it), and wrote into the
   workspace without its lock: what nv started is stopped first, then nv
@@ -2116,11 +2117,13 @@ items `TODO.md` lists, and these, fixed the same way:
 - **`merge_cst.py` read a unit whose own text names it (a list item, a
   heading, a function's name) edited on one side and taken out on the
   other as taken out and added**, and brought it back; two different edits
-  of one list item were both kept. Both are conflicts. A list item both
-  sides put their own items in place of (a placeholder such as `(none
-  yet)`) still merges; it counts as edited when an item put in its place
-  has most of its text. On 800 random merges, 177 are conflicts where 162
-  were.
+  of one list item were both kept. Both are conflicts. Only a list item
+  that holds a place (`(none yet)`, `TBD`, `TODO: ...`, `n/a`, `...`, or
+  any text wholly in brackets or emphasis) may be put in place of by both
+  sides, each with its own items; any other item replaced differently by
+  the two, or taken out by one and replaced by the other, is a conflict.
+  On 800 random merges, 183 are conflicts where 162 were before the third
+  pass.
 - **`nv git`**: a tag and a branch of one name were the branch, where Git
   takes the tag (and says the name is ambiguous); merges of `tags/<t>`,
   `refs/tags/<t>` and `remotes/origin/<b>` were "Merge commit"; `merge` of a
@@ -2130,6 +2133,36 @@ items `TODO.md` lists, and these, fixed the same way:
   to HEAD, which Git deletes); `switch` went over a file staged as new and
   gone from disk that the branch gone to has; and `show` of a file by its
   id read it as a damaged commit (case 50).
+
+A fourth pass (about 11,000 steps, 600 kills and 10,000 requests) found
+the third pass's fixes holding, and these, fixed the same way:
+
+- **The note of a link whose content had not come refused that content
+  as any file's**: one request handing over a directory with a link to the
+  empty content made every empty file unpushable to that repository; and
+  the content brought by adopting another repository's directory got past
+  it, and the ref was again one nobody could sync. Nothing is noted now: a
+  push that sets a directory whole walks it for its links, wherever their
+  content came from, and holds each to what a link may be.
+- **An identity variable set to nothing was taken as not set**, where Git
+  refuses an empty name and writes an empty address; **a date Git refuses
+  was taken** (`0`, `-5`: a commit with a negative date pushed to a Git
+  origin failed `git fsck` there), and a zone out of range was kept. Dates
+  are read as Git reads them: seconds of nine digits or more before 2100,
+  any after `@`, and a zone of under 24 hours and 60 minutes, or this
+  machine's.
+- **An undo finished after a kill wrote over an edit made in between and
+  named as kept a state without it**: the edit is recorded first.
+- **`merge_cst.py` compared list items by likeness**, which was slow on
+  long items (a list both sides rewrote, 41 KB: 62 s) and wrong below its
+  threshold (`- yes` taken out on one side and made `- no` on the other
+  came back). Only an item that holds a place is filled by both.
+- **`nv git`**: a tag of the name of a branch only origin has was taken for
+  that branch (`checkout` is refused, as it would leave HEAD on no branch,
+  and `switch` says a branch is expected); `merge -m ''` committed an empty
+  message where Git stops; `rev-parse --abbrev-ref HEAD` gave a name that
+  finds something else; and `switch` removed a file taken out of the index
+  and kept on disk, which Git refuses (case 51).
 
 ## Why these choices
 

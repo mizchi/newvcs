@@ -80,31 +80,40 @@ pub fn ident_part(text: &str) -> String {
   text.trim_matches(crud).chars().filter(|c| !matches!(c, '\n' | '<' | '>')).collect()
 }
 
-/// A date as a commit carries it, `<seconds> <+hhmm>`, from the forms of
-/// `GIT_AUTHOR_DATE` that are spoken: that one, with or without `@` before
-/// it, and `YYYY-MM-DD HH:MM:SS +hh:mm` with `T` for the space, `Z` for the
-/// zone, or the colon left out.
+/// A date as Git takes one from `GIT_AUTHOR_DATE` and the like, written as a commit has it
+/// (`seconds zone`): seconds since 1970 (nine digits or more, before 2100, or any after an `@`),
+/// or ISO 8601, with a zone (`+hhmm` of under 24 hours and 60 minutes) or this machine's where
+/// none is given or the one given is none. `None` where Git refuses the date (fourth pass: `0`
+/// and `-5` were taken, and a commit Git's fsck refuses pushed; `+9999` was kept).
 pub fn stamp(date: &str) -> Option<String> {
   let date = date.trim();
-  let zone_ok =
-    |zone: &str| zone.len() == 5 && (zone.starts_with('+') || zone.starts_with('-')) && zone[1..].bytes().all(|b| b.is_ascii_digit());
-  if let Some((seconds, zone)) = date.trim_start_matches('@').split_once(' ')
-    && seconds.parse::<i64>().is_ok()
-    && zone_ok(zone)
-  {
+  let zone_of = |zone: &str| -> Option<String> {
+    let bytes = zone.as_bytes();
+    if bytes.len() != 5 || !(bytes[0] == b'+' || bytes[0] == b'-') || !bytes[1..].iter().all(u8::is_ascii_digit) {
+      return None;
+    }
+    let (hours, minutes): (u32, u32) = (zone[1..3].parse().ok()?, zone[3..5].parse().ok()?);
+    (hours < 24 && minutes < 60).then(|| zone.to_string())
+  };
+  let mut words = date.split_whitespace();
+  let first = words.next()?;
+  let seconds = match first.strip_prefix('@') {
+    Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => digits.parse::<i64>().ok(),
+    None if first.bytes().all(|b| b.is_ascii_digit()) => first.parse::<i64>().ok().filter(|s| (100_000_000..4_102_444_800).contains(s)),
+    _ => None,
+  };
+  if first.bytes().all(|b| b.is_ascii_digit()) || first.starts_with('@') {
+    let seconds = seconds?;
+    let zone = words.next().and_then(zone_of).unwrap_or_else(|| local_zone(seconds));
     return Some(format!("{seconds} {zone}"));
   }
   let (day, rest) = date.split_at_checked(10)?;
   let rest = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' '))?;
   let (time, zone) = rest.split_at_checked(8)?;
-  let zone = match zone.trim() {
-    "Z" | "" => "+0000".to_string(),
-    zone => zone.replace(':', ""),
-  };
   let number = |text: &str| text.parse::<i64>().ok();
   let (year, month, date_of) = (number(day.get(..4)?)?, number(day.get(5..7)?)?, number(day.get(8..10)?)?);
   let (hour, minute, second) = (number(time.get(..2)?)?, number(time.get(3..5)?)?, number(time.get(6..8)?)?);
-  if !zone_ok(&zone) || !(1..=12).contains(&month) || !(1..=31).contains(&date_of) || hour > 23 || minute > 59 || second > 60 {
+  if !(1..=12).contains(&month) || !(1..=31).contains(&date_of) || hour > 23 || minute > 59 || second > 60 {
     return None;
   }
   // Days since the epoch, by the civil calendar.
@@ -112,8 +121,38 @@ pub fn stamp(date: &str) -> Option<String> {
   let era = y.div_euclid(400);
   let of_era = y.rem_euclid(400);
   let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + (153 * m + 2) / 5 + date_of - 1 - 719_468;
-  let east = (number(&zone[1..3])? * 3600 + number(&zone[3..5])? * 60) * if zone.starts_with('-') { -1 } else { 1 };
-  Some(format!("{} {zone}", days * 86_400 + hour * 3600 + minute * 60 + second - east))
+  let wall = days * 86_400 + hour * 3600 + minute * 60 + second;
+  let zone = match zone.trim() {
+    "Z" => "+0000".to_string(),
+    "" => local_zone(wall - offset_of(&local_zone(wall))),
+    zone => zone_of(&zone.replace(':', ""))?,
+  };
+  Some(format!("{} {zone}", wall - offset_of(&zone)))
+}
+
+/// Seconds east of UTC that a zone written `+hhmm` is.
+fn offset_of(zone: &str) -> i64 {
+  let number = |text: &str| text.parse::<i64>().unwrap_or(0);
+  (number(&zone[1..3]) * 3600 + number(&zone[3..5]) * 60) * if zone.starts_with('-') { -1 } else { 1 }
+}
+
+/// This machine's zone at a moment, as `+hhmm`.
+pub fn local_zone(seconds: i64) -> String {
+  // SAFETY: `localtime_r` writes into the struct it is handed and nothing else.
+  let east = unsafe {
+    let mut tm: libc::tm = std::mem::zeroed();
+    let at: libc::time_t = seconds as libc::time_t;
+    libc::localtime_r(&at, &mut tm);
+    tm.tm_gmtoff
+  };
+  let (sign, east) = if east < 0 { ('-', -east) } else { ('+', east) };
+  format!("{sign}{:02}{:02}", east / 3600, east / 60 % 60)
+}
+
+/// What the environment says of a commit's author or committer (`role`): a variable set is taken
+/// even when empty, as Git takes it (fourth pass: an empty one was read as unset).
+pub fn ident_env(role: &str, key: &str) -> Option<String> {
+  std::env::var(format!("GIT_{role}_{key}")).ok()
 }
 
 /// The file of patterns Git ignores in every repository of this user's.

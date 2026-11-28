@@ -53,7 +53,7 @@ the README or undone. "Tree" means the files of one commit.
 | Server push | paths in the push | how far behind the pusher is, how many commits the push has | 4–6 ms with one content; 74 ms for 1,000 paths and their contents |
 | Writes to the bucket for a push | 1, and 1 for each large file, and 1 more where the server merged a `merge=union` path | how many files the push has | 200 files: 1 write |
 | Linking a directory of another repository | nothing stored but one change | files and bytes of the directory | 464 bytes for 14,716 files, 119 MB |
-| Pushing a linked directory | its tree objects, and the files the server cannot find | bytes of files the repository it came from has | 833 ms for oxc, 1 content sent |
+| Pushing a linked directory | its tree objects, and the files the server cannot find | bytes of files the repository it came from has | 833 ms for oxc, 1 content sent (before the server walked the directory for its links) |
 | Three-way merge of a file | its lines | | 4.7 ms for 58,000 lines |
 
 `status` is the one place where the whole tree is walked, and only because
