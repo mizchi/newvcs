@@ -1874,7 +1874,14 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
     let chain = workspace::pending(&mut repo.store, &repo.ws)?;
     let after =
       workspace::settles_into(&repo.ws.root).and_then(|into| chain.iter().position(|(id, _)| *id == into)).map(|at| chain.len() - 1 - at);
-    if workspace::complete_settling(&mut repo.store, &mut repo.ws, &committer, workspace::Look::Everywhere, reword)?.is_some() {
+    // What the index has against the commit: the settled files added, and whatever else was.
+    let known = repo.ws.load_index();
+    let staged: Vec<Change> = repo.staged().into_iter().filter(|(path, entry)| known.get(path).map(|k| k.entry) != *entry).collect();
+    let completed = match workspace::complete_settling_staged(&mut repo.store, &mut repo.ws, staged, &committer, reword) {
+      Ok(done) => done,
+      Err(why) => return fatal(128, format!("fatal: {why}")),
+    };
+    if completed.is_some() {
       repo.set_staged(&Staged::new())?;
       if !silent {
         let chain = workspace::pending(&mut repo.store, &repo.ws)?;

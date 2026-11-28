@@ -83,10 +83,19 @@ fn id_of(value: &serde_json::Value) -> Result<Id> {
 /// Nothing is pushed or caught up with while a file still holds both versions from the last
 /// sync: a second sync would forget that it does, and what was pushed next would have the
 /// markers in it.
-fn settled(ws: &Workspace) -> Result<()> {
+fn settled(store: &mut Store, ws: &Workspace) -> Result<()> {
   let left = workspace::unsettled(ws);
   if left.is_empty() {
-    return Ok(());
+    // Settled and not yet in the commit the sync held them out of: a push would carry that commit
+    // without them, and a sync would put it on the tip so (thirteenth round).
+    let waiting = workspace::settled_uncommitted(store, ws)?;
+    if waiting.is_empty() {
+      return Ok(());
+    }
+    return Err(format!(
+      "these were settled and are not yet in the commit the last sync held them out of: {}\n`nv commit <dir>` completes that commit (with `nv git`: `git add` them and `git rebase --continue`, or `git commit -m <message>`); or `nv restore <dir> before-sync` undoes that sync.",
+      waiting.join(", ")
+    ));
   }
   Err(format!(
     "these still hold both versions between markers, from the last sync: {}\nEdit them to what they should be and `nv commit`; or `nv restore <dir> before-sync` to undo that sync.",
@@ -399,7 +408,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   // An arrival a kill cut short is finished first: what it would leave unsettled is known only
   // once it is (killed after noting it, the workspace could otherwise never be moved again).
   resume(store, ws, &url, author)?;
-  settled(ws)?;
+  settled(store, ws)?;
   let mut done = Pushed::default();
   let known = find_place(store, ws, &url, &name)?;
   // The published commits the ref has not seen, oldest first. A ref that does
@@ -562,7 +571,7 @@ pub fn push(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Pushe
   if let Some(tip) = tip {
     let commits = done.synced.commits;
     let landed_at = tip.seq;
-    let arrived = arrive(store, ws, &url, tip, author);
+    let arrived = arrive(store, ws, &url, tip, author, Staging::Unstage);
     if arrived.is_err() {
       // The ref has these commits, under ids the server gave them. Where the workspace stands on
       // the ref is asked again next time, and its commits are known there by what they are.
@@ -617,6 +626,9 @@ pub struct Synced {
   /// How many commits, published here and not pushed, were dropped because the ref already has
   /// the changes they made, under commits of its own.
   pub superseded: usize,
+  /// Paths `nv git add` had staged that the ref changed, unstaged by a catching-up that could not
+  /// refuse: their files on disk are what it made of them.
+  pub unstaged: Vec<String>,
 }
 
 /// Bring the workspace to the ref's tip, keeping its own unpushed work on
@@ -632,7 +644,7 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   {
     return Ok(done);
   }
-  settled(ws)?;
+  settled(store, ws)?;
   let knew = ws.pushed;
   if !find_place(store, ws, &url, &name)? {
     return Ok(Synced::default());
@@ -667,7 +679,7 @@ pub fn sync(store: &mut Store, ws: &mut Workspace, author: &str) -> Result<Synce
   take_commits(store, &url, &answer)?;
   forward(store, ws.pushed, &tip.id)?;
   let came = steps(&answer).count();
-  let mut done = arrive(store, ws, &url, tip, author)?;
+  let mut done = arrive(store, ws, &url, tip, author, Staging::Refuse)?;
   // Those of the ref's commits since the workspace last looked that are not its own, landed.
   done.commits = came.saturating_sub(done.own_landed);
   Ok(done)
@@ -701,25 +713,34 @@ pub fn fetch(store: &mut Store, ws: &mut Workspace) -> Result<Fetched> {
   let tip = Tip { id: id_of(&answer["tip"])?, seq: answer["seq"].as_u64().unwrap_or(0) };
   let mut done = Fetched { was, tip: Some(tip.id), ..Default::default() };
   if Some(tip.id) == ws.pushed {
+    // Where the workspace learnt only now where it stands (a ref its own push started, unheard),
+    // that is where the ref is (thirteenth round).
+    workspace::set_fetched(ws, tip.id, tip.seq)?;
     return Ok(done);
   }
   done.commits = take_commits(store, &url, &answer)?;
   forward(store, ws.pushed, &tip.id)?;
-  let from = match ws.pushed {
-    Some(id) => root_of(store, &id)?,
-    None => None,
-  };
-  let to = root_of(store, &tip.id)?;
+  // Every commit's contents in view, not only the tip's: Git's id of each commit that came is
+  // made from its own files, and `log origin/<ref>` names each (thirteenth round).
   let mut wanted: Vec<(Id, Option<Id>)> = Vec::new();
-  // File by file: with no directory kept whole, a directory set whole comes as its files.
-  for (path, entry) in diff_keeping(store, from, to, &Default::default())? {
-    let Some(entry) = entry.filter(|e| e.mode != MODE_GITLINK && !e.is_dir()) else { continue };
-    if in_view(&ws.prefixes, &path, false) && !store.contains(&entry.id) && !wanted.iter().any(|(id, _)| *id == entry.id) {
-      let before = match from {
-        Some(root) => crate::manifest::lookup(store, root, &path)?.filter(|e| !e.is_dir()).map(|e| e.id),
-        None => None,
-      };
-      wanted.push((entry.id, before));
+  let came: Vec<Id> = steps(&answer).collect();
+  for id in came {
+    let commit = Commit::load(store, &id)?;
+    let from = match commit.parents.first() {
+      Some(parent) => root_of(store, parent)?,
+      None => None,
+    };
+    let to = root_of(store, &id)?;
+    // File by file: with no directory kept whole, a directory set whole comes as its files.
+    for (path, entry) in diff_keeping(store, from, to, &Default::default())? {
+      let Some(entry) = entry.filter(|e| e.mode != MODE_GITLINK && !e.is_dir()) else { continue };
+      if in_view(&ws.prefixes, &path, false) && !store.contains(&entry.id) && !wanted.iter().any(|(id, _)| *id == entry.id) {
+        let before = match from {
+          Some(root) => crate::manifest::lookup(store, root, &path)?.filter(|e| !e.is_dir()).map(|e| e.id),
+          None => None,
+        };
+        wanted.push((entry.id, before));
+      }
     }
   }
   done.contents = fetch_contents(store, &url, &wanted)?.0;
@@ -880,19 +901,32 @@ fn resume(store: &mut Store, ws: &mut Workspace, url: &str, author: &str) -> Res
     (Some(id), Some(seq)) if ws.pushed == Some(id) && ws.seq == seq => {
       std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string())
     }
-    (Some(id), Some(seq)) if store.get(&id)?.is_some() => arrive_from(store, ws, url, Tip { id, seq }, author, true).map(Some),
+    (Some(id), Some(seq)) if store.get(&id)?.is_some() => {
+      arrive_from(store, ws, url, Tip { id, seq }, author, true, Staging::Unstage).map(Some)
+    }
     _ => std::fs::remove_file(arriving(ws)).map(|_| None).map_err(|e| e.to_string()),
   }
 }
 
+/// What an arrival does with what `nv git add` staged of a path the ref changed: the staged copy
+/// would not have what the ref brings, and committed, would take it back out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Staging {
+  /// A sync asked for: refused before anything is touched, as Git refuses such a pull.
+  Refuse,
+  /// The catching-up after a push that landed, or the finishing of one killed: too late to refuse,
+  /// and the path is unstaged instead, its file on disk what the arrival made of it.
+  Unstage,
+}
+
 /// Move the workspace to `tip`, whose commits the store already has.
-fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str) -> Result<Synced> {
+fn arrive(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str, staging: Staging) -> Result<Synced> {
   if let Some(done) = resume(store, ws, url, author)?
     && !done.conflicts.is_empty()
   {
     return Ok(done);
   }
-  arrive_from(store, ws, url, tip, author, false)
+  arrive_from(store, ws, url, tip, author, false, staging)
 }
 
 /// Commits put on the tip one by one: what was made, the one a clash belongs to, and which
@@ -913,7 +947,15 @@ fn differ_only_by_union(root: &std::path::Path, a: &[Change], b: &[Change]) -> b
     })
 }
 
-fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, author: &str, resuming: bool) -> Result<Synced> {
+fn arrive_from(
+  store: &mut Store,
+  ws: &mut Workspace,
+  url: &str,
+  tip: Tip,
+  author: &str,
+  resuming: bool,
+  staging: Staging,
+) -> Result<Synced> {
   let mut done = Synced::default();
   let Tip { id: tip, seq } = tip;
   // What is on disk first, so that nothing unrecorded is written over.
@@ -990,6 +1032,21 @@ fn arrive_from(store: &mut Store, ws: &mut Workspace, url: &str, tip: Tip, autho
   let mut whole = workspace::whole_since(store, Some(tip), common)?;
   whole.extend(workspace::whole_since(store, ws.head, common)?);
   let mut theirs = diff_keeping(store, from, tip_root, &whole)?;
+  // What `nv git add` staged of a path the ref changed would be committed over what the ref
+  // brings (thirteenth round): refused, or, where it is too late for that, unstaged.
+  let staged = workspace::staged_paths(&ws.root);
+  let hit: Vec<Vec<u8>> = staged.into_iter().filter(|p| theirs.iter().any(|(t, _)| paths_conflict(t, p))).collect();
+  if !hit.is_empty() {
+    let named = hit.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>();
+    if staging == Staging::Refuse && !resuming {
+      return Err(format!(
+        "these are staged with `nv git add`, and the ref changed them: {}. Nothing was touched.\nThe staged copy would not have what the ref brings, and a commit of it would take that out again: commit them first (`nv git commit`), or unstage them (`nv git restore --staged <path>`), then sync.",
+        named.join(", ")
+      ));
+    }
+    workspace::unstage(&ws.root, &hit)?;
+    done.unstaged = named;
+  }
   if published_from.is_some() {
     // A change of this workspace's landed commits, as the ref still has it, is no change of theirs.
     theirs.retain(|change| !own_on_ref.contains(change));

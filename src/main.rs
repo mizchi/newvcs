@@ -1054,11 +1054,25 @@ fn run(args: &[String]) -> Result<()> {
     "sync" => {
       let (mut ws, mut store) = opened(arg(1)?)?;
       newvcs::colocated::locked(&ws.root)?;
+      // `git pull --rebase` with anything staged is refused by Git, whatever the ref changed: the
+      // index would not survive the rebase. Not at a pull that stopped, where adding is the way on.
+      if AS_GIT.load(std::sync::atomic::Ordering::Relaxed)
+        && workspace::settles_into(&ws.root).is_none()
+        && !workspace::staged_paths(&ws.root).is_empty()
+      {
+        eprintln!("error: cannot pull with rebase: Your index contains uncommitted changes.\nerror: Please commit or stash them.");
+        std::process::exit(128);
+      }
       let done = remote::sync(&mut store, &mut ws, AUTHOR)?;
       if let Some(done) = newvcs::colocated::follow(&mut store, &mut ws)? {
         eprintln!("nv: {done}");
       }
-      println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
+      // As `git pull -q`: nothing said of a catching-up that left nobody anything to do.
+      let quiet =
+        args.iter().any(|a| a == "--quiet") && done.conflicts.is_empty() && done.unstaged.is_empty() && done.moved_under.is_empty();
+      if !quiet {
+        println!("{} in {:.0} ms", describe(&done, &ws.root), ms(started));
+      }
       // Where the conditions run behind writes, they are run on what the sync made as well: where
       // that is a commit of this workspace's put on a newer tip, the committer is told where to
       // hear how they end, so as not to push what nothing ran on.
@@ -1172,7 +1186,8 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
     && s.contents_fetched == 0
     && s.outside_view == 0
     && s.merged == 0
-    && s.moved_under.is_empty();
+    && s.moved_under.is_empty()
+    && s.unstaged.is_empty();
   if nothing && s.conflicts.is_empty() && s.cancelled == 0 && s.superseded == 0 && s.folded <= 1 && s.before.is_none() {
     return "nothing else came from the ref".to_string();
   }
@@ -1236,6 +1251,12 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
       s.folded
     ));
   }
+  if !s.unstaged.is_empty() {
+    text.push_str(&format!(
+      "\nunstaged, as the ref changed them since they were added: {}. What is on disk has both, and is to be added again",
+      s.unstaged.join(", ")
+    ));
+  }
   if s.before.is_some() {
     text.push_str("\nthe workspace as it was before is kept: `nv restore <dir> before-sync` undoes this catching-up, files and all");
   }
@@ -1283,7 +1304,7 @@ const COMMANDS: &[(&str, usize, usize, &[&str])] = &[
   ("agent-init", 1, 1, &[]),
   ("remote", 3, 3, &[]),
   ("push", 1, 1, &[]),
-  ("sync", 1, 1, &[]),
+  ("sync", 1, 1, &["--quiet"]),
   ("fetch", 1, 1, &["--quiet"]),
   ("fork", 2, 2, &[]),
   ("export", 3, 3, &[]),
@@ -1575,7 +1596,9 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
     let waiting = workspace::settles_into(&root).is_some() || !workspace::unsettled(&ws).is_empty();
     let dir = root.to_string_lossy().into_owned();
     return match options.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-      ["--continue"] if waiting => Ok(Some(vec!["commit".into(), dir])),
+      // What was added completes the commit, as Git's index does: not whatever else the
+      // directory holds (thirteenth round).
+      ["--continue"] if waiting => Ok(Some(vec!["git".into(), "-C".into(), dir, "commit".into(), "-q".into(), "--no-edit".into()])),
       ["--abort"] if waiting => Ok(Some(vec!["restore".into(), dir, "before-sync".into()])),
       _ => Ok(None),
     };
@@ -1607,7 +1630,13 @@ fn toward_the_ref(args: &[String]) -> std::result::Result<Option<Vec<String>>, S
       }
       Ok(Some(nv))
     }
-    "pull" if plain.iter().any(|o| rebase(o)) => Ok(Some(vec!["sync".into(), dir])),
+    "pull" if plain.iter().any(|o| rebase(o)) => {
+      let mut nv = vec!["sync".to_string(), dir];
+      if options.iter().any(|o| quiet(o)) {
+        nv.push("--quiet".into());
+      }
+      Ok(Some(nv))
+    }
     "pull" => Err(format!("`git pull` without --rebase is not supported: it would make a merge commit, which nv does not; {instead}")),
     _ => Err(format!("`git {verb}` is not supported: {instead}")),
   }
