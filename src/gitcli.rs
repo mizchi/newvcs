@@ -723,6 +723,7 @@ pub const SPOKEN: &[(&str, &[&str])] = &[
   ("config", &["--get", "--local"]),
   ("fsck", &["--full", "--strict", "--no-dangling"]),
   ("fetch", &["-q", "--quiet"]),
+  ("remote", &["-v", "--verbose"]),
   ("pull", &["-q", "--quiet", "--ff-only", "--no-rebase"]),
   ("push", &["-q", "--quiet"]),
 ];
@@ -917,6 +918,7 @@ pub fn run(args: &[String]) -> i32 {
     "fsck" => fsck(open()?),
     "fetch" => fetch(&mut open()?).map(|_| 0),
     "pull" => pull(open()?, &rest),
+    "remote" => remote(open()?, &rest),
     "push" => push(open()?, &rest),
     other => unsupported(other),
   });
@@ -1076,6 +1078,33 @@ fn fetch(repo: &mut Repo) -> Res<crate::git::Refs> {
     repo.store.set_ref(&format!("tags/{name}"), *id)?;
   }
   Ok(refs)
+}
+
+/// `origin`, where there is one: the server and repository `nv remote` set, or else the Git
+/// repository this one was cloned from. Listed, or its URL asked for; nothing else is spoken.
+fn remote(repo: Repo, args: &[&str]) -> Res<i32> {
+  let url = match &repo.ws.remote {
+    Some(url) => Some(url.clone()),
+    None => std::fs::read_to_string(repo.meta("git-origin")).ok().map(|o| o.trim().to_string()),
+  };
+  match positional("remote", args)[..] {
+    [] => {
+      if let Some(url) = url {
+        if has(args, "-v") || has(args, "--verbose") {
+          println!("origin\t{url} (fetch)\norigin\t{url} (push)");
+        } else {
+          println!("origin");
+        }
+      }
+      Ok(0)
+    }
+    ["get-url", "origin"] if url.is_some() => {
+      println!("{}", url.unwrap_or_default());
+      Ok(0)
+    }
+    ["get-url", name] => fatal(2, format!("error: No such remote '{name}'")),
+    _ => unsupported(format_args!("remote {}` (only the list, and `get-url`)", args.join(" "))),
+  }
 }
 
 fn clone(at: &Path, args: &[&str]) -> Res<i32> {
@@ -1828,43 +1857,36 @@ fn commit(mut repo: Repo, args: &[&str]) -> Res<i32> {
   if merging.is_some() && amend {
     return fatal(128, "fatal: You are in the middle of a merge -- cannot amend.");
   }
-  // A pull with --rebase that stopped at commits of this workspace's own, waiting with nothing in
-  // them for the files the sync held out of them: as in Git's rebase stopped there, a commit is
-  // the settling of those, under the message given where the one it completes is the last.
-  let waiting = workspace::waiting_on_settling(&mut repo.store, &repo.ws)?;
-  if !waiting.is_empty() {
+  // A pull with --rebase that stopped at a commit of this workspace's own, whose files it held
+  // out of it until they are settled: as at Git's rebase stopped there, a commit is that commit,
+  // with the settling, under the message given or else its own; those after it go on top.
+  if workspace::settles_into(&repo.ws.root).is_some() {
     if amend {
       return fatal(
         128,
         "fatal: You are in the middle of a pull --rebase that stopped -- cannot amend.\nSettle the files, `git add` them, and `git rebase --continue`, or `git commit -m <message>`.",
       );
     }
-    let last_waits = workspace::pending(&mut repo.store, &repo.ws)?.last().is_some_and(|(_, c)| c.changes.is_empty());
-    if !messages.is_empty() && !last_waits {
-      return fatal(
-        128,
-        format!(
-          "fatal: the pull --rebase stopped at commits before the last one made here ({}): `git rebase --continue` completes them under their own messages.",
-          waiting.join("; ")
-        ),
-      );
+    let committer = identity(&repo, "COMMITTER")?;
+    let message = messages.first().map(|m| cleaned(m));
+    let reword = message.as_deref().map(|m| (m, committer.as_str()));
+    // Those after it are made again one for one: what it became is as far from the end.
+    let chain = workspace::pending(&mut repo.store, &repo.ws)?;
+    let after =
+      workspace::settles_into(&repo.ws.root).and_then(|into| chain.iter().position(|(id, _)| *id == into)).map(|at| chain.len() - 1 - at);
+    if workspace::complete_settling(&mut repo.store, &mut repo.ws, &committer, workspace::Look::Everywhere, reword)?.is_some() {
+      repo.set_staged(&Staged::new())?;
+      if !silent {
+        let chain = workspace::pending(&mut repo.store, &repo.ws)?;
+        let made = after.and_then(|after| chain.len().checked_sub(after + 1)).and_then(|at| chain.get(at)).or(chain.last());
+        if let Some((id, made)) = made {
+          let branch = repo.branch().unwrap_or_else(|| "detached HEAD".into());
+          let oid = repo.git_oid(id)?;
+          println!("[{branch} {}] {}", &oid[..abbrev()], told(&made.rest).message.lines().next().unwrap_or_default());
+        }
+      }
+      return Ok(0);
     }
-    let Some(mut id) = workspace::complete_settling(&mut repo.store, &mut repo.ws, "nv <nv@localhost>", workspace::Look::Everywhere)?
-    else {
-      return fatal(1, "nothing to commit: the settling is not on disk");
-    };
-    if let Some(message) = messages.first() {
-      let committer = identity(&repo, "COMMITTER")?;
-      id = workspace::reword_last(&mut repo.store, &mut repo.ws, &cleaned(message), &committer)?;
-    }
-    repo.set_staged(&Staged::new())?;
-    if !silent {
-      let made = Commit::load(&mut repo.store, &id)?;
-      let branch = repo.branch().unwrap_or_else(|| "detached HEAD".into());
-      let oid = repo.git_oid(&id)?;
-      println!("[{branch} {}] {}", &oid[..abbrev()], told(&made.rest).message.lines().next().unwrap_or_default());
-    }
-    return Ok(0);
   }
   // A ref only goes forward: a commit it has is not made again. After a sync that could not
   // merge, that is someone else's commit, with this workspace's work on top as changes to commit;

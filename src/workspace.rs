@@ -2045,6 +2045,20 @@ pub fn signature(ws: &Workspace, role: &str) -> Result<String> {
 /// For a writer that does not commit: what its conditions passed on is committed as it was, while
 /// it goes on writing. Not beside Git, where a commit is made by Git, from the files.
 pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<u8>, author: &str) -> Result<Option<Id>> {
+  commit_state_with(store, ws, state, rest, author, None)
+}
+
+/// The same, where the settling of what a sync left out of a commit completes it: under a message
+/// of its own (`reword`: the message, and who commits it now), as `git commit` at a rebase that
+/// stopped gives the commit it stopped at.
+fn commit_state_with(
+  store: &mut Store,
+  ws: &mut Workspace,
+  state: Id,
+  rest: Vec<u8>,
+  author: &str,
+  reword: Option<(&str, &str)>,
+) -> Result<Option<Id>> {
   if crate::colocated::shared(&ws.root) {
     return Err("committing a state the files have moved on from is not done beside Git, where Git commits the files".to_string());
   }
@@ -2101,6 +2115,10 @@ pub fn commit_state(store: &mut Store, ws: &mut Workspace, state: Id, rest: Vec<
         let rest = match carried.take() {
           Some(before) => joined_rest(&before, &c.rest),
           None => c.rest.clone(),
+        };
+        let rest = match reword.filter(|_| j == at_short) {
+          Some((message, committer)) => reworded(&rest, message, committer),
+          None => rest,
         };
         let c = &Commit { parents: c.parents.clone(), rest, changes: c.changes.clone() };
         let add: &[Change] = if j < at_short {
@@ -3076,34 +3094,27 @@ pub fn settles_into(root: &Path) -> Option<Id> {
   text.lines().next().and_then(crate::unhex).and_then(|b| <Id>::try_from(b.as_slice()).ok())
 }
 
-/// Give the last commit made here another message, keeping who wrote it and its trailers: for a
-/// settling committed under a message of Git's commit, as Git's rebase that stopped does.
-pub fn reword_last(store: &mut Store, ws: &mut Workspace, message: &str, committer: &str) -> Result<Id> {
-  let Some(last) = ws.base.filter(|_| ws.head == ws.base) else {
-    return Err("the commit to give the message to is not the last one here".into());
-  };
-  let was = Commit::load(store, &last)?;
-  let said = String::from_utf8_lossy(&was.rest).into_owned();
+/// A commit's header and trailers under another message: who wrote it stays, who commits it is
+/// whoever does now.
+fn reworded(rest: &[u8], message: &str, committer: &str) -> Vec<u8> {
+  let said = String::from_utf8_lossy(rest).into_owned();
   let head = said.split_once("\n\n").map_or(said.as_str(), |(h, _)| h);
   let author = head.lines().find(|l| l.starts_with("author ")).unwrap_or_default();
-  let rest = format!("{author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes();
-  let rest = with_trailers(rest, &settled_lines(&was.rest));
-  let id = Commit { parents: was.parents.clone(), rest, changes: was.changes.clone() }.store(store)?;
-  root_of(store, &id)?;
-  store.flush()?;
-  ws.log("commit", &id)?;
-  let based = ws.base;
-  (ws.base, ws.head) = (Some(id), Some(id));
-  ws.save()?;
-  take_branch_along(store, ws, based)?;
-  Ok(id)
+  let new = format!("{author}\ncommitter {committer}\n\n{}\n", message.trim_end()).into_bytes();
+  with_trailers(new, &settled_lines(rest))
 }
 
 /// For `nv commit` given no message: where a sync left files out of a commit of this workspace's
 /// own and the files now differ from that commit's only in those, they complete it, under its
 /// message, as `git rebase --continue` keeps the message of the commit that stopped. `Ok(None)`
 /// where there is no such commit; an error that names them where other files changed too.
-pub fn complete_settling(store: &mut Store, ws: &mut Workspace, author: &str, look: Look) -> Result<Option<Id>> {
+pub fn complete_settling(
+  store: &mut Store,
+  ws: &mut Workspace,
+  author: &str,
+  look: Look,
+  reword: Option<(&str, &str)>,
+) -> Result<Option<Id>> {
   let Some((_, paths)) = incomplete(store, ws)? else { return Ok(None) };
   snapshot(store, ws, author, look)?;
   let state = ws.head.ok_or("nothing to commit")?;
@@ -3119,7 +3130,7 @@ pub fn complete_settling(store: &mut Store, ws: &mut Workspace, author: &str, lo
       other.join(", ")
     ));
   }
-  commit_state(store, ws, state, Vec::new(), author)
+  commit_state_with(store, ws, state, Vec::new(), author, reword)
 }
 
 /// The commit a settling completes, and the paths it was left without, while that commit is

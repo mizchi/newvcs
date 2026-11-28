@@ -9,7 +9,6 @@ revert HEAD
 stash
 blame a.txt
 clean -fd
-remote -v
 submodule status
 worktree list
 bisect start
@@ -47,6 +46,7 @@ commit --fixup HEAD
 commit -S -m signed
 commit --no-verify -m skip
 commit -qS -m signed, a letter not spoken in a cluster
+remote add other /nowhere
 add -p
 add -u
 add -f a.txt

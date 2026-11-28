@@ -46,3 +46,4 @@
 44-messages-and-diff-names.sh
 45-status-branch-line.sh
 46-clustered-short-options.sh
+47-remote.sh

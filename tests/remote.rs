@@ -2362,6 +2362,64 @@ fn git_fetch_names_the_refs_tip_without_touching_the_files() {
   assert_eq!(run("bob", "$NV git status -sb").1, "## main...origin/main\n");
 }
 
+/// A `git pull --rebase` that stopped speaks Git's verbs for what comes next, and `git commit -m`
+/// there gives the commit the settling completes a message of its own, as at a rebase stopped at
+/// that commit, though commits of this workspace's came after it.
+#[test]
+fn git_commit_at_a_stopped_pull_gives_the_commit_it_completes_a_message() {
+  let Ok(server) = std::env::var("NV_SERVER") else {
+    eprintln!("NV_SERVER is not set: skipping the test against a server");
+    return;
+  };
+  let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remote-git-commit-stopped");
+  let _ = std::fs::remove_dir_all(&root);
+  std::fs::create_dir_all(&root).unwrap();
+  let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+  let url = format!("{}/t/git-commit-stopped-{unique}", server.trim_end_matches('/'));
+  let nv = env!("CARGO_BIN_EXE_nv");
+  sh(
+    &root,
+    &format!(
+      r##"
+      git init -q -b main src && cd src && printf 'a\nb\n' > list && echo x > x
+      git add -A && git commit -q -m seed && cd ..
+      {nv} git clone -q src ann && {nv} remote ann {url} main && (cd ann && {nv} push . >/dev/null) && {nv} fork ann bob >/dev/null
+      "##
+    ),
+  );
+  let run = |dir: &str, script: &str| -> (i32, String) {
+    let out = common::bounded(
+      Command::new("sh")
+        .arg("-c")
+        .arg(format!("{{ {script}; }} 2>&1"))
+        .current_dir(root.join(dir))
+        .env("NV", nv)
+        .env("GIT_AUTHOR_NAME", dir)
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", dir)
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+    );
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+  };
+  run("ann", "printf 'ANN\\nb\\n' > list && $NV git commit -q -am 'Ann shouts' && $NV git push -q");
+  run("bob", "printf 'BOB\\nb\\n' > list && echo y > y && $NV git add -A && $NV git commit -q -m 'Bob shouts and adds y'");
+  run("bob", "echo z > z && $NV git add z && $NV git commit -q -m 'Bob adds z'");
+  let (code, said) = run("bob", "$NV git pull --rebase");
+  assert_eq!(code, 1, "{said}");
+  // Told in the verbs it was asked in.
+  assert!(said.contains("git add") && said.contains("git rebase --continue") && said.contains("git commit -m"), "{said}");
+  let (code, said) =
+    run("bob", "printf 'ANN BOB\\nb\\n' > list && $NV git add list && $NV git commit -q -m 'Bob shouts with Ann and adds y'");
+  assert_eq!(code, 0, "{said}");
+  assert_eq!(run("bob", "$NV git log --format=%s").1, "Bob adds z\nBob shouts with Ann and adds y\nAnn shouts\nseed\n");
+  assert_eq!(run("bob", "$NV git show --name-only --format= HEAD~1").1, "list\ny\n");
+  assert_eq!(run("bob", "$NV git log -1 --format=%an HEAD~1").1, "bob\n");
+  assert_eq!(run("bob", "$NV git status --porcelain").1, "");
+  let (code, said) = run("bob", "$NV git push");
+  assert_eq!(code, 0, "{said}");
+}
+
 /// Where a sync made the commits one, it says so, and not that each will get its version of the
 /// files it left with both versions.
 #[test]

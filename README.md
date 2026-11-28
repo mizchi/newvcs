@@ -106,6 +106,7 @@ refused as it was written:
 | Command | Options |
 | --- | --- |
 | `init` | `-q` `-b <branch>` |
+| `remote` | the list, `-v`, `get-url origin`: the server `nv remote` set, or the Git repository it was cloned from |
 | `clone`, `fetch`, `pull`, `push` | `-q`; `pull --ff-only`, `--no-rebase`; `push` of the branch one is on, to the branch of its name on `origin`. A Git repository on this machine only |
 | `add` | `-A`, paths |
 | `rm`, `mv` | `rm -r -q -f --cached` (the file stays on disk, where Git then does not track it) |
@@ -632,6 +633,13 @@ furthest along the ref; `log`, `show`, `diff` and `status` compare with
 it, as Git's do after `git fetch`. `git rebase origin/<ref>` is not
 spoken: nv puts work on the ref's tip as it is now (`pull --rebase`), not
 on a tip fetched earlier.
+
+A `git pull --rebase` that left files with both versions says what comes
+next in Git's verbs: `git add` them and `git rebase --continue`, which is
+`nv commit <dir>` with no message, or `git commit -m <message>`, which
+completes the commit the settling goes into under that message, wherever
+it is among the commits not pushed, as Git's `commit` at a rebase stopped
+at that commit does.
 
 A file a sync left with both versions is settled by whoever settles it,
 and the commit that holds the settling says so, as a Git trailer: which

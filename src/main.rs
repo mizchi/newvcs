@@ -492,7 +492,7 @@ fn run(args: &[String]) -> Result<()> {
           }
           _ => String::new(),
         };
-        if let Some(id) = workspace::complete_settling(&mut store, &mut ws, AUTHOR, look(3))? {
+        if let Some(id) = workspace::complete_settling(&mut store, &mut ws, AUTHOR, look(3), None)? {
           println!(
             "{} in {:.0} ms: the settling completes {what}, under its message, and what came after it is on top",
             hex(&id),
@@ -1161,6 +1161,10 @@ fn counted(n: usize, what: &str) -> String {
   if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
+/// Whether the command was asked for in Git's words (`nv git pull --rebase`), and should say what
+/// comes next in them.
+static AS_GIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn describe(s: &remote::Synced, root: &Path) -> String {
   let nothing = s.commits == 0
     && s.written == 0
@@ -1197,6 +1201,12 @@ fn describe(s: &remote::Synced, root: &Path) -> String {
         "Edit them: once the conditions pass on them, they complete the commit of yours put on the tip, under its message. Then `nv push`."
       } else if newvcs::checks::load(root).ok().flatten().is_some_and(|c| c.commit_each) {
         "Edit them: once the conditions pass on them, each commit of yours that changed them gets its own version of them, with what the settling brought in, and the last of them the settled one (where you have none, they are a commit of their own; `nv pending` lists what each is held out of). Then `nv push`."
+      } else if AS_GIT.load(std::sync::atomic::Ordering::Relaxed) && newvcs::workspace::settles_into(root).is_some() {
+        if s.folded > 1 {
+          "Edit them and `git add` them, then `git rebase --continue`: they complete the commit of yours put on the tip, under its message, or under a new one given with `git commit -m <message>` instead. Then `git push`."
+        } else {
+          "Edit them and `git add` them, then `git rebase --continue`: they complete the commit of yours that changed them last, under its message, or under a new one given with `git commit -m <message>` instead; each earlier commit of yours that changed them gets its own version of them. Then `git push`."
+        }
       } else {
         if newvcs::workspace::settles_into(root).is_some() && s.folded > 1 {
           "Edit them, then `nv commit <dir>` with no message: they complete the commit of yours put on the tip, under its message. Then `nv push`."
@@ -1384,7 +1394,10 @@ fn main() -> ExitCode {
   }
   // Git's verbs for the ref a workspace pushes to are nv's own push and sync (`toward_the_ref`).
   let (args, exit_as_git) = match toward_the_ref(&args) {
-    Ok(Some(nv)) => (nv, true),
+    Ok(Some(nv)) => {
+      AS_GIT.store(true, std::sync::atomic::Ordering::Relaxed);
+      (nv, true)
+    }
     Ok(None) => (args, false),
     Err(why) => {
       eprintln!("nv: {why}");
