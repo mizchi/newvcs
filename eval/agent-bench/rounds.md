@@ -229,6 +229,24 @@ reference: the longest a developer took was 134 s.
   warm, beside two rounds of Git in the same hour: **87 to 96 s against Git's 89 and 94, at a mean
   of 1.28 against 1.25, 40 model calls a round against 38**. Within what these few rounds can
   tell apart, a writer that knows Git does as well with nv as with Git, on this task.
+- **`fetch` toward the ref** (6cc74ab: commits into the store, no file written, `origin/<ref>`
+  the tip it found; `status -sb`). Writers ran `git fetch && git log origin/main` and were
+  answered. Three rounds took 104 to 125 s (Git's two in the same hour 84 and 96) at a mean of
+  1.42 (Git's 1.26), all of it the writer of `Contents`: it made its commits with a script, ran
+  `git commit -qa -F -` or `-qF <file>`, was refused for the options run together, and made
+  the commits again from `git reset --hard`, twice the builds.
+- **With short options taken apart as Git takes them** (1422606, case 46), nothing was refused
+  in three rounds, and one took 78 s at 1.20. The two others, 111 and 115 s at 1.47, each had
+  one clash, and its writer settled it as the sync said (`nv commit <dir>`), saw the commit it
+  completed kept a message that no longer held, and looked up `nv rebuild` to write it again:
+  three calls more each. Git's two rounds: 85 and 99 s, at 1.22 and 1.38.
+- **With the stopped pull told in Git's verbs** (478578f: `git add`, then `git rebase
+  --continue`, or `git commit -m` for the commit the settling completes, wherever it is; and
+  `git remote -v`): 82, 95 and 105 s at a mean of **1.31**, against Git's 93 and 98 s at 1.36
+  in the same hour. The round with a clash settled it in one call, `git add` and `git commit -F -`
+  under a new message, with no lookup. Of all six rounds of Git this afternoon (84 to 99 s,
+  1.21 to 1.38, mean 1.31), nv's three are inside the range. One Git command was refused, a
+  `git pull` without `--rebase`, which nv does not do toward a ref.
 
 ## Counting Git's refusals
 
